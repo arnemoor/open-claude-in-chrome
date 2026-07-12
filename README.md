@@ -8,7 +8,7 @@
   <em>Official Claude in Chrome gives you 58 blocked domains and two browsers.<br/>
   <strong>Open Claude in Chrome gives you the whole web.</strong></em>
   <br/>
-  <sub>Clean-room reimplementation of Anthropic's browser extension. No blocklist. Any Chromium browser. 100% feature &amp; performance parity.</sub>
+  <sub>Clean-room reimplementation of Anthropic's browser extension. No blocklist. Any Chromium browser. The full 22-tool surface.</sub>
   <br/>
   <sub>by <a href="https://noemica.io">noemica</a></sub>
 </p>
@@ -33,7 +33,7 @@
 
 ---
 
-The official [Claude in Chrome](https://code.claude.com/docs/en/chrome) extension gives Claude Code full browser automation — as long as you stay within Anthropic's allowlist of "safe" sites. Open Claude in Chrome is a clean-room reimplementation that strips the restrictions while keeping all 18 MCP tools and matching the official extension's performance.
+The official [Claude in Chrome](https://code.claude.com/docs/en/chrome) extension gives Claude Code full browser automation — as long as you stay within Anthropic's allowlist of "safe" sites. Open Claude in Chrome is a clean-room reimplementation that strips the restrictions while exposing the same 22-tool surface as the official extension and matching its performance.
 
 ## What's Different
 
@@ -42,7 +42,7 @@ The official [Claude in Chrome](https://code.claude.com/docs/en/chrome) extensio
 | **Domain blocklist** | 58 blocked domains across 11 categories | No blocklist. Navigate anywhere. |
 | **Browser support** | Chrome and Edge only | Any Chromium browser (Chrome, Edge, Brave, Arc, Opera, Vivaldi, etc.) |
 | **Source code** | Closed source | Open source (MIT) |
-| **Tools** | 18 MCP tools | Same 18 MCP tools |
+| **Tools** | 22 MCP tools | Same 22-tool surface (a few advanced tools are stubs, see below) |
 | **Performance** | Baseline | Identical |
 
 ### Blocked Domains in the Official Extension
@@ -70,9 +70,11 @@ Claude Code <--stdio MCP--> mcp-server.js <--TCP--> native-host.js <--native mes
 ```
 
 Three components:
-1. **Extension** — Manifest V3 with CDP-based browser automation (all 18 tools)
+1. **Extension** — Manifest V3 with CDP-based browser automation (all 22 tools)
 2. **MCP Server** — Node.js process started by Claude Code, exposes tools via MCP
 3. **Native Messaging Host** — Bridge between the MCP server and the extension
+
+The MCP server and native host authenticate to each other over the loopback TCP channel with a shared secret at `~/.config/open-claude-in-chrome/token` (created automatically on first run, mode `0600`). This stops any other local process, or another user on a shared machine, from driving your browser through the port.
 
 ## Installation
 
@@ -137,14 +139,16 @@ Reddit loads. No domain restriction.
 
 ## Available Tools
 
-All 18 tools, identical to Claude in Chrome:
+The full 22-tool surface of the official Claude in Chrome. Most are fully implemented. A few advanced tools that depend on Anthropic-proprietary or multi-browser infrastructure are honest stubs — they return a clear "not supported" message rather than fake success.
 
 | Tool | Description |
 |------|-------------|
 | `tabs_context_mcp` | Get tab group context |
 | `tabs_create_mcp` | Create new tab |
+| `tabs_close_mcp` | Close a tab in the group |
 | `navigate` | Navigate to URL, back, forward |
-| `computer` | Mouse, keyboard, screenshots (13 actions) |
+| `computer` | Mouse, keyboard, screenshots (13 actions; `save_to_disk` writes to Downloads) |
+| `browser_batch` | Run a sequence of tool calls in one round trip |
 | `read_page` | Accessibility tree with element refs |
 | `get_page_text` | Extract article/main text |
 | `find` | Find elements by text/attributes |
@@ -153,12 +157,14 @@ All 18 tools, identical to Claude in Chrome:
 | `read_console_messages` | Console output (filtered) |
 | `read_network_requests` | Network activity |
 | `resize_window` | Resize browser window |
-| `upload_image` | Upload screenshot to file input (stub) |
+| `file_upload` | Upload local files to a file input by ref |
+| `upload_image` | Upload a captured screenshot to a file input (best-effort) |
 | `gif_creator` | GIF recording (stub) |
 | `shortcuts_list` | List shortcuts (stub) |
 | `shortcuts_execute` | Run shortcut (stub) |
 | `switch_browser` | Switch browser (stub) |
-| `update_plan` | Present plan (auto-approved) |
+| `list_connected_browsers` | List connected browsers (stub) |
+| `select_browser` | Select browser by deviceId (stub) |
 
 ## Updating After Code Changes
 
@@ -170,6 +176,8 @@ No build step. All files are plain JavaScript. After pulling or editing code:
 | `host/mcp-server.js` | Kill stale servers and reconnect: `pkill -f "node.*mcp-server"` then `/mcp` in Claude Code |
 | `host/native-host.js` | Restart the browser (close all windows, reopen) |
 | `install.sh` or native host name changed | Re-run `./install.sh <extension-id>`, restart browser, re-add MCP |
+
+> The MCP server and native host share an auth token, so after changing either `host/native-host.js` or `host/mcp-server.js` refresh **both** sides (restart the browser **and** `pkill` + `/mcp`). A new server talking to an old native host will refuse the connection. Reloading the extension also picks up any new manifest permission (for example `downloads`, used by `save_to_disk`).
 
 ### Quick reset (nuclear option)
 
@@ -192,14 +200,7 @@ pkill -f "node.*mcp-server"
 
 ## Multiple Sessions
 
-Multiple Claude Code sessions can share the same browser extension. The first session becomes the "primary" (owns the TCP port), and subsequent sessions connect as clients through the primary. All sessions can use the browser simultaneously.
-
-If a session disconnects, kill stale servers and reconnect:
-
-```bash
-pkill -f "node.*mcp-server"
-# then /mcp in each Claude Code session
-```
+Multiple Claude Code sessions can share the same browser extension. The first session becomes the "primary" (owns the TCP port), and later sessions connect as clients through it. All can use the browser simultaneously. If the primary session ends, a surviving session promotes itself to primary automatically, so the others keep working without a manual restart.
 
 ## Troubleshooting
 
@@ -222,10 +223,12 @@ claude mcp add open-claude-in-chrome -- node /absolute/path/to/host/mcp-server.j
 
 ### "Browser extension is not connected"
 
-The MCP server started but the native host hasn't connected. Try:
-1. Open any webpage (wakes the service worker)
-2. Check service worker logs: `chrome://extensions` > "Inspect views: service worker"
-3. Verify `host/native-host-wrapper.sh` exists
+The MCP server is running but no native host is attached. Check, in order:
+1. **Is the browser running?** The extension and its native host only exist while the browser is open — no browser means no connection.
+2. Open any webpage to wake the service worker.
+3. Reload the extension in `chrome://extensions` — a fresh service worker reconnects the native host to the running server.
+4. Check service worker logs: `chrome://extensions` > "Inspect views: service worker".
+5. Verify `host/native-host-wrapper.sh` exists and its `node` path is valid.
 
 ### Tools fail immediately after reconnect
 
