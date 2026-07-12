@@ -18,9 +18,8 @@
 // each call correctly. What it does NOT prove: actual in-browser behavior (the
 // mock native host only records the request and replies with a canned result).
 // So tools kept as honest stubs (shortcuts_list, shortcuts_execute,
-// switch_browser, list_connected_browsers, select_browser, gif_creator) and
-// schema-only params (computer.save_to_disk) pass dispatch but are NOT
-// behaviorally equivalent to the official extension. See issue #1.
+// switch_browser, list_connected_browsers, select_browser, gif_creator) pass
+// dispatch but their real effects are NOT verified here. See issue #1.
 //
 // Harness (isolatedEnv / mock native host / spawned server) is reused from
 // multi-session.test.mjs and auth.test.mjs. Ports 18850+ keep this suite from

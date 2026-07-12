@@ -361,6 +361,29 @@ async function takeScreenshot(tabId) {
   return { base64, imageId };
 }
 
+// Save a captured image (base64 JPEG) to disk via the Downloads API so it can be
+// attached to a message for the user. Returns the absolute file path. Files land
+// in an "open-claude-in-chrome" subfolder of the browser's Downloads directory.
+async function saveImageToDisk(base64, prefix = "screenshot") {
+  const url = `data:image/jpeg;base64,${base64}`;
+  const filename = `open-claude-in-chrome/${prefix}_${Date.now()}.jpg`;
+  const downloadId = await chrome.downloads.download({ url, filename, saveAs: false });
+  return await new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      chrome.downloads.onChanged.removeListener(onChanged);
+      chrome.downloads.search({ id: downloadId }, (items) => resolve(items?.[0]?.filename || filename));
+    };
+    function onChanged(delta) {
+      if (delta.id === downloadId && delta.state?.current === "complete") finish();
+    }
+    chrome.downloads.onChanged.addListener(onChanged);
+    setTimeout(finish, 3000); // fallback: return whatever path we have
+  });
+}
+
 // --- Mouse helpers ---
 async function dispatchMouse(tabId, type, x, y, opts = {}) {
   await cdp(tabId, "Input.dispatchMouseEvent", {
@@ -498,9 +521,14 @@ const toolHandlers = {
           });
           if (vp?.result?.value) dims = vp.result.value;
         } catch {}
+        let savedNote = "";
+        if (args.save_to_disk) {
+          try { savedNote = ` Saved to disk: ${await saveImageToDisk(base64, "screenshot")}`; }
+          catch (e) { savedNote = ` (save_to_disk failed: ${e.message})`; }
+        }
         return {
           content: [
-            { type: "text", text: `Successfully captured screenshot (${dims}, jpeg) - ID: ${imageId}` },
+            { type: "text", text: `Successfully captured screenshot (${dims}, jpeg) - ID: ${imageId}.${savedNote}` },
             { type: "image", data: base64, mimeType: "image/jpeg" },
           ],
         };
@@ -654,9 +682,14 @@ const toolHandlers = {
         // Return the full screenshot with the region noted; the caller can crop
         // to it. Screenshots are JPEG (see takeScreenshot), so label them as such.
         const { base64: fullBase64 } = await takeScreenshot(tabId);
+        let savedNote = "";
+        if (args.save_to_disk) {
+          try { savedNote = ` Saved to disk: ${await saveImageToDisk(fullBase64, "zoom")}`; }
+          catch (e) { savedNote = ` (save_to_disk failed: ${e.message})`; }
+        }
         return {
           content: [
-            { type: "text", text: `Zoom region: [${args.region.join(", ")}]` },
+            { type: "text", text: `Zoom region: [${args.region.join(", ")}]${savedNote}` },
             { type: "image", data: fullBase64, mimeType: "image/jpeg" },
           ],
         };
