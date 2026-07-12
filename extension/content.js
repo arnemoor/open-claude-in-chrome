@@ -353,6 +353,76 @@
     return null;
   }
 
+  // Find a file input (self, descendant, or inside shadow DOM) for uploads.
+  function findFileInput(el) {
+    const isFile = (n) =>
+      n.tagName && n.tagName.toLowerCase() === "input" && (n.type || "").toLowerCase() === "file";
+    if (isFile(el)) return el;
+    const root = el.shadowRoot || el;
+    const inner = root.querySelector('input[type="file"]');
+    if (inner) return inner;
+    for (const child of root.querySelectorAll("*")) {
+      if (child.shadowRoot) {
+        const deep = child.shadowRoot.querySelector('input[type="file"]');
+        if (deep) return deep;
+      }
+    }
+    return null;
+  }
+
+  // Mark the file input for a ref with a unique attribute so the background page
+  // can locate the same node from CDP. Content scripts share the page DOM, so
+  // the attribute is visible to CDP DOM.querySelector.
+  function markFileInput(refId) {
+    const el = resolveRef(refId);
+    if (!el) return { error: `Element ${refId} not found or was garbage collected.` };
+    const input = findFileInput(el);
+    if (!input) return { error: `No file input found for ${refId}.` };
+    const token = `mcp_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    input.setAttribute("data-mcp-file-input", token);
+    return { token };
+  }
+
+  function unmarkFileInput(refId) {
+    const el = resolveRef(refId);
+    if (el) {
+      const input = findFileInput(el);
+      if (input) input.removeAttribute("data-mcp-file-input");
+    }
+    return { ok: true };
+  }
+
+  // Best-effort image upload: decode base64 into a File and set it on the ref'd
+  // file input via DataTransfer, then dispatch input/change. Some sites gate
+  // hidden file inputs on trusted events, so this may not work everywhere.
+  function uploadImage(refId, base64, filename, mimeType) {
+    const el = resolveRef(refId);
+    if (!el) return { error: `Element ${refId} not found or was garbage collected.` };
+    const input = findFileInput(el);
+    if (!input) return { error: `No file input found for ${refId}.` };
+
+    let bytes;
+    try {
+      const bin = atob(base64);
+      bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    } catch {
+      return { error: "Failed to decode image data." };
+    }
+
+    const file = new File([bytes], filename || "image.png", { type: mimeType || "image/png" });
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    try {
+      input.files = dt.files;
+    } catch (e) {
+      return { error: `Could not set files on the input: ${e.message}` };
+    }
+    input.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+    input.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+    return { success: true, name: file.name, size: file.size };
+  }
+
   function setFormValue(refId, value) {
     const el = resolveRef(refId);
     if (!el) return { error: `Element ${refId} not found or was garbage collected.` };
@@ -447,6 +517,21 @@
       return true;
     }
 
+    if (msg.type === "markFileInput") {
+      sendResponse({ result: markFileInput(msg.ref) });
+      return true;
+    }
+
+    if (msg.type === "unmarkFileInput") {
+      sendResponse({ result: unmarkFileInput(msg.ref) });
+      return true;
+    }
+
+    if (msg.type === "uploadImage") {
+      sendResponse({ result: uploadImage(msg.ref, msg.base64, msg.filename, msg.mimeType) });
+      return true;
+    }
+
     return false;
   });
 
@@ -457,6 +542,10 @@
     findElements,
     setFormValue,
     getRefCoordinates,
+    findFileInput,
+    markFileInput,
+    unmarkFileInput,
+    uploadImage,
     resolveRef,
     elementMap,
   };

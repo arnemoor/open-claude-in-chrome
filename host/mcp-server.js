@@ -435,7 +435,7 @@ async function callTool(toolName, args) {
   }
 }
 
-// --- MCP Server with all 18 tools ---
+// --- MCP Server with all 22 official claude-in-chrome tools (drop-in surface) ---
 
 const server = new McpServer({
   name: "open-claude-in-chrome",
@@ -503,13 +503,14 @@ server.tool(
     ]).describe('The action to perform:\n* `left_click`: Click the left mouse button at the specified coordinates.\n* `right_click`: Click the right mouse button at the specified coordinates to open context menus.\n* `double_click`: Double-click the left mouse button at the specified coordinates.\n* `triple_click`: Triple-click the left mouse button at the specified coordinates.\n* `type`: Type a string of text.\n* `screenshot`: Take a screenshot of the screen.\n* `wait`: Wait for a specified number of seconds.\n* `scroll`: Scroll up, down, left, or right at the specified coordinates.\n* `key`: Press a specific keyboard key.\n* `left_click_drag`: Drag from start_coordinate to coordinate.\n* `zoom`: Take a screenshot of a specific region for closer inspection.\n* `scroll_to`: Scroll an element into view using its element reference ID from read_page or find tools.\n* `hover`: Move the mouse cursor to the specified coordinates or element without clicking. Useful for revealing tooltips, dropdown menus, or triggering hover states.'),
     tabId: z.number().describe("Tab ID to execute the action on. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
     coordinate: z.array(z.number()).min(2).max(2).optional().describe("(x, y): The x (pixels from the left edge) and y (pixels from the top edge) coordinates. Required for `left_click`, `right_click`, `double_click`, `triple_click`, and `scroll`. For `left_click_drag`, this is the end position."),
-    duration: z.number().min(0).max(30).optional().describe("The number of seconds to wait. Required for `wait`. Maximum 30 seconds."),
+    duration: z.number().min(0).max(10).optional().describe("The number of seconds to wait. Required for `wait`. Maximum 10 seconds."),
     modifiers: z.string().optional().describe('Modifier keys for click actions. Supports: "ctrl", "shift", "alt", "cmd" (or "meta"), "win" (or "windows"). Can be combined with "+" (e.g., "ctrl+shift", "cmd+alt"). Optional.'),
     ref: z.string().optional().describe('Element reference ID from read_page or find tools (e.g., "ref_1", "ref_2"). Required for `scroll_to` action. Can be used as alternative to `coordinate` for click actions.'),
     region: z.array(z.number()).min(4).max(4).optional().describe("(x0, y0, x1, y1): The rectangular region to capture for `zoom`. Coordinates define a rectangle from top-left (x0, y0) to bottom-right (x1, y1) in pixels from the viewport origin. Required for `zoom` action. Useful for inspecting small UI elements like icons, buttons, or text."),
     repeat: z.number().min(1).max(100).optional().describe("Number of times to repeat the key sequence. Only applicable for `key` action. Must be a positive integer between 1 and 100. Default is 1. Useful for navigation tasks like pressing arrow keys multiple times."),
     scroll_direction: z.enum(["up", "down", "left", "right"]).optional().describe("The direction to scroll. Required for `scroll`."),
     scroll_amount: z.number().min(1).max(10).optional().describe("The number of scroll wheel ticks. Optional for `scroll`, defaults to 3."),
+    save_to_disk: z.boolean().optional().describe("For screenshot/zoom actions: save the image to disk so it can be attached to a message for the user. Returns the saved path in the tool result. Only set this when you intend to share the image — screenshots you're just looking at don't need saving."),
     start_coordinate: z.array(z.number()).min(2).max(2).optional().describe("(x, y): The starting coordinates for `left_click_drag`."),
     text: z.string().optional().describe('The text to type (for `type` action) or the key(s) to press (for `key` action). For `key` action: Provide space-separated keys (e.g., "Backspace Backspace Delete"). Supports keyboard shortcuts using the platform\'s modifier key (use "cmd" on Mac, "ctrl" on Windows/Linux, e.g., "cmd+a" or "ctrl+a" for select all).'),
   },
@@ -575,7 +576,7 @@ server.tool(
   "javascript_tool",
   "Execute JavaScript code in the context of the current page. The code runs in the page's context and can interact with the DOM, window object, and page variables. Returns the result of the last expression or any thrown errors. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
   {
-    action: z.literal("javascript_exec").describe("Must be set to 'javascript_exec'"),
+    action: z.string().describe("Must be set to 'javascript_exec'"),
     text: z.string().describe("The JavaScript code to execute. The code will be evaluated in the page context. The result of the last expression will be returned automatically. Do NOT use 'return' statements - just write the expression you want to evaluate (e.g., 'window.myData.value' not 'return window.myData.value'). You can access and modify the DOM, call page functions, and interact with page variables."),
     tabId: z.number().describe("Tab ID to execute the code in. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."),
   },
@@ -665,18 +666,7 @@ server.tool(
   async (args) => callTool("switch_browser", args)
 );
 
-// 17. update_plan
-server.tool(
-  "update_plan",
-  "Present a plan to the user for approval before taking actions. The user will see the domains you intend to visit and your approach. Once approved, you can proceed with actions on the approved domains without additional permission prompts.",
-  {
-    domains: z.array(z.string()).describe("List of domains you will visit (e.g., ['github.com', 'stackoverflow.com']). These domains will be approved for the session when the user accepts the plan."),
-    approach: z.array(z.string()).describe("High-level description of what you will do. Focus on outcomes and key actions, not implementation details. Be concise - aim for 3-7 items."),
-  },
-  async (args) => callTool("update_plan", args)
-);
-
-// 18. upload_image
+// 17. upload_image
 server.tool(
   "upload_image",
   "Upload a previously captured screenshot or user-uploaded image to a file input or drag & drop target. Supports two approaches: (1) ref - for targeting specific elements, especially hidden file inputs, (2) coordinate - for drag & drop to visible locations like Google Docs. Provide either ref or coordinate, not both.",
@@ -688,6 +678,61 @@ server.tool(
     filename: z.string().optional().describe('Optional filename for the uploaded file (default: "image.png")'),
   },
   async (args) => callTool("upload_image", args)
+);
+
+// 19. browser_batch
+server.tool(
+  "browser_batch",
+  "Execute a sequence of browser tool calls in ONE round trip. Each item is `{name, input}` where input is exactly what you'd pass to that tool standalone. Actions execute SEQUENTIALLY (not in parallel) and stop on the first error. Use this tool extensively to quickly execute work whenever you can predict two or more steps ahead — e.g. navigate, click a field, type, press Return, screenshot. Each tool's own permission check runs per item — if an action navigates to a domain without permission, the next item's check fails and the batch stops. Screenshots and other images are returned interleaved with outputs; coordinates you write in THIS batch refer to the screenshot taken BEFORE this call. browser_batch cannot be nested.",
+  {
+    actions: z.array(
+      z.object({
+        name: z.string().describe("Tool name (e.g. computer, navigate, find, tabs_create_mcp). browser_batch cannot be nested."),
+        input: z.object({}).passthrough().describe("That tool's input — same shape you'd pass when calling it directly."),
+      })
+    ).min(1).describe("List of tool calls to execute sequentially. Each item is `{name, input}`: `name` = tool name (e.g. computer, navigate, find, tabs_create_mcp; browser_batch cannot be nested); `input` = that tool's input, same shape you'd pass when calling it directly."),
+  },
+  async (args) => callTool("browser_batch", args)
+);
+
+// 20. file_upload
+server.tool(
+  "file_upload",
+  "Upload one or multiple files to a file input element on the page. Do not click on file upload buttons or file inputs — clicking opens a native file picker dialog that you cannot see or interact with. Instead, use read_page or find to locate the file input element, then use this tool with its ref to upload files directly. Only files the user has shared with this session (attachments, the session's outputs/uploads folders, or folders the user has connected) can be uploaded; other paths will be rejected. The combined size of all files in a single call must stay under 10 MB.",
+  {
+    paths: z.array(z.string()).describe("Absolute paths to the files to upload. Each must be a file the user has shared with this session."),
+    ref: z.string().describe('Element reference ID of the file input from read_page/find (e.g. "ref_1").'),
+    tabId: z.number().describe("Tab ID where the file input is located."),
+  },
+  async (args) => callTool("file_upload", args)
+);
+
+// 21. list_connected_browsers
+server.tool(
+  "list_connected_browsers",
+  'List all Chrome browsers (extension instances) currently connected to this account. Returns each browser\'s deviceId, display name, OS platform, and whether it appears to be on this computer. Use this before select_browser to present choices to the user. Before any browser action, you MUST call the AskUserQuestion tool with a question listing EVERY connected browser as a separate option (use the display name as the label, and include the deviceId in parentheses), plus one final option labeled exactly: "Open a confirmation screen in every connected Chrome extension and let me select the right one there." Do not skip any connected browser and do not pick one yourself. If the user picks a specific browser, call select_browser with that browser\'s deviceId. If the user picks the final option, call switch_browser — this sends a confirmation prompt to every connected Chrome extension and waits for the user to click Connect in the one they want; it also lets them name that browser.',
+  {},
+  async (args) => callTool("list_connected_browsers", args)
+);
+
+// 22. select_browser
+server.tool(
+  "select_browser",
+  "Select a specific Chrome browser by deviceId for browser automation, without broadcasting a pairing request. Use this after list_connected_browsers when the user has chosen one from the list.",
+  {
+    deviceId: z.string().describe("The deviceId from list_connected_browsers."),
+  },
+  async (args) => callTool("select_browser", args)
+);
+
+// 23. tabs_close_mcp
+server.tool(
+  "tabs_close_mcp",
+  "Close a tab in the MCP tab group by its ID. Use to clean up tabs you're done with. Only tabs in this session's group are closable; call tabs_context_mcp first to get valid IDs. If you close the group's last tab, Chrome auto-removes the group — the next tabs_context_mcp with createIfEmpty starts fresh.",
+  {
+    tabId: z.number().int().describe("The ID of the tab to close. Must be in this session's tab group."),
+  },
+  async (args) => callTool("tabs_close_mcp", args)
 );
 
 // --- Start MCP server ---

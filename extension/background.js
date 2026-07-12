@@ -413,6 +413,16 @@ const toolHandlers = {
     return result;
   },
 
+  async tabs_close_mcp(args) {
+    const { tabId } = args;
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    // chrome.tabs.onRemoved cleans up our per-tab state (attached debugger,
+    // console/network buffers). Chrome auto-removes the tab group when its last
+    // tab is closed, so no extra group teardown is needed here.
+    await chrome.tabs.remove(tabId);
+    return { content: [{ type: "text", text: `Closed tab ${tabId}.` }] };
+  },
+
   async navigate(args) {
     const { url, tabId } = args;
     if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
@@ -845,12 +855,116 @@ const toolHandlers = {
     return { content: [{ type: "text", text: `Resized window to ${width}x${height}` }] };
   },
 
+  // Run a sequence of tool actions in order and aggregate their content blocks
+  // (text and images interleave naturally). Each action is { name, input } and
+  // dispatches through the same toolHandlers map as a normal request. Stops on
+  // the first action that throws; nested browser_batch is rejected.
+  async browser_batch(args) {
+    const actions = Array.isArray(args.actions) ? args.actions : [];
+    if (actions.length === 0) {
+      return { content: [{ type: "text", text: "browser_batch requires a non-empty 'actions' array." }] };
+    }
+
+    const content = [];
+    for (let i = 0; i < actions.length; i++) {
+      const name = actions[i]?.name;
+      const input = actions[i]?.input || {};
+
+      if (name === "browser_batch") {
+        content.push({ type: "text", text: `Action ${i + 1}: nested browser_batch is not allowed.` });
+        break;
+      }
+      const handler = toolHandlers[name];
+      if (!handler) {
+        content.push({ type: "text", text: `Action ${i + 1}: unknown tool "${name}".` });
+        break;
+      }
+
+      content.push({ type: "text", text: `--- Action ${i + 1}/${actions.length}: ${name} ---` });
+      try {
+        const result = await handler(input);
+        if (result?.content) content.push(...result.content);
+      } catch (err) {
+        content.push({ type: "text", text: `Action ${i + 1} (${name}) failed: ${err.message}` });
+        break;
+      }
+    }
+
+    return { content };
+  },
+
   async upload_image(args) {
-    // Not implemented. Uploading captured image data to a file input needs a
-    // real file on disk for CDP DOM.setFileInputFiles, which the service worker
-    // can't provide. Honest stub — the previous body ran page-world lookups
-    // (window.__unblockedChrome) that never resolve from CDP's isolated world.
-    return { content: [{ type: "text", text: "Image upload is not yet implemented in this extension." }] };
+    const { imageId, ref, coordinate, filename, tabId } = args;
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+
+    // Only screenshots captured by the computer tool this session are stored.
+    // "user-uploaded" images have no equivalent here (no Claude.ai file channel).
+    const base64 = screenshotStore.get(imageId);
+    if (!base64) {
+      return { content: [{ type: "text", text: `Image "${imageId}" not found. Only screenshots captured by the computer tool in this session can be uploaded.` }] };
+    }
+
+    // Best-effort: only the ref path (file input) is supported. The coordinate
+    // drag & drop path (e.g. Google Docs) is not implemented in this fork.
+    if (!ref) {
+      return { content: [{ type: "text", text: "upload_image requires a 'ref' to a file input in this extension. Coordinate-based drag & drop is not supported." }] };
+    }
+
+    // Stored screenshots are JPEG (see takeScreenshot). Set the File mime to
+    // image/jpeg so it matches the actual bytes even if filename ends in .png.
+    const resp = await sendContentMessage(tabId, {
+      type: "uploadImage",
+      ref,
+      base64,
+      filename: filename || "image.png",
+      mimeType: "image/jpeg",
+    });
+    const result = resp?.result;
+    if (!result || result.error) {
+      return { content: [{ type: "text", text: `Error: ${result?.error || "image upload failed"}` }] };
+    }
+    return { content: [{ type: "text", text: `Uploaded image ${imageId} to ${ref} (${result.name}, ${result.size} bytes).` }] };
+  },
+
+  async file_upload(args) {
+    const { paths, ref, tabId } = args;
+    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    if (!ref) return { content: [{ type: "text", text: "file_upload requires a 'ref' to a file input." }] };
+    if (!Array.isArray(paths) || paths.length === 0) {
+      return { content: [{ type: "text", text: "file_upload requires 'paths' to be a non-empty array of absolute file paths." }] };
+    }
+
+    // NOTE: The official file_upload only allows files the user has explicitly
+    // shared with the session (attachments, session output/upload folders,
+    // connected folders). This fork has NO session file-sharing/sandbox model,
+    // so that provenance restriction is NOT enforced here — any absolute path
+    // the caller provides is passed straight to CDP DOM.setFileInputFiles.
+    await ensureAttached(tabId);
+
+    // Mark the ref'd file input in the shared DOM so we can locate the same node
+    // via CDP. (Works for light-DOM inputs; inputs buried in shadow DOM may not
+    // be reachable by DOM.querySelector from the document root.)
+    const mark = await sendContentMessage(tabId, { type: "markFileInput", ref });
+    if (!mark?.result || mark.result.error) {
+      return { content: [{ type: "text", text: `Error: ${mark?.result?.error || "could not resolve a file input for the ref"}` }] };
+    }
+    const token = mark.result.token;
+
+    try {
+      const doc = await cdp(tabId, "DOM.getDocument", { depth: 0 });
+      const { nodeId } = await cdp(tabId, "DOM.querySelector", {
+        nodeId: doc.root.nodeId,
+        selector: `[data-mcp-file-input="${token}"]`,
+      });
+      if (!nodeId) {
+        return { content: [{ type: "text", text: "Error: could not locate the file input node via CDP (it may be inside shadow DOM)." }] };
+      }
+      await cdp(tabId, "DOM.setFileInputFiles", { nodeId, files: paths });
+    } finally {
+      await sendContentMessage(tabId, { type: "unmarkFileInput", ref }).catch(() => {});
+    }
+
+    return { content: [{ type: "text", text: `Uploaded ${paths.length} file(s) to ${ref}: ${paths.join(", ")}` }] };
   },
 
   async gif_creator(args) {
@@ -869,15 +983,18 @@ const toolHandlers = {
     return { content: [{ type: "text", text: "Browser switching is not yet supported. The extension connects to whichever browser has it loaded (Chrome, Brave, or Edge). To switch, disable the extension in the current browser, enable it in the target browser, and restart both." }] };
   },
 
-  async update_plan(args) {
-    const { domains, approach } = args;
-    let text = `Plan:\n\nDomains: ${domains.join(", ")}\n\nApproach:\n`;
-    for (const step of approach) {
-      text += `- ${step}\n`;
-    }
-    text += "\nPlan auto-approved (no permission restrictions in this extension).";
-    return { content: [{ type: "text", text }] };
+  async list_connected_browsers(args) {
+    // Honest stub: this fork uses Chrome native messaging with one host per
+    // browser and no shared account relay, so there is no multi-browser
+    // registry (deviceIds) to enumerate.
+    return { content: [{ type: "text", text: "Listing connected browsers is not supported in this extension. It uses native messaging with a single browser per host, so there is no multi-browser registry to enumerate." }] };
   },
+
+  async select_browser(args) {
+    // Honest stub: no deviceId registry exists (see list_connected_browsers).
+    return { content: [{ type: "text", text: "Selecting a browser by deviceId is not supported in this extension. The native-messaging host connects to whichever single browser has the extension loaded." }] };
+  },
+
 };
 
 // --- Tool dispatch ---
