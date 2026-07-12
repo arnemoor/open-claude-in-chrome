@@ -15,7 +15,9 @@ import net from "node:net";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import crypto from "node:crypto";
 import { z } from "zod";
+import { getAuthToken } from "./auth-token.js";
 
 
 const DEFAULT_PORT = 18765;
@@ -31,6 +33,13 @@ function getPort() {
 }
 
 const TCP_PORT = getPort();
+const AUTH_TOKEN = getAuthToken();
+
+// Constant-time check that a peer presented the shared secret.
+function validAuth(token) {
+  if (typeof token !== "string" || token.length !== AUTH_TOKEN.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(token), Buffer.from(AUTH_TOKEN));
+}
 
 // --- Mode detection ---
 // Try to bind the port. If it's taken, switch to client mode.
@@ -85,23 +94,7 @@ function sendToExtension(tool, args) {
   });
 }
 
-// --- Pidfile management ---
-
-const pidfilePath = path.join(os.tmpdir(), `open-claude-in-chrome-mcp-${TCP_PORT}.pid`);
-
-function writePidfile() {
-  try { fs.writeFileSync(pidfilePath, String(process.pid)); } catch {}
-}
-
-function cleanupPidfile() {
-  try {
-    const content = fs.readFileSync(pidfilePath, "utf-8").trim();
-    if (content === String(process.pid)) fs.unlinkSync(pidfilePath);
-  } catch {}
-}
-
 function shutdown() {
-  if (mode === "primary") cleanupPidfile();
   if (nativeHostSocket && !nativeHostSocket.destroyed) nativeHostSocket.destroy();
   if (primarySocket && !primarySocket.destroyed) primarySocket.destroy();
   for (const [, sock] of clientSockets) {
@@ -154,48 +147,60 @@ function processLine(line) {
   if (!line) return;
   try {
     const msg = JSON.parse(line);
-    if (msg.type === "heartbeat") return;
     handleResponse(msg);
   } catch {}
 }
 
 const tcpServer = net.createServer((socket) => {
-  // Classification: wait briefly for a client_hello. If none arrives, treat as native host.
-  // Native hosts (launched by the browser) don't send data immediately on connect.
-  // Client MCP servers send client_hello immediately.
+  // Every legitimate peer authenticates with a hello line the moment it
+  // connects: the native host sends {type:"native_hello",token}, a client MCP
+  // server sends {type:"client_hello",token}. Anything that presents a bad
+  // token, an unknown hello, or stays silent past the timeout is dropped — so a
+  // random local process (or another local user) can't hijack the port or the
+  // native host slot. This also replaces the old timing-based classification.
   let classified = false;
   let earlyBuffer = Buffer.alloc(0);
 
-  const classifyTimeout = setTimeout(() => {
+  const helloTimeout = setTimeout(() => {
     if (!classified) {
       classified = true;
-      setupNativeHostConnection(socket, earlyBuffer);
+      socket.destroy();
     }
-  }, 500); // 500ms is plenty for a local client_hello
+  }, 2000);
 
   socket.on("data", function onEarlyData(chunk) {
     if (classified) return; // Already classified, data handler was replaced
     earlyBuffer = Buffer.concat([earlyBuffer, chunk]);
     const newlineIdx = earlyBuffer.indexOf(10);
-    if (newlineIdx === -1) return; // No full line yet, keep buffering
+    if (newlineIdx === -1) {
+      if (earlyBuffer.length > 8192) { // no hello line in a sane amount of data
+        classified = true;
+        clearTimeout(helloTimeout);
+        socket.destroy();
+      }
+      return; // No full line yet, keep buffering
+    }
+
+    classified = true;
+    clearTimeout(helloTimeout);
+    socket.removeListener("data", onEarlyData);
 
     const firstLine = earlyBuffer.subarray(0, newlineIdx).toString("utf-8").trim();
-    try {
-      const firstMsg = JSON.parse(firstLine);
-      if (firstMsg.type === "client_hello") {
-        classified = true;
-        clearTimeout(classifyTimeout);
-        socket.removeListener("data", onEarlyData);
-        setupClientConnection(socket, earlyBuffer.subarray(newlineIdx + 1));
-        return;
-      }
-    } catch {}
+    const rest = earlyBuffer.subarray(newlineIdx + 1);
+    let msg = null;
+    try { msg = JSON.parse(firstLine); } catch {}
 
-    // Got data but it's not a client_hello, this is a native host
-    classified = true;
-    clearTimeout(classifyTimeout);
-    socket.removeListener("data", onEarlyData);
-    setupNativeHostConnection(socket, earlyBuffer);
+    if (!msg || !validAuth(msg.token)) {
+      socket.end(JSON.stringify({ type: "error", error: "Authentication failed." }) + "\n");
+      return;
+    }
+    if (msg.type === "client_hello") {
+      setupClientConnection(socket, rest);
+    } else if (msg.type === "native_hello") {
+      setupNativeHostConnection(socket, rest);
+    } else {
+      socket.end(JSON.stringify({ type: "error", error: "Unknown hello type." }) + "\n");
+    }
   });
 });
 
@@ -304,114 +309,106 @@ function setupClientConnection(socket, initialBuffer) {
   });
 }
 
-// --- Client mode: connect to primary ---
+// --- Role acquisition: own the port (primary) or connect to it (client) ---
+// Run at startup AND whenever the primary we were using dies. Re-running this on
+// primary loss is what lets a surviving client promote itself to primary instead
+// of being stranded forever waiting for a primary that will never come back.
 
-function startClientMode() {
-  mode = "client";
-  process.stderr.write(`Port ${TCP_PORT} in use. Connecting as client to primary MCP server...\n`);
-
-  function connect() {
-    primarySocket = net.createConnection(TCP_PORT, "127.0.0.1", () => {
-      process.stderr.write(`Connected to primary MCP server on :${TCP_PORT}\n`);
-      // Send handshake
-      primarySocket.write(JSON.stringify({ type: "client_hello" }) + "\n");
-    });
-
-    primarySocket.on("data", (chunk) => {
-      clientBuffer = Buffer.concat([clientBuffer, chunk]);
-      let idx;
-      while ((idx = clientBuffer.indexOf(10)) !== -1) {
-        const line = clientBuffer.subarray(0, idx).toString("utf-8").trim();
-        clientBuffer = clientBuffer.subarray(idx + 1);
-        if (!line) continue;
-        try {
-          const msg = JSON.parse(line);
-          if (msg.type === "client_ack") continue;
-          if (msg.type === "error") {
-            process.stderr.write(`Primary server error: ${msg.error}\n`);
-            continue;
-          }
-          // Tool response routed back from primary
-          if (msg.id && pendingRequests.has(msg.id)) {
-            const { resolve, reject, timer } = pendingRequests.get(msg.id);
-            clearTimeout(timer);
-            pendingRequests.delete(msg.id);
-            if (msg.type === "tool_error") {
-              reject(new Error(msg.error || "Tool execution failed"));
-            } else {
-              resolve(msg.result);
-            }
-          }
-        } catch {}
-      }
-    });
-
-    primarySocket.on("error", (err) => {
-      process.stderr.write(`Client connection error: ${err.message}\n`);
-    });
-
-    primarySocket.on("close", () => {
-      primarySocket = null;
-      // Primary died, reject pending requests
-      for (const [, { reject, timer }] of pendingRequests) {
-        clearTimeout(timer);
-        reject(new Error("Primary MCP server disconnected"));
-      }
-      pendingRequests.clear();
-      // Try to reconnect after a delay (primary might restart)
-      setTimeout(connect, 2000);
-    });
-  }
-
-  connect();
+function runAsPrimary() {
+  mode = "primary";
+  process.stderr.write(`Primary MCP server listening on :${TCP_PORT}\n`);
 }
 
-// --- Startup: try primary, fall back to client ---
-
-async function start() {
-  // Clean up stale pidfiles (but don't kill live servers)
-  const pidfiles = [
-    pidfilePath,
-    path.join(os.tmpdir(), `unblocked-chrome-mcp-${TCP_PORT}.pid`),
-  ];
-  for (const pf of pidfiles) {
-    try {
-      const oldPid = parseInt(fs.readFileSync(pf, "utf-8").trim(), 10);
-      if (oldPid && oldPid !== process.pid) {
-        try {
-          process.kill(oldPid, 0); // Check if alive
-          // It's alive. DON'T kill it. We'll run as client instead.
-        } catch {
-          // Dead process, clean up pidfile
-          try { fs.unlinkSync(pf); } catch {}
-        }
-      }
-    } catch {}
-  }
-
-  // Try to bind the port
+// Try to bind the port. Resolves "ok" if we became the listener, "in-use" if
+// another live session already holds it, or "error" for anything else.
+function attemptListen() {
   return new Promise((resolve) => {
-    tcpServer.once("error", (err) => {
-      if (err.code === "EADDRINUSE") {
-        // Port taken by another live session. Run as client.
-        startClientMode();
-        resolve();
-      } else {
+    const onError = (err) => {
+      tcpServer.removeListener("listening", onListening);
+      if (err.code === "EADDRINUSE") resolve("in-use");
+      else {
         process.stderr.write(`TCP server error: ${err.message}\n`);
-        process.exit(1);
+        resolve("error");
       }
-    });
-
-    tcpServer.listen(TCP_PORT, "127.0.0.1", () => {
-      mode = "primary";
-      writePidfile();
-      process.stderr.write(`Primary MCP server listening on :${TCP_PORT}\n`);
-      resolve();
-    });
+    };
+    const onListening = () => {
+      tcpServer.removeListener("error", onError);
+      resolve("ok");
+    };
+    tcpServer.once("error", onError);
+    tcpServer.once("listening", onListening);
+    tcpServer.listen(TCP_PORT, "127.0.0.1");
   });
 }
 
-await start();
+async function acquireRole() {
+  const outcome = await attemptListen();
+  if (outcome === "ok") runAsPrimary();
+  else if (outcome === "in-use") connectToPrimary();
+  else setTimeout(acquireRole, 1000); // transient bind error — retry
+}
+
+function connectToPrimary() {
+  mode = "client";
+  clientBuffer = Buffer.alloc(0); // fresh connection — drop any stale partial line
+  process.stderr.write(`Port ${TCP_PORT} in use. Connecting as client to primary MCP server...\n`);
+
+  primarySocket = net.createConnection(TCP_PORT, "127.0.0.1", () => {
+    process.stderr.write(`Connected to primary MCP server on :${TCP_PORT}\n`);
+    // Authenticated handshake — the primary drops us without a valid token.
+    primarySocket.write(JSON.stringify({ type: "client_hello", token: AUTH_TOKEN }) + "\n");
+  });
+
+  primarySocket.on("data", (chunk) => {
+    clientBuffer = Buffer.concat([clientBuffer, chunk]);
+    let idx;
+    while ((idx = clientBuffer.indexOf(10)) !== -1) {
+      const line = clientBuffer.subarray(0, idx).toString("utf-8").trim();
+      clientBuffer = clientBuffer.subarray(idx + 1);
+      if (!line) continue;
+      try {
+        const msg = JSON.parse(line);
+        if (msg.type === "client_ack") continue;
+        if (msg.type === "error") {
+          process.stderr.write(`Primary server error: ${msg.error}\n`);
+          continue;
+        }
+        // Tool response routed back from primary
+        if (msg.id && pendingRequests.has(msg.id)) {
+          const { resolve, reject, timer } = pendingRequests.get(msg.id);
+          clearTimeout(timer);
+          pendingRequests.delete(msg.id);
+          if (msg.type === "tool_error") {
+            reject(new Error(msg.error || "Tool execution failed"));
+          } else {
+            resolve(msg.result);
+          }
+        }
+      } catch {}
+    }
+  });
+
+  primarySocket.on("error", (err) => {
+    process.stderr.write(`Client connection error: ${err.message}\n`);
+  });
+
+  primarySocket.on("close", () => {
+    primarySocket = null;
+    // Reject in-flight requests; a dead primary can't answer them.
+    for (const [, { reject, timer }] of pendingRequests) {
+      clearTimeout(timer);
+      reject(new Error("Primary MCP server disconnected"));
+    }
+    pendingRequests.clear();
+    // The primary is gone. Try to take over the port ourselves; if another
+    // session beats us to it, acquireRole reconnects us to that new primary.
+    setTimeout(acquireRole, 200);
+  });
+}
+
+// --- Startup: own the port (primary) or connect to whoever already does ---
+
+await acquireRole();
 
 // --- Helper to wrap tool results for MCP ---
 
