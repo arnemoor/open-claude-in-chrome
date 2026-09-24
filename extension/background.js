@@ -306,29 +306,105 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   }
 });
 
-// --- Key code mapping ---
-const KEY_MAP = {
-  enter: "Enter", return: "Enter", tab: "Tab", escape: "Escape", esc: "Escape",
-  backspace: "Backspace", delete: "Delete", space: "Space", " ": "Space",
+// --- Keyboard ---
+// DOM key, code, Windows virtual key code, and the text a key press inserts (US layout).
+const NAMED_KEYS = {
+  Enter: { key: "Enter", code: "Enter", keyCode: 13, text: "\r" },
+  Tab: { key: "Tab", code: "Tab", keyCode: 9 },
+  Escape: { key: "Escape", code: "Escape", keyCode: 27 },
+  Backspace: { key: "Backspace", code: "Backspace", keyCode: 8 },
+  Delete: { key: "Delete", code: "Delete", keyCode: 46 },
+  Space: { key: " ", code: "Space", keyCode: 32, text: " " },
+  ArrowUp: { key: "ArrowUp", code: "ArrowUp", keyCode: 38 },
+  ArrowDown: { key: "ArrowDown", code: "ArrowDown", keyCode: 40 },
+  ArrowLeft: { key: "ArrowLeft", code: "ArrowLeft", keyCode: 37 },
+  ArrowRight: { key: "ArrowRight", code: "ArrowRight", keyCode: 39 },
+  Home: { key: "Home", code: "Home", keyCode: 36 },
+  End: { key: "End", code: "End", keyCode: 35 },
+  PageUp: { key: "PageUp", code: "PageUp", keyCode: 33 },
+  PageDown: { key: "PageDown", code: "PageDown", keyCode: 34 },
+  Insert: { key: "Insert", code: "Insert", keyCode: 45 },
+};
+for (let i = 1; i <= 12; i++) NAMED_KEYS[`F${i}`] = { key: `F${i}`, code: `F${i}`, keyCode: 111 + i };
+
+const KEY_ALIASES = {
+  enter: "Enter", return: "Enter", kp_enter: "Enter", tab: "Tab", escape: "Escape", esc: "Escape",
+  backspace: "Backspace", back_space: "Backspace", delete: "Delete", del: "Delete", space: "Space",
   arrowup: "ArrowUp", arrowdown: "ArrowDown", arrowleft: "ArrowLeft", arrowright: "ArrowRight",
-  up: "ArrowUp", down: "ArrowDown", left: "ArrowLeft", right: "ArrowRight",
-  home: "Home", end: "End", pageup: "PageUp", pagedown: "PageDown",
-  f1: "F1", f2: "F2", f3: "F3", f4: "F4", f5: "F5", f6: "F6",
-  f7: "F7", f8: "F8", f9: "F9", f10: "F10", f11: "F11", f12: "F12",
+  up: "ArrowUp", down: "ArrowDown", left: "ArrowLeft", right: "ArrowRight", home: "Home", end: "End",
+  pageup: "PageUp", page_up: "PageUp", prior: "PageUp", pagedown: "PageDown", page_down: "PageDown",
+  next: "PageDown", insert: "Insert",
 };
 
-function parseKeyCombo(keyStr) {
-  const parts = keyStr.split("+").map((p) => p.trim().toLowerCase());
-  let modifiers = 0;
-  let key = "";
-  for (const part of parts) {
-    if (part === "ctrl" || part === "control") modifiers |= 2;
-    else if (part === "alt") modifiers |= 1;
-    else if (part === "shift") modifiers |= 8;
-    else if (part === "meta" || part === "cmd" || part === "command" || part === "win" || part === "windows") modifiers |= 4;
-    else key = KEY_MAP[part] || part;
+const SHIFTED_DIGITS = { ")": "0", "!": "1", "@": "2", "#": "3", "$": "4", "%": "5", "^": "6", "&": "7", "*": "8", "(": "9" };
+const PUNCTUATION = {
+  " ": ["Space", 32, false], "-": ["Minus", 189, false], "_": ["Minus", 189, true], "=": ["Equal", 187, false],
+  "+": ["Equal", 187, true], "[": ["BracketLeft", 219, false], "{": ["BracketLeft", 219, true],
+  "]": ["BracketRight", 221, false], "}": ["BracketRight", 221, true], "\\": ["Backslash", 220, false],
+  "|": ["Backslash", 220, true], ";": ["Semicolon", 186, false], ":": ["Semicolon", 186, true],
+  "'": ["Quote", 222, false], "\"": ["Quote", 222, true], ",": ["Comma", 188, false], "<": ["Comma", 188, true],
+  ".": ["Period", 190, false], ">": ["Period", 190, true], "/": ["Slash", 191, false], "?": ["Slash", 191, true],
+  "`": ["Backquote", 192, false], "~": ["Backquote", 192, true],
+};
+
+// The key a US keyboard uses to produce this character, or null (then it is inserted as text).
+function charDefinition(ch) {
+  if (/^[a-z]$/.test(ch)) return { key: ch, code: `Key${ch.toUpperCase()}`, keyCode: ch.toUpperCase().charCodeAt(0), text: ch, shift: false };
+  if (/^[A-Z]$/.test(ch)) return { key: ch, code: `Key${ch}`, keyCode: ch.charCodeAt(0), text: ch, shift: true };
+  if (/^[0-9]$/.test(ch)) return { key: ch, code: `Digit${ch}`, keyCode: ch.charCodeAt(0), text: ch, shift: false };
+  if (ch in SHIFTED_DIGITS) return { key: ch, code: `Digit${SHIFTED_DIGITS[ch]}`, keyCode: SHIFTED_DIGITS[ch].charCodeAt(0), text: ch, shift: true };
+  if (ch in PUNCTUATION) {
+    const [code, keyCode, shift] = PUNCTUATION[ch];
+    return { key: ch, code, keyCode, text: ch, shift };
   }
-  return { key, modifiers };
+  return null;
+}
+
+function keyDefinition(name) {
+  if (NAMED_KEYS[name]) return NAMED_KEYS[name];
+  const alias = KEY_ALIASES[name.toLowerCase()];
+  if (alias) return NAMED_KEYS[alias];
+  if (/^f([1-9]|1[0-2])$/i.test(name)) return NAMED_KEYS[name.toUpperCase()];
+  if ([...name].length === 1) return charDefinition(name);
+  return null;
+}
+
+const MOD_ALT = 1, MOD_CTRL = 2, MOD_META = 4, MOD_SHIFT = 8;
+
+function parseKeyCombo(keyStr) {
+  const parts = keyStr.split("+");
+  let modifiers = 0;
+  let def = null;
+  parts.forEach((raw, i) => {
+    const part = raw.trim();
+    const lower = part.toLowerCase();
+    const isLast = i === parts.length - 1;
+    if (!isLast && (lower === "ctrl" || lower === "control")) modifiers |= MOD_CTRL;
+    else if (!isLast && (lower === "alt" || lower === "option")) modifiers |= MOD_ALT;
+    else if (!isLast && lower === "shift") modifiers |= MOD_SHIFT;
+    else if (!isLast && ["meta", "cmd", "command", "win", "windows", "super"].includes(lower)) modifiers |= MOD_META;
+    else if (isLast) def = keyDefinition(part);
+    else throw new Error(`Unknown modifier: ${part}`);
+  });
+  if (!def) throw new Error(`Unknown key: ${keyStr}`);
+  return { def, modifiers };
+}
+
+// macOS text fields ignore synthetic Cmd shortcuts unless the editing command is named.
+const MAC_EDIT_COMMANDS = { a: "selectAll", c: "copy", x: "cut", v: "paste", z: "undo" };
+const IS_MAC = typeof navigator !== "undefined" && /Mac/.test(navigator.platform || "");
+
+async function pressKey(tabId, def, modifiers) {
+  const shifted = (modifiers & MOD_SHIFT) !== 0 && /^[a-z]$/.test(def.key);
+  const key = shifted ? def.key.toUpperCase() : def.key;
+  const commandHeld = (modifiers & (MOD_CTRL | MOD_ALT | MOD_META)) !== 0;
+  const text = commandHeld ? undefined : shifted ? key : def.text;
+  const down = { type: text ? "keyDown" : "rawKeyDown", key, code: def.code, windowsVirtualKeyCode: def.keyCode, modifiers };
+  if (text) down.text = text;
+  if (IS_MAC && modifiers === MOD_META && MAC_EDIT_COMMANDS[def.key]) down.commands = [MAC_EDIT_COMMANDS[def.key]];
+  if (IS_MAC && modifiers === (MOD_META | MOD_SHIFT) && def.key === "z") down.commands = ["redo"];
+  await cdp(tabId, "Input.dispatchKeyEvent", down);
+  await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyUp", key, code: def.code, windowsVirtualKeyCode: def.keyCode, modifiers });
 }
 
 function parseModifierString(modStr) {
@@ -610,9 +686,15 @@ const toolHandlers = {
       case "type": {
         if (!args.text) return { content: [{ type: "text", text: "text is required for type action" }] };
         await ensureAttached(tabId);
-        // Type character by character for better compatibility
         for (const char of args.text) {
-          await cdp(tabId, "Input.insertText", { text: char });
+          // Chrome's Input.insertText treats a "\n"/"\r" in the inserted text as an implicit
+          // Enter, submitting the form exactly like a real Enter keypress would — even though
+          // no keydown ever fires. So newlines and tabs are skipped rather than inserted.
+          if (char !== "\n" && char !== "\r" && char !== "\t") {
+            const def = charDefinition(char);
+            if (def) await pressKey(tabId, def, def.shift ? MOD_SHIFT : 0);
+            else await cdp(tabId, "Input.insertText", { text: char });
+          }
           await sleep(10);
         }
         return { content: [{ type: "text", text: `Typed "${args.text.substring(0, 50)}${args.text.length > 50 ? "..." : ""}"` }] };
@@ -622,25 +704,15 @@ const toolHandlers = {
         if (!args.text) return { content: [{ type: "text", text: "text is required for key action" }] };
         await ensureAttached(tabId);
         const repeat = Math.min(args.repeat || 1, 100);
-        // Parse space-separated key combos
-        const keys = args.text.split(" ").filter(Boolean);
+        let combos;
+        try {
+          combos = args.text.split(" ").filter(Boolean).map(parseKeyCombo);
+        } catch (err) {
+          return { content: [{ type: "text", text: err.message }] };
+        }
         for (let r = 0; r < repeat; r++) {
-          for (const keyStr of keys) {
-            const { key, modifiers: keyMod } = parseKeyCombo(keyStr);
-            const resolvedKey = key.length === 1 ? key : key;
-            await cdp(tabId, "Input.dispatchKeyEvent", {
-              type: "keyDown",
-              key: resolvedKey,
-              code: resolvedKey.length === 1 ? `Key${resolvedKey.toUpperCase()}` : resolvedKey,
-              modifiers: keyMod,
-              windowsVirtualKeyCode: resolvedKey.charCodeAt ? resolvedKey.charCodeAt(0) : 0,
-            });
-            await cdp(tabId, "Input.dispatchKeyEvent", {
-              type: "keyUp",
-              key: resolvedKey,
-              code: resolvedKey.length === 1 ? `Key${resolvedKey.toUpperCase()}` : resolvedKey,
-              modifiers: keyMod,
-            });
+          for (const { def, modifiers: keyMods } of combos) {
+            await pressKey(tabId, def, keyMods);
             await sleep(30);
           }
         }
