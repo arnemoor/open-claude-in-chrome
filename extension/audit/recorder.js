@@ -42,6 +42,20 @@
     emit: onEmit,
     maskAllInputs: true,
     maskInputOptions: { password: true },
+    // maskAllInputs only covers <input>/<textarea>/<select>; contenteditable regions
+    // (rich-text editors, some chat/comment boxes) hold their text as plain DOM text
+    // nodes, so they need maskTextSelector instead. This matches the contenteditable
+    // host element itself, not a "... *" descendant selector: rrweb resolves
+    // maskTextSelector with el.matches() against the element itself (or a text node's
+    // immediate parent) the first time a branch's mask state is decided, and with
+    // el.closest() (which walks up through every ancestor) for every incremental
+    // mutation — both a brand-new text node (genAdds) and a changed one
+    // (characterData) always re-check with closest(), regardless of nesting depth. A
+    // "... *" variant would miss text that is a direct child of the contenteditable
+    // element itself (the common case: typing into a freshly focused, empty div),
+    // since closest()/matches() on that div would then need an ancestor of the div to
+    // match, not the div itself.
+    maskTextSelector: '[contenteditable]:not([contenteditable="false"])',
     recordCanvas: false,
     collectFonts: false,
     inlineImages: false,

@@ -27,7 +27,7 @@ after(() => browser?.close());
 // actually relaying it to a background page.
 async function withRecorderPage(fn) {
   const server = http.createServer((req, res) => {
-    res.end(`<!doctype html><title>audit-recorder test</title><input id="t"><input id="p" type="password">`);
+    res.end(`<!doctype html><title>audit-recorder test</title><input id="t"><input id="p" type="password"><div id="c" contenteditable="true"></div>`);
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = server.address().port;
@@ -74,6 +74,17 @@ test("masks typed input and a password field, but still emits a full snapshot", 
     assert.ok(sent.every((m) => m.type === "ocic_audit_events"), "expected every message to carry the ocic_audit_events type");
     const events = sent.flatMap((m) => m.events);
     assert.ok(events.some((e) => e.type === 2), `expected a full snapshot (type 2) event among: ${events.map((e) => e.type)}`);
+  });
+});
+
+test("masks text typed into a contenteditable element", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  await withRecorderPage(async (page, world) => {
+    await page.evaluate(`document.querySelector("#c").focus()`);
+    await page.send("Input.insertText", { text: "hunter2" });
+    await sleep(1500);
+
+    const sentJson = await world("JSON.stringify(globalThis.sent)");
+    assert.doesNotMatch(sentJson, /hunter2/);
   });
 });
 
