@@ -7,8 +7,51 @@
 // - Element finding by text/attributes
 
 (function () {
-  if (window.__unblockedChromeLoaded) return;
+  if (window.__unblockedChromeLoaded === true) return;
   window.__unblockedChromeLoaded = true;
+
+  // --- DOM helpers, immune to clobbering by page markup ---
+  // <form> elements and `document` have [LegacyOverrideBuiltIns]: a descendant control named like a
+  // built-in property (e.g. <input name="title">) replaces that property on the form, and a top-level
+  // <img name="body"> replaces document.body. Every read below goes through the true prototype
+  // getter/method instead of the (possibly clobbered) instance property.
+  const tagNameGet = Object.getOwnPropertyDescriptor(Element.prototype, "tagName").get;
+  const childrenGet = Object.getOwnPropertyDescriptor(Element.prototype, "children").get;
+  const shadowRootGet = Object.getOwnPropertyDescriptor(Element.prototype, "shadowRoot").get;
+  const textContentGet = Object.getOwnPropertyDescriptor(Node.prototype, "textContent").get;
+  const nodeTypeGet = Object.getOwnPropertyDescriptor(Node.prototype, "nodeType").get;
+  const offsetParentGet = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "offsetParent").get;
+  const docTitleGet = Object.getOwnPropertyDescriptor(Document.prototype, "title").get;
+  const docBodyGet = Object.getOwnPropertyDescriptor(Document.prototype, "body").get;
+  const getAttributeFn = Element.prototype.getAttribute;
+  const closestFn = Element.prototype.closest;
+  const matchesFn = Element.prototype.matches;
+  const rectFn = Element.prototype.getBoundingClientRect;
+  const docQueryFn = Document.prototype.querySelector;
+  const docByIdFn = Document.prototype.getElementById;
+  const docElementFromPointFn = Document.prototype.elementFromPoint;
+
+  function str(value) {
+    return typeof value === "string" ? value : "";
+  }
+
+  const dom = {
+    tag: (el) => (el ? str(tagNameGet.call(el)).toLowerCase() : ""),
+    attr: (el, name) => (el ? str(getAttributeFn.call(el, name)) : ""),
+    children: (el) => (el ? childrenGet.call(el) : []),
+    text: (el) => (el ? str(textContentGet.call(el)) : ""),
+    nodeType: (el) => (el ? nodeTypeGet.call(el) : 0),
+    shadowRoot: (el) => (el ? shadowRootGet.call(el) : null),
+    closest: (el, sel) => (el ? closestFn.call(el, sel) : null),
+    matches: (el, sel) => (el ? matchesFn.call(el, sel) : false),
+    rect: (el) => (el ? rectFn.call(el) : { x: 0, y: 0, width: 0, height: 0, top: 0, left: 0, right: 0, bottom: 0 }),
+    str,
+    docTitle: () => str(docTitleGet.call(document)),
+    docBody: () => docBodyGet.call(document),
+    docQuery: (sel) => docQueryFn.call(document, sel),
+    docById: (id) => docByIdFn.call(document, id),
+    docElementFromPoint: (x, y) => docElementFromPointFn.call(document, x, y),
+  };
 
   // --- Element reference map ---
   // Persistent ref IDs stored as WeakRefs so GC still works
@@ -75,8 +118,9 @@
   };
 
   function getRole(el) {
-    if (el.getAttribute("role")) return el.getAttribute("role");
-    const tag = el.tagName.toLowerCase();
+    const explicitRole = dom.attr(el, "role");
+    if (explicitRole) return explicitRole;
+    const tag = dom.tag(el);
     if (tag === "input") {
       const type = (el.type || "text").toLowerCase();
       const typeRoles = {
@@ -97,36 +141,41 @@
   // --- Accessible name ---
   function getAccessibleName(el) {
     // Priority: aria-label > aria-labelledby > placeholder > title > alt > label > text
-    const ariaLabel = el.getAttribute("aria-label");
+    const ariaLabel = dom.attr(el, "aria-label");
     if (ariaLabel) return ariaLabel.trim();
 
-    const labelledBy = el.getAttribute("aria-labelledby");
+    const labelledBy = dom.attr(el, "aria-labelledby");
     if (labelledBy) {
       const names = labelledBy
         .split(/\s+/)
-        .map((id) => document.getElementById(id)?.textContent?.trim())
+        .map((id) => dom.text(dom.docById(id)).trim())
         .filter(Boolean);
       if (names.length) return names.join(" ");
     }
 
-    if (el.placeholder) return el.placeholder.trim();
-    if (el.title) return el.title.trim();
-    if (el.alt) return el.alt.trim();
+    const placeholder = dom.attr(el, "placeholder");
+    if (placeholder) return placeholder.trim();
+    const title = dom.attr(el, "title");
+    if (title) return title.trim();
+    const alt = dom.attr(el, "alt");
+    if (alt) return alt.trim();
 
     // Associated <label>
-    if (el.id) {
-      const label = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
-      if (label) return label.textContent.trim();
+    const id = dom.attr(el, "id");
+    if (id) {
+      const label = dom.docQuery(`label[for="${CSS.escape(id)}"]`);
+      if (label) return dom.text(label).trim();
     }
-    if (el.closest("label")) {
-      const labelText = el.closest("label").textContent.trim();
+    const labelAncestor = dom.closest(el, "label");
+    if (labelAncestor) {
+      const labelText = dom.text(labelAncestor).trim();
       if (labelText) return labelText;
     }
 
     // Direct text content (only for leaf-ish elements)
-    const tag = el.tagName.toLowerCase();
+    const tag = dom.tag(el);
     if (["a", "button", "h1", "h2", "h3", "h4", "h5", "h6", "li", "summary", "label", "th", "td", "span"].includes(tag)) {
-      const text = el.textContent?.trim();
+      const text = dom.text(el).trim();
       if (text && text.length < 200) return text;
     }
 
@@ -135,18 +184,20 @@
 
   // --- Interactivity check ---
   function isInteractive(el) {
-    const tag = el.tagName.toLowerCase();
+    const tag = dom.tag(el);
     if (["a", "button", "input", "textarea", "select", "summary", "details"].includes(tag)) return true;
-    if (el.getAttribute("role") && ["button", "link", "textbox", "checkbox", "radio", "tab", "menuitem", "switch", "combobox", "slider", "spinbutton", "searchbox", "option"].includes(el.getAttribute("role"))) return true;
-    if (el.tabIndex >= 0) return true;
-    if (el.onclick || el.getAttribute("onclick")) return true;
-    if (el.contentEditable === "true") return true;
+    const role = dom.attr(el, "role");
+    if (role && ["button", "link", "textbox", "checkbox", "radio", "tab", "menuitem", "switch", "combobox", "slider", "spinbutton", "searchbox", "option"].includes(role)) return true;
+    if (typeof el.tabIndex === "number" && el.tabIndex >= 0) return true;
+    if (typeof el.onclick === "function" || dom.attr(el, "onclick")) return true;
+    const contentEditable = dom.attr(el, "contenteditable");
+    if (contentEditable === "" || contentEditable === "true") return true;
     return false;
   }
 
   // --- Visibility check ---
   function isVisible(el) {
-    if (el.offsetParent === null && el.tagName.toLowerCase() !== "body" && getComputedStyle(el).position !== "fixed") return false;
+    if (offsetParentGet.call(el) === null && dom.tag(el) !== "body" && getComputedStyle(el).position !== "fixed") return false;
     const style = getComputedStyle(el);
     if (style.display === "none" || style.visibility === "hidden") return false;
     return true;
@@ -179,9 +230,9 @@
     function walk(el, depth, indent) {
       if (truncated) return;
       if (depth > maxDepth) return;
-      if (!el || el.nodeType !== 1) return;
+      if (!el || dom.nodeType(el) !== 1) return;
 
-      const tag = el.tagName.toLowerCase();
+      const tag = dom.tag(el);
       // Skip invisible, script, style, svg internals
       if (["script", "style", "noscript", "template"].includes(tag)) return;
 
@@ -191,7 +242,7 @@
       const visible = isVisible(el);
 
       // Filter: if interactive-only mode, skip non-interactive non-container elements
-      const isContainer = el.children.length > 0;
+      const isContainer = dom.children(el).length > 0;
       if (filter === "interactive" && !interactive && !isContainer) return;
 
       const shouldShow =
@@ -211,15 +262,18 @@
         if (tag === "img" && el.src) line += ` src="${el.src.substring(0, 100)}"`;
         if (["input", "textarea"].includes(tag) && el.value) line += ` value="${el.value.substring(0, 100)}"`;
         if (tag === "input") line += ` type="${el.type || "text"}"`;
-        if (el.getAttribute("aria-expanded")) line += ` expanded=${el.getAttribute("aria-expanded")}`;
-        if (el.getAttribute("aria-checked")) line += ` checked=${el.getAttribute("aria-checked")}`;
-        if (el.getAttribute("aria-selected")) line += ` selected=${el.getAttribute("aria-selected")}`;
-        if (el.disabled) line += " disabled";
+        const expanded = dom.attr(el, "aria-expanded");
+        if (expanded) line += ` expanded=${expanded}`;
+        const checked = dom.attr(el, "aria-checked");
+        if (checked) line += ` checked=${checked}`;
+        const selected = dom.attr(el, "aria-selected");
+        if (selected) line += ` selected=${selected}`;
+        if (dom.matches(el, ":disabled")) line += " disabled";
 
         // Select options
         if (tag === "select") {
           const opts = Array.from(el.options).map(
-            (o) => `${o.selected ? "*" : " "}${o.value}="${o.textContent.trim()}"`
+            (o) => `${o.selected ? "*" : " "}${o.value}="${dom.text(o).trim()}"`
           );
           if (opts.length) line += ` options=[${opts.join(", ")}]`;
         }
@@ -229,17 +283,18 @@
 
       // Recurse children (including shadow DOM)
       const nextIndent = shouldShow && visible ? indent + "  " : indent;
-      if (el.shadowRoot) {
-        for (const child of el.shadowRoot.children) {
+      const shadow = dom.shadowRoot(el);
+      if (shadow) {
+        for (const child of shadow.children) {
           walk(child, depth + 1, nextIndent);
         }
       }
-      for (const child of el.children) {
+      for (const child of dom.children(el)) {
         walk(child, depth + 1, nextIndent);
       }
     }
 
-    let root = document.body;
+    let root = dom.docBody();
     if (startRefId) {
       const el = resolveRef(startRefId);
       if (el) root = el;
@@ -264,19 +319,19 @@
     ];
     let source = null;
     for (const sel of selectors) {
-      source = document.querySelector(sel);
+      source = dom.docQuery(sel);
       if (source) break;
     }
-    if (!source) source = document.body;
+    if (!source) source = dom.docBody();
 
-    const title = document.title || "";
+    const title = dom.docTitle();
     const url = location.href;
-    const tag = source.tagName.toLowerCase();
+    const tag = dom.tag(source);
 
     // Clean text: remove script/style content, collapse whitespace
     const clone = source.cloneNode(true);
     clone.querySelectorAll("script, style, noscript, template, svg").forEach((el) => el.remove());
-    const text = clone.textContent.replace(/\s+/g, " ").trim();
+    const text = dom.text(clone).replace(/\s+/g, " ").trim();
 
     return JSON.stringify({ title, url, sourceTag: tag, text: text.substring(0, 100000) });
   }
@@ -291,8 +346,9 @@
       const elements = [];
       for (const el of root.querySelectorAll("*")) {
         elements.push(el);
-        if (el.shadowRoot) {
-          elements.push(...collectAll(el.shadowRoot));
+        const shadow = dom.shadowRoot(el);
+        if (shadow) {
+          elements.push(...collectAll(shadow));
         }
       }
       return elements;
@@ -304,22 +360,22 @@
       if (results.length >= 20) break;
       if (!isVisible(el)) continue;
 
-      const tag = el.tagName.toLowerCase();
+      const tag = dom.tag(el);
       if (["script", "style", "noscript", "template"].includes(tag)) continue;
 
       const role = getRole(el) || "";
       const name = getAccessibleName(el) || "";
-      const text = el.textContent?.trim()?.substring(0, 200) || "";
-      const placeholder = el.placeholder || "";
-      const ariaLabel = el.getAttribute("aria-label") || "";
-      const title = el.title || "";
-      const type = el.type || "";
+      const text = dom.text(el).trim().substring(0, 200);
+      const placeholder = dom.attr(el, "placeholder");
+      const ariaLabel = dom.attr(el, "aria-label");
+      const title = dom.attr(el, "title");
+      const type = dom.attr(el, "type");
 
       const searchable = `${role} ${name} ${text} ${placeholder} ${ariaLabel} ${title} ${type} ${tag}`.toLowerCase();
 
       if (searchable.includes(q)) {
         const ref = getOrAssignRef(el);
-        const rect = el.getBoundingClientRect();
+        const rect = dom.rect(el);
         results.push({
           ref,
           role: role || tag,
