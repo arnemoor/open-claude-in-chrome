@@ -434,4 +434,16 @@ describe("file_upload allowlist enforcement", () => {
     assert.ok(req, "native host should have received the browser_batch request");
     assert.deepEqual(req.args.actions[0].input.paths, [fs.realpathSync(reportPath)]);
   });
+
+  it("rejects a nested browser_batch action before anything reaches the browser", async () => {
+    const before = recorded.length;
+    const res = await session.client.callTool({
+      name: "browser_batch",
+      arguments: {
+        actions: [{ name: "browser_batch", input: { actions: [{ name: "navigate", input: { url: "https://example.com", tabId: 123 } }] } }],
+      },
+    });
+    assert.match(res.content[0].text, /^Error: Action 1 \(browser_batch\): nested browser_batch is not allowed\./);
+    assert.equal(recorded.length, before, "native host should not have received anything from the rejected batch");
+  });
 });

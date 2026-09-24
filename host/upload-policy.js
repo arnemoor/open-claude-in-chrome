@@ -77,7 +77,10 @@ export function loadUploadPolicy({ home = os.homedir(), warn = (m) => process.st
 
   const candidates = [];
   for (const entry of rawDirs) {
-    if (typeof entry !== "string") continue;
+    if (typeof entry !== "string") {
+      warn(`open-claude-in-chrome: ignoring non-string fileUploadAllowedDirs entry ${JSON.stringify(entry)}\n`);
+      continue;
+    }
     const expanded = expandHome(entry, home);
     if (!path.isAbsolute(expanded)) {
       warn(`open-claude-in-chrome: ignoring relative fileUploadAllowedDirs entry "${entry}"\n`);
@@ -149,11 +152,11 @@ export function checkUploadPaths(paths, policy) {
     try {
       stat = fs.statSync(real);
     } catch (err) {
-      if (err.code === "ENOENT") return { ok: false, error: `File not found: ${real}.${suffix}` };
-      return { ok: false, error: `Cannot access: ${real} (${err.code}).${suffix}` };
+      if (err.code === "ENOENT") return { ok: false, error: `File not found: ${p}.${suffix}` };
+      return { ok: false, error: `Cannot access: ${p} (${err.code}).${suffix}` };
     }
     if (!stat.isFile()) {
-      return { ok: false, error: `Not a regular file: ${real}.${suffix}` };
+      return { ok: false, error: `Not a regular file: ${p}.${suffix}` };
     }
 
     resolved.push(real);

@@ -122,6 +122,28 @@ test("a relative fileUploadAllowedDirs entry is ignored with a warning, and an e
   assert.doesNotMatch(r.error, /Allowed folders: \./);
 });
 
+test("non-string fileUploadAllowedDirs entries are each ignored with a warning; valid entries still work", () => {
+  const h = home();
+  fs.writeFileSync(
+    path.join(h, ".config", "open-claude-in-chrome", "config.json"),
+    JSON.stringify({ fileUploadAllowedDirs: [42, null, {}, "~/Downloads"] })
+  );
+  const warnings = [];
+  const p = loadUploadPolicy({ home: h, warn: (m) => warnings.push(m) });
+  assert.equal(warnings.length, 3);
+  assert.equal(checkUploadPaths([path.join(h, "Downloads", "ok.txt")], p).ok, true);
+});
+
+test("a symlink to a directory inside Downloads reports the symlink's own path, not its target", () => {
+  const h = home();
+  fs.mkdirSync(path.join(h, "Downloads", "dir"));
+  const dirlink = path.join(h, "Downloads", "dirlink");
+  fs.symlinkSync(path.join(h, "Downloads", "dir"), dirlink);
+  const r = checkUploadPaths([dirlink], loadUploadPolicy({ home: h }));
+  assert.equal(r.ok, false);
+  assert.ok(r.error.startsWith(`Not a regular file: ${dirlink}.`), r.error);
+});
+
 test("a config with a JSON syntax error fails closed and names the reason", () => {
   const h = home();
   fs.writeFileSync(

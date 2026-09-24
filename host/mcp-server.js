@@ -325,14 +325,18 @@ server.tool(
     ).min(1).describe("List of tool calls to execute sequentially. Each item is `{name, input}`: `name` = tool name (e.g. computer, navigate, find, tabs_create_mcp; browser_batch cannot be nested); `input` = that tool's input, same shape you'd pass when calling it directly."),
   },
   async (args) => {
+    const uploadPolicy = loadUploadPolicy();
     const actions = [];
     for (let i = 0; i < args.actions.length; i++) {
       const action = args.actions[i];
+      if (action.name === "browser_batch") {
+        return textResult(`Error: Action ${i + 1} (browser_batch): nested browser_batch is not allowed.`);
+      }
       if (action.name !== "file_upload") {
         actions.push(action);
         continue;
       }
-      const check = checkUploadPaths(action.input?.paths, loadUploadPolicy());
+      const check = checkUploadPaths(action.input?.paths, uploadPolicy);
       if (!check.ok) return textResult(`Error: Action ${i + 1} (file_upload): ${check.error}`);
       actions.push({ ...action, input: { ...action.input, paths: check.resolved } });
     }
