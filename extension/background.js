@@ -556,29 +556,6 @@ async function takeScreenshot(tabId) {
   return { base64, imageId };
 }
 
-// Save a captured image (base64 JPEG) to disk via the Downloads API so it can be
-// attached to a message for the user. Returns the absolute file path. Files land
-// in an "open-claude-in-chrome" subfolder of the browser's Downloads directory.
-async function saveImageToDisk(base64, prefix = "screenshot") {
-  const url = `data:image/jpeg;base64,${base64}`;
-  const filename = `open-claude-in-chrome/${prefix}_${Date.now()}.jpg`;
-  const downloadId = await chrome.downloads.download({ url, filename, saveAs: false });
-  return await new Promise((resolve) => {
-    let done = false;
-    const finish = () => {
-      if (done) return;
-      done = true;
-      chrome.downloads.onChanged.removeListener(onChanged);
-      chrome.downloads.search({ id: downloadId }, (items) => resolve(items?.[0]?.filename || filename));
-    };
-    function onChanged(delta) {
-      if (delta.id === downloadId && delta.state?.current === "complete") finish();
-    }
-    chrome.downloads.onChanged.addListener(onChanged);
-    setTimeout(finish, 3000); // fallback: return whatever path we have
-  });
-}
-
 // --- Mouse helpers ---
 async function dispatchMouse(tabId, type, x, y, opts = {}) {
   await cdp(tabId, "Input.dispatchMouseEvent", {
@@ -761,15 +738,12 @@ const toolHandlers = {
         const { base64, imageId } = await takeScreenshot(tabId);
         const vp = await readViewport(tabId);
         const dims = vp ? `${vp.width}x${vp.height}` : "";
-        let savedNote = "";
-        if (args.save_to_disk) {
-          try { savedNote = ` Saved to disk: ${await saveImageToDisk(base64, "screenshot")}`; }
-          catch (e) { savedNote = ` (save_to_disk failed: ${e.message})`; }
-        }
+        const image = { type: "image", data: base64, mimeType: "image/jpeg" };
+        if (args.save_to_disk) image.saveToDisk = "screenshot";
         return {
           content: [
-            { type: "text", text: `Successfully captured screenshot (${dims}, jpeg) - ID: ${imageId}.${savedNote}` },
-            { type: "image", data: base64, mimeType: "image/jpeg" },
+            { type: "text", text: `Successfully captured screenshot (${dims}, jpeg) - ID: ${imageId}.` },
+            image,
           ],
         };
       }
@@ -938,15 +912,12 @@ const toolHandlers = {
         // Return the full screenshot with the region noted; the caller can crop
         // to it. Screenshots are JPEG (see takeScreenshot), so label them as such.
         const { base64: fullBase64 } = await takeScreenshot(tabId);
-        let savedNote = "";
-        if (args.save_to_disk) {
-          try { savedNote = ` Saved to disk: ${await saveImageToDisk(fullBase64, "zoom")}`; }
-          catch (e) { savedNote = ` (save_to_disk failed: ${e.message})`; }
-        }
+        const image = { type: "image", data: fullBase64, mimeType: "image/jpeg" };
+        if (args.save_to_disk) image.saveToDisk = "zoom";
         return {
           content: [
-            { type: "text", text: `Zoom region: [${args.region.join(", ")}]${savedNote}` },
-            { type: "image", data: fullBase64, mimeType: "image/jpeg" },
+            { type: "text", text: `Zoom region: [${args.region.join(", ")}]` },
+            image,
           ],
         };
       }
@@ -1260,11 +1231,8 @@ const toolHandlers = {
       return { content: [{ type: "text", text: "file_upload requires 'paths' to be a non-empty array of absolute file paths." }] };
     }
 
-    // NOTE: The official file_upload only allows files the user has explicitly
-    // shared with the session (attachments, session output/upload folders,
-    // connected folders). This fork has NO session file-sharing/sandbox model,
-    // so that provenance restriction is NOT enforced here — any absolute path
-    // the caller provides is passed straight to CDP DOM.setFileInputFiles.
+    // The host checks every path against the upload allowlist before a request
+    // reaches the extension (host/upload-policy.js).
     await ensureAttached(tabId);
 
     // Mark the ref'd file input in the shared DOM so we can locate the same node
