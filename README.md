@@ -80,7 +80,7 @@ If more than one native host tries to serve that socket at the same time (for ex
 
 ## Upgrading from the old TCP version
 
-Earlier releases of Open Claude in Chrome connected the MCP server to the native host over a fixed loopback TCP port, authenticated with a shared secret file created on first run. The first MCP server to start owned that port, later sessions connected to it as clients, and one of them would take over if it exited. None of that exists anymore. The native host now owns a per-user Unix socket directly (see Architecture above), so there is no port to pick, no secret file to protect, and no session to promote.
+Earlier releases of Open Claude in Chrome connected the MCP server to the native host over a loopback TCP port (default 18765, configurable through `config.json`), authenticated with a shared secret file at `~/.config/open-claude-in-chrome/token`. The first MCP server to start owned that port, later sessions connected to it as clients, and one of them would take over if it exited. None of that exists anymore. The native host now owns a per-user Unix socket directly (see Architecture above), so there is no port to pick, no secret file to protect, and no session to promote.
 
 To move an existing install to this version:
 
@@ -93,8 +93,9 @@ To move an existing install to this version:
    pkill -f "node.*open-claude-in-chrome/host/mcp-server"
    ```
    then run `/mcp` in each session.
+6. Re-run `./install.sh <your-extension-id>` (the same IDs from your original install) to link the new agent skill into `~/.claude/skills` (see Installation, Step 3).
 
-No manual cleanup is needed beyond that. A leftover `port` key in `~/.config/open-claude-in-chrome/config.json` is simply ignored now (that file's only remaining job is `fileUploadAllowedDirs`, see below), and the shared-secret file earlier versions created is no longer read. Either can stay or be deleted, whichever you prefer.
+No manual cleanup is required beyond that. A leftover `port` key in `~/.config/open-claude-in-chrome/config.json` is simply ignored now (that file's only remaining job is `fileUploadAllowedDirs`, see below), and `~/.config/open-claude-in-chrome/token` is no longer read. You can confirm nothing from the old version is still listening with `lsof -iTCP:18765`. Either file can stay or be deleted.
 
 ## Installation
 
@@ -130,6 +131,8 @@ If you use multiple browsers, pass all IDs:
 ```bash
 ./install.sh <chrome-id> <brave-id> <arc-id>
 ```
+
+This also links an agent-facing skill describing this fork's tool quirks into `~/.claude/skills/open-claude-in-chrome`, if that directory already exists on your machine.
 
 ### Step 4: Restart your browser
 
@@ -188,39 +191,41 @@ The full 22-tool surface of the official Claude in Chrome. Most are fully implem
 
 ## Uploading and saving files
 
-`file_upload`, including a `file_upload` action nested inside `browser_batch`, only accepts absolute paths inside an allowed upload folder. By default that's `~/Downloads` and `~/Desktop`. Set your own list with `fileUploadAllowedDirs` in `~/.config/open-claude-in-chrome/config.json`:
+`file_upload`, including a `file_upload` action nested inside `browser_batch`, only accepts absolute paths inside an allowed upload folder. By default that's `~/Downloads` and `~/Desktop`. Set `fileUploadAllowedDirs` in `~/.config/open-claude-in-chrome/config.json` to use different folders instead, not in addition: once it's set, only the folders you list are allowed, and the refusal names them.
 
 ```json
 { "fileUploadAllowedDirs": ["~/Downloads", "~/Projects/shared-uploads"] }
 ```
 
-`~` expands to your home directory. A path outside the allowed folders, or a symlink that resolves outside them, is refused. If the config file exists but is invalid (bad JSON, or `fileUploadAllowedDirs` set to something other than an array), every upload is refused until it's fixed, and the error message says what to fix. The combined size of the files in a single call is limited to 10 MB.
+Only a leading `~/` expands to your home directory. A bare `~` is left as a relative path and ignored, with a warning. A path outside the allowed folders, or a symlink that resolves outside them, is refused. If the config file exists but is invalid (bad JSON, or `fileUploadAllowedDirs` set to something other than an array), every upload is refused until it's fixed, and the error message says what to fix. The 10 MB combined-size limit applies per `file_upload` action, including inside `browser_batch`, where each nested `file_upload` action is checked, and limited, on its own.
 
 `computer`'s `screenshot` and `zoom` actions take a `save_to_disk: true` argument. The MCP server, not the extension, writes the image to `~/Downloads/open-claude-in-chrome/` (folder mode `0700`, files mode `0600`) and reports the saved path in the reply. The extension no longer needs, or requests, Chrome's `downloads` permission.
+
+macOS privacy protection (TCC) covers `~/Downloads` and `~/Desktop`. `save_to_disk` and `file_upload` run in the MCP server, a child process of whatever terminal or app started Claude Code, so if that app has no Files and Folders access, both come back with an `EPERM` error in the tool reply instead of writing anything (see Troubleshooting).
 
 ## Tool behavior notes
 
 A few things about `computer` and `navigate` that aren't obvious from the tool descriptions alone.
 
-**navigate.** A bare host like `example.com` gets `https://` added automatically. An explicit scheme (`http:`, `https:`, `file:`, `data:`, `about:`, `chrome:`, `view-source:`, and others) is kept as given. `javascript:` URLs are refused (use `javascript_tool` instead), and so is navigating to this extension's own pages. Opening a `file://` URL needs "Allow access to file URLs" enabled for this extension in `chrome://extensions`. If it's off, the reply says so.
+**navigate.** A bare host like `example.com` gets `https://` added automatically. These schemes are kept exactly as given: `http:`, `https:`, `file:`, `data:`, `about:`, `chrome:`, `brave:`, `edge:`, `view-source:`, `blob:`, `ftp:`, and `chrome-extension:` for another extension's id. Anything else is either treated as a mistyped protocol and rewritten (`ws://h` becomes `https://h`) or, if it has no `//`, prefixed with `https://` as a whole (`mailto:a@b` becomes `https://mailto:a@b`), so don't rely on an unlisted scheme surviving as written. `javascript:` URLs are refused (use `javascript_tool` instead), and so is navigating to this extension's own pages. Opening a `file://` URL needs "Allow access to file URLs" enabled for this extension in `chrome://extensions`. If it's off, the reply says so.
 
-**Typing and keys.** `type` sends real per-character key events, including umlauts, emoji and CJK, not a pasted string. A line break in the typed text becomes a real line break only when a `textarea` or a contenteditable element is focused. In a single-line `<input>` it's dropped, and the reply notes that. Use the `key` action with `text: "Enter"` to submit a form. Some shifted punctuation can't be built as a `key` combination (for example `shift+1` presses Shift and 1, not `!`). Type that character directly instead.
+**Typing and keys.** `type` presses real keys, with real keydown/keyup events, only for characters on a US keyboard layout (letters, digits, common punctuation). Every other character (umlauts, ß, emoji, CJK) is inserted as text instead, one character at a time, with no key events at all, though the field's value ends up exactly right either way. A line break in the typed text becomes a real line break only when a `textarea` or a contenteditable element is focused. In a single-line `<input>` it's dropped, and the reply notes that. Use the `key` action with `text: "Enter"` to submit a form. Some shifted punctuation can't be built as a `key` combination (for example `shift+1` presses Shift and 1, not `!`). Type that character directly instead.
 
-**Clicking.** A click reply names what it actually hit, for example `Clicked at (120, 40) on button#submit "Sign in".` A note like `Warning: The click point is covered by …` means something else is stacked on top of the target. Take a screenshot before trying again. A coordinate outside the current viewport is refused outright (`Scroll first or use a ref`). Clicking by element `ref` (from `read_page` or `find`) scrolls it into view instead and says so in the reply, since any coordinate read from an earlier screenshot is now stale.
+**Clicking.** A click reply always names what it actually hit, for example `Clicked at (120, 40) on button#submit "Sign in".` Compare that name against what you meant to click. Only a **ref** click (`ref` from `read_page` or `find`) additionally warns `Warning: The click point is covered by …` when something else is stacked on top. A plain coordinate click has no such warning. Only the name of what it hit tells you whether it landed on the wrong thing. A coordinate outside the current viewport is refused outright (`Scroll first or use a ref`). Clicking by element `ref` scrolls it into view instead and says so in the reply, since any coordinate read from an earlier screenshot is now stale.
 
 ## Audit mode
 
-The extension can keep a local, opt-in audit log of what an agent does in the browser, for the user's own oversight. It's off by default. Only the extension's own options page (open it from `chrome://extensions`, or right-click the extension's toolbar icon and choose Options) can turn it on or change its retention period (1, 7 or 30 days). No MCP tool can read or change this setting.
+The extension can keep a local, opt-in audit log of what an agent does in the browser, for the user's own oversight. It's off by default. Only the extension's own options page (`chrome://extensions` > Open Claude in Chrome > Details > Extension options) can turn it on or change its retention period (1, 7 or 30 days). No MCP tool can read or change this setting, and it never changes a tool's result.
 
-When it's on, each session's tool calls are recorded as a redacted summary (a `type` action records how many characters were typed, never the text itself, and a URL has its query string and fragment blanked out) alongside a masked screen recording of the tabs it touched, with every input value masked, including passwords. Everything lives in the browser profile's own IndexedDB and never leaves the machine. Entries older than the retention period are pruned automatically, and at most 200 sessions are kept regardless of age.
+When it's on, each session's tool calls are recorded as a redacted summary. `type` is kept only as a character count, never the text. `form_input` keeps a character count for a string value, and just `[number]` or `checked=...` for a number or boolean, never the value itself. A navigated URL has its query string and fragment blanked out. `javascript_tool` code (up to 500 characters), `find` queries and `file_upload` paths are recorded as given, since they matter for oversight, so never rely on `javascript_tool` to keep something out of the log. Alongside that summary, a masked DOM replay (via rrweb) of the tabs the session touched blanks every input, textarea and select value on screen. It doesn't inline canvas content or images, and a page this extension can't script at all (a `chrome://` page, the Web Store) gets no replay. Everything lives in the browser profile's own IndexedDB and never leaves the machine. Entries older than the retention period are pruned automatically, and at most 200 sessions are kept regardless of age.
 
-The options page lists sessions by label, working directory, pid, first and last seen, action count and tab count. Clicking one shows its action list and a replay player for each recorded tab, plus buttons to export that session as JSON or delete it.
+The options page lists sessions by label, working directory, pid, first and last seen, action count and tab count. Clicking one shows its action list and a replay player with a tab selector, plus buttons to export that session as JSON or delete it.
 
 This is meant for oversight, not as tamper-proof forensic evidence. It's ordinary browser-profile storage, not a signed or write-once log.
 
 ## Logs
 
-The native host and each MCP server keep their own JSON-lines log under `~/.config/open-claude-in-chrome/logs/` (`native-host.log` and `mcp-server.log`, folder mode `0700`, files mode `0600`). Entries are lifecycle events only, things like a hub starting, a client connecting, or a process exiting and why. Tool arguments and results are never written there. Each file is capped at about 1 MB and rotates to a single `.log.1` generation (for example `native-host.log.1`), so at most roughly 2 MB of history is kept per file. These logs are the only durable record of what the native host or an MCP server did between restarts, worth checking when something in Troubleshooting below doesn't explain itself.
+The native host and every MCP server write JSON-lines logs under `~/.config/open-claude-in-chrome/logs/` (folder mode `0700`, files mode `0600`). The native host has its own `native-host.log`. Every MCP server process, across every Claude Code session, appends to the same shared `mcp-server.log`, with each line's `pid` field identifying which one wrote it. Entries are lifecycle events only, things like a hub starting, a client connecting, or a process exiting and why. Tool arguments and results are never written there. Each file is capped at about 1 MB and rotates to a single `.log.1` generation (for example `native-host.log.1`), so at most roughly 2 MB of history is kept per file. These logs are the only durable record of what the native host or an MCP server did between restarts, worth checking when something in Troubleshooting below doesn't explain itself.
 
 ## Updating After Code Changes
 
@@ -228,7 +233,7 @@ No build step. All files are plain JavaScript. After pulling or editing code:
 
 | What changed | What to do |
 |---|---|
-| `extension/background.js` or `extension/content.js` or `extension/manifest.json` | Reload the extension: `brave://extensions` > click the reload icon |
+| `extension/background.js`, `extension/content.js`, `extension/manifest.json`, anything under `extension/audit/` or `extension/vendor/`, or the `extension/options.*` files | Reload the extension: `brave://extensions` > click the reload icon |
 | `host/*.js` (`native-host.js`, `mcp-server.js`, `bridge-hub.js`, `bridge-client.js`, `bridge-endpoint.js`) | Restart the browser (new native host), then `pkill -f "node.*open-claude-in-chrome/host/mcp-server"` and `/mcp` in each Claude Code session |
 | `install.sh` or native host name changed | Re-run `./install.sh <extension-id>`, restart browser, re-add MCP |
 
@@ -278,16 +283,27 @@ claude mcp add open-claude-in-chrome -- node /absolute/path/to/host/mcp-server.j
 
 ### "Browser extension is not connected"
 
-The MCP server is running but no native host is attached. Check, in order:
+The MCP server is running, but no native host is serving the bridge socket. Check, in order:
 1. **Is the browser running?** The extension and its native host only exist while the browser is open — no browser means no connection.
 2. Open any webpage to wake the service worker.
-3. Reload the extension in `chrome://extensions` — a fresh service worker reconnects the native host to the running server.
+3. Reload the extension in `chrome://extensions`. A fresh service worker starts a new native host, which serves the socket again, and the MCP servers reconnect on their own.
 4. Check service worker logs: `chrome://extensions` > "Inspect views: service worker".
 5. Verify `host/native-host-wrapper.sh` exists and its `node` path is valid.
 
 ### Socket permission error
 
-The native host creates `~/.config/open-claude-in-chrome/run` with mode `0700` each time it starts, and tightens it back to `0700` automatically if it finds looser permissions there, as long as the directory is a real directory you own. It refuses to serve the bridge instead, and logs why, only when the path genuinely isn't usable: a symlink, a plain file, a directory owned by someone else, or a parent directory it cannot create or reach at all. Remove or fix whatever is at that path (or its parent), then restart the browser.
+The native host creates `~/.config/open-claude-in-chrome/run` with mode `0700` each time it starts, and tightens it back to `0700` automatically if it finds looser permissions there, as long as the directory is a real directory you own. It refuses to serve the bridge instead, and logs why as a `start_failed` entry in `~/.config/open-claude-in-chrome/logs/native-host.log`, only when the path genuinely isn't usable:
+
+- the run directory is a symlink, a plain file, or owned by someone else
+- its parent directory can't be created or reached at all
+- something other than a socket already sits at the `bridge.sock` path itself
+- the full socket path is too long for a Unix socket (over 103 bytes on macOS, 107 on Linux, which a long home directory path can trigger)
+
+Remove or fix whatever is at that path (or shorten your home directory path), then restart the browser.
+
+### EPERM on `save_to_disk` or `file_upload`
+
+macOS protects `~/Downloads` and `~/Desktop` (TCC). If a screenshot's `save_to_disk` note, or a `file_upload` reply, contains `EPERM`, the app running the MCP server (your terminal, or the Claude app) doesn't have permission to reach that folder. It isn't a wrong path. Fix it in **System Settings > Privacy & Security > Files and Folders**: grant that terminal or app access to Downloads (and Desktop, if you use it), then try again.
 
 ## License
 
