@@ -42,6 +42,7 @@ export class BridgeClient {
     this._reqCounter = 0;
     this._connectWaiters = [];
     this._lastSecurityError = null;
+    this._loggedSecurityError = null; // throttle: security_refusal logs once per distinct message
   }
 
   get connected() { return this._connected; }
@@ -130,7 +131,12 @@ export class BridgeClient {
       } catch (err) {
         if (err instanceof BridgeSecurityError) {
           this._lastSecurityError = err.message;
-          this.log("security_refusal", { message: err.message });
+          // Throttled: retrying every retryMinMs..retryMaxMs against a
+          // directory that stays unsafe would otherwise log every retry.
+          if (err.message !== this._loggedSecurityError) {
+            this._loggedSecurityError = err.message;
+            this.log("security_refusal", { message: err.message });
+          }
         } else {
           this._lastSecurityError = null; // ENOENT: no hub running yet
         }
@@ -194,6 +200,7 @@ export class BridgeClient {
             this._socket = sock;
             this._connected = true;
             this._backoffMs = this.retryMinMs;
+            this._loggedSecurityError = null; // a fresh connect clears the security_refusal throttle
             this.log("bridge_connected", { session: msg.session });
             this._releaseWaiters();
             finish();

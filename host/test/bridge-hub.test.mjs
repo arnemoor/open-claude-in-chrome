@@ -420,3 +420,49 @@ test("a rejected peer that stays half-open is destroyed within a bounded time, n
   sock.write(JSON.stringify({ type: "nope" }) + "\n");
   await waitFor(() => hub._conns.size === 0, 2000);
 });
+
+// --- Task 5 (H5): M2 deferred logging ---------------------------------------
+
+test("a persistent standby-retry failure logs standby_retry_failed once, not every retry", { timeout: 10000 }, async (t) => {
+  const home = tmpHome();
+  const sock = bridgePath(home);
+  const first = await startHub(home);
+  t.after(() => first.hub.stop("cleanup").catch(() => {}));
+  const events = [];
+  const second = new BridgeHub({ sockPath: sock, sendToExtension: () => {}, standbyRetryMs: 50, log: (event, data) => events.push({ event, data }) });
+  t.after(() => second.stop("cleanup").catch(() => {}));
+  assert.equal(await second.start(), "standby");
+  // Replace the still-live socket with a non-socket file. Unlinking a path
+  // never touches an already-open Unix socket, so A keeps serving unaffected,
+  // but every future standby-retry attempt by B now sees a non-socket file at
+  // sockPath and rejects with BridgeSecurityError.
+  fs.unlinkSync(sock);
+  fs.writeFileSync(sock, "not a socket");
+  await waitFor(() => events.some((e) => e.event === "standby_retry_failed"), 2000);
+  await sleep(250); // several more 50ms retry cycles against the same failure
+  const failures = events.filter((e) => e.event === "standby_retry_failed");
+  assert.equal(failures.length, 1, "a persistent identical failure must log exactly once");
+  assert.match(failures[0].data.message, /non-socket/);
+});
+
+test("self_check_failed and its trailing standby retries throttle by message, and reset after recovery", { timeout: 15000 }, async (t) => {
+  const home = tmpHome();
+  const sock = bridgePath(home);
+  const events = [];
+  const { hub } = await startHub(home, { selfCheckMs: 100, standbyRetryMs: 50, log: (event, data) => events.push({ event, data }) });
+  t.after(() => hub.stop("cleanup").catch(() => {}));
+
+  fs.unlinkSync(sock);
+  fs.writeFileSync(sock, "not a socket");
+  await waitFor(() => events.some((e) => e.event === "self_check_failed"), 2000);
+  await sleep(250); // several more 50ms standby-retry cycles against the same failure
+  assert.equal(events.filter((e) => e.event === "self_check_failed").length, 1, "the self-check's own reacquire attempt logs once");
+  assert.equal(events.filter((e) => e.event === "standby_retry_failed").length, 1, "the standby retries that follow must also throttle to one log");
+
+  // Recovery clears both throttles: an identical later failure must log again.
+  fs.unlinkSync(sock);
+  await waitFor(() => hub.state === "serving", 2000);
+  fs.unlinkSync(sock);
+  fs.writeFileSync(sock, "not a socket");
+  await waitFor(() => events.filter((e) => e.event === "self_check_failed").length === 2, 2000);
+});

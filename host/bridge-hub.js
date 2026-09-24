@@ -47,6 +47,8 @@ export class BridgeHub {
     this._server = null; // the currently-live listening server, or null
     this._standbyTimer = null;
     this._selfCheckTimer = null;
+    this._lastStandbyRetryError = null; // throttle: standby_retry_failed logs once per distinct message
+    this._lastSelfCheckError = null; // throttle: self_check_failed logs once per distinct message
   }
 
   get state() { return this._state; }
@@ -186,6 +188,13 @@ export class BridgeHub {
   // logs, and arms the follow-up timer (self-check or standby retry).
   _applyAcquireResult(result, servingEvent) {
     if (result.outcome === "aborted") return "stopped";
+    // Any non-throwing resolution (serving or standby) means whatever caused
+    // a prior standby-retry/self-check failure is no longer happening, so a
+    // later identical failure is a new incident and should log again. Reset
+    // here, once, since both call sites (a standby retry and a self-check)
+    // funnel their success through this function.
+    this._lastStandbyRetryError = null;
+    this._lastSelfCheckError = null;
     if (result.outcome === "serving") {
       this._server = result.server;
       this._ino = result.ino;
@@ -205,9 +214,15 @@ export class BridgeHub {
       if (this._state !== "standby") return;
       this._tryBecomeServer().then(
         (result) => this._applyAcquireResult(result, "takeover"),
-        () => {
+        (err) => {
           // A background retry has no caller to report a failure to. Stay in
           // standby and keep trying rather than take the host process down.
+          // Log it, throttled: a persistent failure (e.g. a non-socket file
+          // left at sockPath) would otherwise log every standbyRetryMs.
+          if (err.message !== this._lastStandbyRetryError) {
+            this._lastStandbyRetryError = err.message;
+            this.log("standby_retry_failed", { message: err.message });
+          }
           if (this._state !== "stopped") {
             this._state = "standby";
             this._scheduleStandbyRetry();
@@ -249,7 +264,12 @@ export class BridgeHub {
     try {
       const result = await this._tryBecomeServer();
       this._applyAcquireResult(result, "takeover");
-    } catch {
+    } catch (err) {
+      // Throttled for the same reason as the standby-retry failure below.
+      if (err.message !== this._lastSelfCheckError) {
+        this._lastSelfCheckError = err.message;
+        this.log("self_check_failed", { message: err.message });
+      }
       if (this._state !== "stopped") {
         this._state = "standby";
         this._scheduleStandbyRetry();

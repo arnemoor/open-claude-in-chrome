@@ -116,3 +116,32 @@ test("a grace-timeout rejection drops its waiter instead of leaking it until the
   await assert.rejects(c.request("javascript_tool", { text: "x".repeat(1000) }), (e) => e.message === NOT_CONNECTED);
   assert.equal(c._connectWaiters.length, 0, "the timed-out request's waiter must not remain queued");
 });
+
+// --- Task 5 (H5): M5 deferred logging ---------------------------------------
+
+test("a persistent security refusal logs security_refusal once, and again after a successful connect clears it", { timeout: 10000 }, async (t) => {
+  const home = tmpHome();
+  const { hub } = await startHub(home);
+  t.after(() => hub.stop("cleanup").catch(() => {}));
+  fs.chmodSync(bridgeDir(home), 0o755);
+  t.after(() => { try { fs.chmodSync(bridgeDir(home), 0o700); } catch {} });
+  const events = [];
+  const c = client(home, { retryMinMs: 20, retryMaxMs: 20, log: (event, data) => events.push({ event, data }) });
+  t.after(() => c.close());
+
+  await waitFor(() => events.some((e) => e.event === "security_refusal"));
+  await sleep(150); // several more 20ms retries against the same unsafe directory
+  assert.equal(events.filter((e) => e.event === "security_refusal").length, 1, "a persistent identical refusal must log exactly once");
+
+  fs.chmodSync(bridgeDir(home), 0o700);
+  await waitFor(() => c.connected, 2000);
+  assert.equal(events.filter((e) => e.event === "bridge_connected").length, 1);
+
+  // A later, identical refusal after a successful connect must log again.
+  await hub.stop("test");
+  fs.chmodSync(bridgeDir(home), 0o755);
+  await waitFor(() => events.filter((e) => e.event === "security_refusal").length === 2, 3000);
+
+  c.close();
+  fs.chmodSync(bridgeDir(home), 0o700);
+});
