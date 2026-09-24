@@ -11,6 +11,7 @@ import path from "node:path";
 import { z } from "zod";
 import { BridgeClient } from "./bridge-client.js";
 import { bridgePath } from "./bridge-endpoint.js";
+import { checkUploadPaths, loadUploadPolicy } from "./upload-policy.js";
 
 const bridge = new BridgeClient({
   sockPath: bridgePath(),
@@ -329,13 +330,17 @@ server.tool(
 // 20. file_upload
 server.tool(
   "file_upload",
-  "Upload one or multiple files to a file input element on the page. Do not click on file upload buttons or file inputs — clicking opens a native file picker dialog that you cannot see or interact with. Instead, use read_page or find to locate the file input element, then use this tool with its ref to upload files directly. Only files the user has shared with this session (attachments, the session's outputs/uploads folders, or folders the user has connected) can be uploaded; other paths will be rejected. The combined size of all files in a single call must stay under 10 MB.",
+  "Upload one or multiple files to a file input element on the page. Do not click on file upload buttons or file inputs — clicking opens a native file picker dialog that you cannot see or interact with. Instead, use read_page or find to locate the file input element, then use this tool with its ref to upload files directly. Only files inside the allowed upload folders can be uploaded (by default ~/Downloads, ~/Desktop and the system temp folders, configurable with fileUploadAllowedDirs in ~/.config/open-claude-in-chrome/config.json); other paths will be rejected. The combined size of all files in a single call must stay under 10 MB.",
   {
-    paths: z.array(z.string()).describe("Absolute paths to the files to upload. Each must be a file the user has shared with this session."),
+    paths: z.array(z.string()).describe("Absolute paths to the files to upload. Each must be inside an allowed upload folder."),
     ref: z.string().describe('Element reference ID of the file input from read_page/find (e.g. "ref_1").'),
     tabId: z.number().describe("Tab ID where the file input is located."),
   },
-  async (args) => callTool("file_upload", args)
+  async (args) => {
+    const check = checkUploadPaths(args.paths, loadUploadPolicy());
+    if (!check.ok) return textResult(`Error: ${check.error}`);
+    return callTool("file_upload", { ...args, paths: check.resolved });
+  }
 );
 
 // 21. list_connected_browsers

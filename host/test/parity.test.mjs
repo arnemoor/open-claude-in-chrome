@@ -88,6 +88,8 @@ const EXAMPLE_INPUTS = {
 
 function isolatedEnv() {
   const home = fs.mkdtempSync("/tmp/ocic-");
+  fs.mkdirSync(path.join(home, "Downloads"), { recursive: true });
+  fs.writeFileSync(path.join(home, "Downloads", "report.txt"), "report");
   return { env: { ...process.env, HOME: home, OCIC_CONNECT_GRACE_MS: "2000" }, home };
 }
 
@@ -236,7 +238,7 @@ function schemaProblems(served, fixture) {
 // Mirror mcp-server.js pre-validation coercion (mcp-server.js:445-466) so the
 // dispatch expectation matches what the server actually forwards to the native
 // host (e.g. a string tabId is coerced to a number before validation).
-function expectedArgs(input) {
+function expectedArgs(input, name) {
   const args = structuredClone(input);
   if (args && typeof args === "object" && !Array.isArray(args)) {
     if (typeof args.tabId === "string") args.tabId = Number(args.tabId);
@@ -244,6 +246,10 @@ function expectedArgs(input) {
       if (typeof args[k] === "string") {
         try { args[k] = JSON.parse(args[k]); } catch { /* leave as-is */ }
       }
+    }
+    // file_upload resolves paths to realpaths before dispatch (e.g. /tmp -> /private/tmp on macOS).
+    if (name === "file_upload" && Array.isArray(args.paths)) {
+      args.paths = args.paths.map((p) => fs.realpathSync(p));
     }
   }
   return args;
@@ -325,6 +331,7 @@ describe("dispatch parity (each tool reaches the browser with matching args)", (
   before(async () => {
     const iso = isolatedEnv();
     home = iso.home;
+    EXAMPLE_INPUTS.file_upload.paths = [path.join(home, "Downloads", "report.txt")];
     nativeHost = await startRecordingHub(home, recorded);
     session = await startSession(iso.env);
     const routed = await waitForRoute(session.client);
@@ -362,9 +369,45 @@ describe("dispatch parity (each tool reaches the browser with matching args)", (
 
       assert.deepEqual(
         req.args,
-        expectedArgs(input),
+        expectedArgs(input, name),
         `'${name}' must dispatch the caller's arguments (after mcp-server coercion) unchanged`
       );
     });
   }
+});
+
+// --- TEST 4: file_upload allowlist enforcement --------------------------------
+// A path outside the allowed upload folders must be rejected by the host
+// before it ever reaches the browser extension.
+
+describe("file_upload allowlist enforcement", () => {
+  let session;
+  let home;
+  let nativeHost;
+  const recorded = [];
+
+  before(async () => {
+    const iso = isolatedEnv();
+    home = iso.home;
+    nativeHost = await startRecordingHub(home, recorded);
+    session = await startSession(iso.env);
+    const routed = await waitForRoute(session.client);
+    assert.ok(routed, "mock native host should attach to the primary and route tool calls");
+    recorded.length = 0; // discard the readiness-probe request(s)
+  });
+
+  after(async () => {
+    if (session) await session.transport.close().catch(() => {});
+    if (nativeHost) await nativeHost.stop();
+    try { fs.rmSync(home, { recursive: true, force: true }); } catch {}
+  });
+
+  it("rejects a path outside the allowed upload folders before it reaches the browser", async () => {
+    const res = await session.client.callTool({
+      name: "file_upload",
+      arguments: { paths: ["/etc/hosts"], ref: "ref_1", tabId: 123 },
+    });
+    assert.match(res.content[0].text, /^Error: Not in an allowed upload folder/);
+    assert.ok(!recorded.some((r) => r.tool === "file_upload"), "native host should not have received a file_upload request");
+  });
 });
