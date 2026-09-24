@@ -41,16 +41,6 @@ const log = (event, data = {}) => {
 };
 const hub = new BridgeHub({ sockPath: bridgePath(), sendToExtension: writeNativeMessage, log });
 
-// A missing or corrupt package.json must not crash the host before the exit
-// handlers below even exist to record why.
-let version = "unknown";
-try {
-  ({ version } = JSON.parse(fs.readFileSync(new URL("./package.json", import.meta.url), "utf-8")));
-} catch {
-  // fall back to "unknown"
-}
-log("start", { version, node: process.version });
-
 let stdinBuffer = Buffer.alloc(0);
 process.stdin.on("data", (chunk) => {
   stdinBuffer = Buffer.concat([stdinBuffer, chunk]);
@@ -69,12 +59,29 @@ async function exit(code, reason) {
   process.exit(code);
 }
 
+// Registered before the "start" log line below: until a signal has a
+// registered handler, the OS default disposition applies and can terminate
+// the process immediately — even mid synchronous execution, since signal
+// delivery is not blocked by JS being single threaded — with no exit line
+// at all. Nothing here awaits, so by the time any of these can actually
+// fire (which requires yielding back to the event loop), the whole
+// synchronous setup below has already finished running.
 process.stdin.on("end", () => exit(0, "stdin closed"));
 process.on("SIGTERM", () => exit(0, "SIGTERM"));
 process.on("SIGINT", () => exit(0, "SIGINT"));
 // `throw undefined` / `throw null` is legal JS; err.stack would then throw
 // inside this handler itself, so Node's crash exits with no exit line at all.
 process.on("uncaughtException", (err) => exit(1, `uncaught: ${String(err?.stack ?? err)}`));
+
+// A missing or corrupt package.json must not crash the host before the exit
+// handlers above even exist to record why.
+let version = "unknown";
+try {
+  ({ version } = JSON.parse(fs.readFileSync(new URL("./package.json", import.meta.url), "utf-8")));
+} catch {
+  // fall back to "unknown"
+}
+log("start", { version, node: process.version });
 
 // An unsafe bridge directory must not crash-loop us: the extension would respawn this
 // process every 2 s. Stay alive and retry, so the problem shows up in the log.

@@ -20,7 +20,6 @@ const log = (event, data = {}) => {
   process.stderr.write(`[mcp-server] ${event} ${JSON.stringify(data)}\n`);
   logger.info(event, data);
 };
-log("start", { cwd: process.cwd() });
 
 const bridge = new BridgeClient({
   sockPath: bridgePath(),
@@ -28,7 +27,6 @@ const bridge = new BridgeClient({
   graceMs: Number(process.env.OCIC_CONNECT_GRACE_MS) || 5000,
   log,
 });
-bridge.start();
 
 function sendToExtension(tool, args) {
   return bridge.request(tool, args);
@@ -41,18 +39,18 @@ function shutdown(reason) {
   process.exit(0);
 }
 
+// Registered before the "start" log line below (and before bridge.start()):
+// until a signal has a registered handler, the OS default disposition
+// applies and can terminate the process immediately — even mid synchronous
+// execution, since signal delivery is not blocked by JS being single
+// threaded — with no exit line at all. Nothing here awaits, so by the time
+// any of these can actually fire (which requires yielding back to the event
+// loop), the whole synchronous setup below has already finished running.
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGHUP", () => shutdown("SIGHUP"));
 process.stdin.on("end", () => shutdown("stdin closed"));
 process.stdin.resume();
-
-// Exit if the parent dies without closing our stdin: we get re-parented.
-const initialPpid = process.ppid;
-setInterval(() => {
-  if (process.ppid !== initialPpid) shutdown("parent exited");
-}, 5000).unref();
-
 // The MCP SDK runs tool handlers inside its own request loop; a bug there
 // would otherwise crash us with no record of why. Log it and exit non-zero
 // rather than let Node print to a stderr nobody is watching.
@@ -64,6 +62,15 @@ process.on("uncaughtException", (err) => {
   logger.error("exit", { reason });
   process.exit(1);
 });
+
+log("start", { cwd: process.cwd() });
+bridge.start();
+
+// Exit if the parent dies without closing our stdin: we get re-parented.
+const initialPpid = process.ppid;
+setInterval(() => {
+  if (process.ppid !== initialPpid) shutdown("parent exited");
+}, 5000).unref();
 
 // --- Helper to wrap tool results for MCP ---
 

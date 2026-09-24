@@ -187,7 +187,6 @@ export class BridgeHub {
   // logs, and arms the follow-up timer (self-check or standby retry).
   _applyAcquireResult(result, servingEvent) {
     if (result.outcome === "aborted") return "stopped";
-    const enteringStandby = result.outcome !== "serving" && this._state !== "standby";
     // A non-throwing resolution (serving or standby) means whatever caused a
     // prior standby-retry failure is no longer happening, so a later
     // identical failure is a new incident and should log again.
@@ -200,15 +199,23 @@ export class BridgeHub {
       this._scheduleSelfCheck();
       return "serving";
     }
-    this._state = "standby";
-    // Every standby retry against a live peer resolves "standby" again; log
-    // only the transition into standby. Otherwise a hub parked in standby
-    // (e.g. behind a browser that owns the socket) writes a "standby" line
-    // every standbyRetryMs forever — about 43,200 lines a day at the 2s
-    // default, which rotates the real history away within hours.
-    if (enteringStandby) this.log("standby", { sockPath: this.sockPath });
-    this._scheduleStandbyRetry();
+    this._enterStandby();
     return "standby";
+  }
+
+  // Transitions into standby, logging "standby" only if we weren't already
+  // there. Shared by every path that can reach standby: a fresh _tryBecomeServer
+  // resolution (above), a failed self-check reacquire, and a standby retry
+  // re-affirming it's still standby. Without this, a hub parked in standby
+  // behind a live peer would write a "standby" line every standbyRetryMs
+  // forever — about 43,200 lines a day at the 2s default, rotating the real
+  // history away within hours — and a self-check's fallback to standby (a
+  // real serving-to-standby role switch) would never log at all.
+  _enterStandby() {
+    const wasStandby = this._state === "standby";
+    this._state = "standby";
+    if (!wasStandby) this.log("standby", { sockPath: this.sockPath });
+    this._scheduleStandbyRetry();
   }
 
   _scheduleStandbyRetry() {
@@ -230,10 +237,7 @@ export class BridgeHub {
             this._lastStandbyRetryError = key;
             this.log("standby_retry_failed", { message: err.message });
           }
-          if (this._state !== "stopped") {
-            this._state = "standby";
-            this._scheduleStandbyRetry();
-          }
+          if (this._state !== "stopped") this._enterStandby();
         },
       );
     }, this.standbyRetryMs);
@@ -278,10 +282,7 @@ export class BridgeHub {
       // displacement anyway, and the standby retries that follow have their
       // own throttle above.
       this.log("self_check_failed", { message: err.message });
-      if (this._state !== "stopped") {
-        this._state = "standby";
-        this._scheduleStandbyRetry();
-      }
+      if (this._state !== "stopped") this._enterStandby();
     }
   }
 

@@ -40,6 +40,28 @@ test("fixed fields (ts, pid, name, level, event) always win over a same-named pa
   assert.equal(l[0].foo, "bar", "a non-colliding payload key still comes through");
 });
 
+test("a payload key that only exists on Object.prototype is not mistaken for a fixed-field collision", () => {
+  const home = tmpHome();
+  const log = createLogger("unit3", { home });
+  log.info("myevent", { constructor: "x", toString: "y", hasOwnProperty: "z" });
+  const l = lines(logFile(home, "unit3"));
+  assert.equal(l.length, 1);
+  assert.equal(l[0].constructor, "x", "constructor is an ordinary payload key, not a fixed field");
+  assert.equal(l[0].toString, "y", "toString is an ordinary payload key, not a fixed field");
+  assert.equal(l[0].hasOwnProperty, "z", "hasOwnProperty is an ordinary payload key, not a fixed field");
+});
+
+test("a null or omitted payload is treated as {}, not a hard failure that drops the line", () => {
+  const home = tmpHome();
+  const log = createLogger("unit4", { home });
+  log.info("start", null);
+  log.info("exit");
+  const l = lines(logFile(home, "unit4"));
+  assert.equal(l.length, 2, "both calls must still produce a line");
+  assert.equal(l[0].event, "start");
+  assert.equal(l[1].event, "exit");
+});
+
 test("rotates past maxBytes", () => {
   const home = tmpHome();
   const log = createLogger("rot", { home, maxBytes: 200 });
@@ -165,7 +187,11 @@ test("12 concurrent processes rotating and appending at once: no dropped lines, 
   assert.ok(fs.existsSync(rotatedFile), "the burst must have triggered a rotation");
   const rotatedContent = fs.readFileSync(rotatedFile, "utf8");
   assert.ok(rotatedContent.startsWith(seedContent), ".1 must start with the complete, uncorrupted seed content");
-  assert.ok(!fs.existsSync(logFile(home, name) + ".2"), "maxBytes and line sizes were chosen so a second rotation cannot happen inside the burst");
+  // maxBytes and line sizes were chosen so a second rotation cannot happen
+  // inside the burst, and every lock is removed in a finally: the logs dir
+  // must hold exactly the log and its one rotation, nothing else (no .2, no
+  // leftover .lock).
+  assert.deepEqual(fs.readdirSync(logDir(home)).sort(), [`${name}.log`, `${name}.log.1`].sort());
 
   const burstLines = (mainContent + rotatedContent).trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)).filter((l) => l.event === "burst");
   assert.equal(burstLines.length, CHILD_COUNT * 2, "all 24 lines from the 12 processes must be present across the log and .1, none dropped");

@@ -72,10 +72,13 @@ export function createLogger(name, { home = os.homedir(), maxBytes = 1_000_000 }
       // Fixed fields are assembled first and never overwritten: a same-named
       // key in `data` (e.g. a hub forwarding a client's own pid) must not be
       // able to shadow the writing process's own pid, timestamp, name,
-      // level or event.
+      // level or event. Object.hasOwn (not `in`) so a payload key that only
+      // exists on Object.prototype (constructor, toString, ...) is treated
+      // as an ordinary key, not mistaken for a collision. A null/undefined
+      // payload (info(event, null)) is treated as {}, not a hard failure.
       const line = { ts: new Date().toISOString(), pid: process.pid, name, level, event };
-      for (const [k, v] of Object.entries(data)) {
-        if (!(k in line)) line[k] = v;
+      for (const [k, v] of Object.entries(data ?? {})) {
+        if (!Object.hasOwn(line, k)) line[k] = v;
       }
       fs.appendFileSync(file, JSON.stringify(line) + "\n", { mode: 0o600 });
     } catch {

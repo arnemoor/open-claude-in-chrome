@@ -535,3 +535,22 @@ test("client_connected and client_disconnected carry session, clientPid, label a
   const disconnectedA = events.find((e) => e.event === "client_disconnected").data;
   assert.deepEqual(disconnectedA, { session: "s1", clientPid: 1, label: "app-a", clients: 1 }, "clients is the post-disconnect count");
 });
+
+// --- Task 5 (H5) fix round 2 -------------------------------------------------
+
+test("a serving hub whose self-check fails logs standby exactly once, including across the retries that follow (N2)", { timeout: 10000 }, async (t) => {
+  const home = tmpHome();
+  const sock = bridgePath(home);
+  const events = [];
+  const { hub } = await startHub(home, { selfCheckMs: 100, standbyRetryMs: 50, log: (event) => events.push(event) });
+  t.after(() => hub.stop("cleanup").catch(() => {}));
+  fs.unlinkSync(sock);
+  fs.writeFileSync(sock, "not a socket");
+  await waitFor(() => events.some((e) => e === "self_check_failed"), 2000);
+  await sleep(250); // several more 50ms standby-retry cycles against the same failure
+  assert.equal(
+    events.filter((e) => e === "standby").length,
+    1,
+    "the self-check's fallback to standby (a real serving-to-standby role switch) must log once, and the retries that follow must not log again",
+  );
+});
