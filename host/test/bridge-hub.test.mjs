@@ -3,9 +3,10 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import net from "node:net";
 import { spawn } from "node:child_process";
-import { bridgePath } from "../bridge-endpoint.js";
+import { BridgeHub } from "../bridge-hub.js";
+import { bridgePath, bridgeDir } from "../bridge-endpoint.js";
 import { BridgeSecurityError } from "../bridge-endpoint.js";
-import { tmpHome, startHub, waitFor, sleep } from "./helpers.mjs";
+import { tmpHome, startHub, waitFor, sleep, fakeExtension } from "./helpers.mjs";
 
 function rawClient(sockPath) {
   const sock = net.createConnection(sockPath);
@@ -179,4 +180,200 @@ test("the socket is 0600 and stop() only removes a socket that is still ours", {
   assert.ok(fs.existsSync(sock), "hub A must not delete hub B's socket");
   await b.hub.stop("test");
   assert.ok(!fs.existsSync(sock));
+});
+
+// --- Fix round: I1, I2, I3, M1, M3, M4 --------------------------------------
+
+test("stop() closes a silent pre-hello peer instead of waiting out its hello timeout", { timeout: 10000 }, async (t) => {
+  const home = tmpHome();
+  const { hub } = await startHub(home, { helloTimeoutMs: 2000 });
+  t.after(() => hub.stop("cleanup").catch(() => {}));
+  const silent = net.createConnection(bridgePath(home)); silent.on("error", () => {});
+  t.after(() => silent.destroy());
+  await new Promise((r) => silent.once("connect", r));
+  await sleep(20);
+  const t0 = Date.now();
+  await hub.stop("test");
+  const elapsed = Date.now() - t0;
+  assert.ok(elapsed < 1000, `stop() took ${elapsed}ms, expected well under the 2000ms hello timeout`);
+  // stop() destroying the hub-side socket needs a moment to reach the peer.
+  await waitFor(() => silent.destroyed || silent.readyState === "closed", 1000);
+});
+
+test("a hello sent after stop() begins is refused, nothing reaches the extension, and stop() still resolves promptly", { timeout: 10000 }, async (t) => {
+  const home = tmpHome();
+  const { hub, ext } = await startHub(home);
+  const p = rawClient(bridgePath(home));
+  t.after(() => p.sock.destroy());
+  await new Promise((r) => p.sock.once("connect", r));
+  await sleep(20);
+  const t0 = Date.now();
+  const stopP = hub.stop("test");
+  p.send({ type: "hello", protocol: 2, pid: 1, ppid: 1, cwd: "/w", label: "late" });
+  await sleep(50);
+  p.send({ type: "tool_request", id: "1", tool: "computer", args: {} });
+  await stopP;
+  assert.ok(Date.now() - t0 < 1000, "stop() must resolve promptly even with a late hello arriving");
+  await sleep(50);
+  assert.ok(!p.lines.some((l) => l.type === "welcome"), "a late hello must not be welcomed");
+  assert.equal(ext.received.length, 0, "nothing may reach the extension after stop() begins");
+});
+
+test("stop() never removes or replaces the socket of a hub that currently owns the path", { timeout: 10000 }, async (t) => {
+  const home = tmpHome();
+  const sock = bridgePath(home);
+  const A = await startHub(home, { helloTimeoutMs: 1500 });
+  t.after(() => A.hub.stop("cleanup").catch(() => {}));
+  const silent = net.createConnection(sock); silent.on("error", () => {});
+  t.after(() => silent.destroy());
+  await new Promise((r) => silent.once("connect", r));
+  fs.unlinkSync(sock);
+  const B = await startHub(home);
+  t.after(() => B.hub.stop("cleanup").catch(() => {}));
+  const inoB = fs.statSync(sock).ino;
+  const C = await startHub(home, { standbyRetryMs: 50 });
+  t.after(() => C.hub.stop("cleanup").catch(() => {}));
+  assert.equal(C.state, "standby");
+  await A.hub.stop("test");
+  await sleep(150);
+  assert.equal(fs.statSync(sock).ino, inoB, "B's socket must survive A.stop()");
+  assert.equal(B.hub.state, "serving");
+  assert.notEqual(C.hub.state, "serving", "C must not end up claiming to serve an unreachable path");
+  const c = await helloClient(sock);
+  t.after(() => c.sock.destroy());
+  c.send({ type: "tool_request", id: "1", tool: "find", args: {} });
+  await waitFor(() => B.ext.received.length === 1);
+  assert.equal(C.ext.received.length, 0);
+});
+
+test("two hubs starting at the same instant against a stale socket: exactly one serves, every time", { timeout: 20000 }, async (t) => {
+  for (let i = 0; i < 5; i++) {
+    const home = tmpHome();
+    const sock = bridgePath(home);
+    fs.mkdirSync(sock.replace(/\/bridge\.sock$/, ""), { recursive: true, mode: 0o700 });
+    const child = spawn(process.execPath, ["--input-type=commonjs", "-e",
+      "require('net').createServer().listen(process.argv[1]); setInterval(() => {}, 1000);", sock], { stdio: "ignore" });
+    t.after(() => { try { child.kill("SIGKILL"); } catch {} });
+    await waitFor(() => fs.existsSync(sock));
+    child.kill("SIGKILL");
+    await new Promise((r) => child.once("exit", r));
+
+    const extB = fakeExtension();
+    const extC = fakeExtension();
+    const B = new BridgeHub({ sockPath: sock, sendToExtension: extB.send, standbyRetryMs: 100000 });
+    const C = new BridgeHub({ sockPath: sock, sendToExtension: extC.send, standbyRetryMs: 100000 });
+    extB.attach(B); extC.attach(C);
+    t.after(() => Promise.all([B.stop("cleanup").catch(() => {}), C.stop("cleanup").catch(() => {})]));
+    const [sb, sc] = await Promise.all([B.start(), C.start()]);
+    assert.ok((sb === "serving") !== (sc === "serving"), `iteration ${i}: exactly one of B/C must serve (got B=${sb}, C=${sc})`);
+
+    const c = await helloClient(sock);
+    c.send({ type: "tool_request", id: "1", tool: "find", args: {} });
+    await waitFor(() => extB.received.length + extC.received.length === 1);
+    c.sock.destroy();
+    await B.stop("test"); await C.stop("test");
+  }
+});
+
+test("a serving hub notices it was displaced and serves again within selfCheckMs", { timeout: 10000 }, async (t) => {
+  const home = tmpHome();
+  const sock = bridgePath(home);
+  const { hub, ext } = await startHub(home, { selfCheckMs: 100 });
+  t.after(() => hub.stop("cleanup").catch(() => {}));
+  const inoBefore = fs.statSync(sock).ino;
+  fs.unlinkSync(sock);
+  await waitFor(() => fs.existsSync(sock) && fs.statSync(sock).ino !== inoBefore, 2000);
+  assert.equal(hub.state, "serving");
+  const c = await helloClient(sock);
+  t.after(() => c.sock.destroy());
+  c.send({ type: "tool_request", id: "1", tool: "find", args: {} });
+  await waitFor(() => ext.received.length === 1);
+});
+
+test("stop() called while start() is still in flight resolves start() as \"stopped\" and nothing keeps listening", { timeout: 10000 }, async (t) => {
+  const home = tmpHome();
+  const A = await startHub(home); // occupies the path so B's start() goes through the probe/link-retry path
+  t.after(() => A.hub.stop("cleanup").catch(() => {}));
+  const extB = fakeExtension();
+  const B = new BridgeHub({ sockPath: bridgePath(home), sendToExtension: extB.send, standbyRetryMs: 50 });
+  extB.attach(B);
+  t.after(() => B.stop("cleanup").catch(() => {}));
+  const startP = B.start();
+  await B.stop("test");
+  const startResult = await startP;
+  assert.equal(startResult, "stopped");
+  assert.equal(B.state, "stopped");
+  await sleep(200); // give any lingering retry/standby logic a chance to misbehave
+  assert.equal(B.state, "stopped", "state must not flip back to standby/serving after stop()");
+  assert.ok(!B._server || !B._server.listening, "B must not be left listening after an aborted start()");
+  const leftover = fs.readdirSync(bridgeDir(home)).filter((f) => f !== "bridge.sock");
+  assert.deepEqual(leftover, [], "no stray temp socket files after an aborted start()");
+});
+
+test("after \"Expected hello.\" the hub ignores anything else from that peer, even a later valid hello", { timeout: 10000 }, async (t) => {
+  const home = tmpHome();
+  const events = [];
+  const { hub, ext } = await startHub(home, { log: (e) => events.push(e) });
+  t.after(() => hub.stop("cleanup").catch(() => {}));
+  // allowHalfOpen keeps the peer's read side open after the hub's end() sends
+  // a FIN, so its later writes actually reach the hub instead of the whole
+  // connection auto-closing first (matches the reviewer's probe technique).
+  const sock = net.createConnection(bridgePath(home));
+  sock.allowHalfOpen = true;
+  sock.on("error", () => {});
+  t.after(() => sock.destroy());
+  const lines = []; let buf = "";
+  sock.on("data", (d) => { buf += d; let i; while ((i = buf.indexOf("\n")) !== -1) { lines.push(JSON.parse(buf.slice(0, i))); buf = buf.slice(i + 1); } });
+  await new Promise((r) => sock.once("connect", r));
+  sock.write(JSON.stringify({ type: "nope" }) + "\n"); // triggers "Expected hello." + end()
+  await waitFor(() => lines.some((l) => l.type === "error"));
+  sock.write(JSON.stringify({ type: "hello", protocol: 2, pid: 1, ppid: 1, cwd: "/w", label: "late" }) + "\n");
+  sock.write(JSON.stringify({ type: "tool_request", id: "1", tool: "find", args: {} }) + "\n");
+  await sleep(150);
+  // Check the internal signal directly: a Node stream quirk (write-after-end
+  // failing silently) can make the peer's own view look clean even when the
+  // hub internally still accepted the late hello, so client-observable lines
+  // alone are not a reliable check here.
+  assert.ok(!events.includes("client_connected"), "a hello after rejection must never be accepted, even internally");
+  assert.equal(ext.received.length, 0, "nothing may be forwarded from a rejected peer");
+});
+
+test("an oversized line destroys the connection quickly, proving the length check rather than the hello timer", { timeout: 10000 }, async (t) => {
+  const home = tmpHome();
+  const { hub } = await startHub(home, { helloTimeoutMs: 5000, maxLineBytes: 1024 });
+  t.after(() => hub.stop("cleanup").catch(() => {}));
+  const sock = bridgePath(home);
+  const big = net.createConnection(sock); big.on("error", () => {});
+  t.after(() => big.destroy());
+  await new Promise((r) => big.once("connect", r));
+  const t0 = Date.now();
+  big.write("x".repeat(4096)); // no newline
+  await waitFor(() => big.destroyed, 2000);
+  assert.ok(Date.now() - t0 < 500, "the oversized line must be caught well before the 5000ms hello timer");
+});
+
+test('a tool_request without a tool string gets "Malformed request."', { timeout: 10000 }, async (t) => {
+  const home = tmpHome();
+  const { hub, ext } = await startHub(home);
+  t.after(() => hub.stop("cleanup").catch(() => {}));
+  const c = await helloClient(bridgePath(home));
+  t.after(() => c.sock.destroy());
+  c.send({ type: "tool_request", id: "1", args: {} }); // missing tool
+  await waitFor(() => c.lines.some((l) => l.type === "tool_error"));
+  assert.equal(c.lines.find((l) => l.type === "tool_error").error, "Malformed request.");
+  assert.equal(ext.received.length, 0);
+});
+
+test('sending the same request id twice while the first is pending gets "Duplicate request id." for the second', { timeout: 10000 }, async (t) => {
+  const home = tmpHome();
+  const { hub, ext } = await startHub(home);
+  t.after(() => hub.stop("cleanup").catch(() => {}));
+  const c = await helloClient(bridgePath(home));
+  t.after(() => c.sock.destroy());
+  c.send({ type: "tool_request", id: "1", tool: "find", args: {} });
+  c.send({ type: "tool_request", id: "1", tool: "find", args: {} });
+  await waitFor(() => c.lines.some((l) => l.type === "tool_error"));
+  assert.equal(c.lines.find((l) => l.type === "tool_error").error, "Duplicate request id.");
+  await sleep(50);
+  assert.equal(ext.received.length, 1, "the extension must receive exactly one request");
 });
