@@ -22,3 +22,15 @@ test("says so when the browser limits the size", async () => {
   const r = await bg.handlers.resize_window({ width: 200, height: 100, tabId: bg.tabId });
   assert.match(r.content[0].text, /^Resized window to 500x400 \(viewport 500x313\)\. Requested 200x100: the browser limited the size/);
 });
+
+test("a hung viewport read doesn't stall the reply near the CDP timeout", { timeout: 5000 }, async () => {
+  let size = { width: 1200, height: 800 };
+  const bg = await loadBackground({ overrides: { windows: {
+    get: async (id) => ({ id, state: "normal", ...size }),
+    update: async (id, p) => { if (p.width) size = { width: p.width, height: p.height }; },
+  }, debugger: { sendCommand: async (t, m) => (m === "Runtime.evaluate" ? new Promise(() => {}) : {}) } } });
+  const start = Date.now();
+  const r = await bg.handlers.resize_window({ width: 900, height: 600, tabId: bg.tabId });
+  assert.ok(Date.now() - start < 2500, `took ${Date.now() - start}ms`);
+  assert.equal(r.content[0].text, "Resized window to 900x600.");
+});

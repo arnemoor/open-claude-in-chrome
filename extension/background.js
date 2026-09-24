@@ -198,13 +198,17 @@ async function cdp(tabId, method, params = {}, timeoutMs) {
 
 // Read the page's viewport size, e.g. for the screenshot/read_page/resize_window
 // replies. Returns null instead of throwing so callers can just omit that part of
-// their message (for example on a chrome:// page that refuses to attach).
-async function readViewport(tabId) {
+// their message (for example on a chrome:// page that refuses to attach, or one
+// that's stuck on an open JS dialog and won't answer Runtime.evaluate at all). A
+// viewport read is trivial, so it gets a short default timeout instead of
+// inheriting cdp()'s full 30s — callers with a tighter budget (resize_window) pass
+// their own.
+async function readViewport(tabId, timeoutMs = 2000) {
   try {
     const result = await cdp(tabId, "Runtime.evaluate", {
       expression: "[innerWidth, innerHeight]",
       returnByValue: true,
-    });
+    }, timeoutMs);
     const value = result?.result?.value;
     if (result?.exceptionDetails || !Array.isArray(value)) return null;
     const [width, height] = value;
@@ -935,13 +939,17 @@ const toolHandlers = {
 
     await chrome.windows.update(windowId, { width, height });
 
-    // Wait for the page to reflow: poll until two consecutive viewport reads agree.
-    let vp = await readViewport(tabId);
+    // Wait for the page to reflow: poll until two consecutive viewport reads agree,
+    // within a ~1s budget overall. Give each read only whatever budget is still
+    // left (floored at 100ms), so a page that never answers Runtime.evaluate (e.g.
+    // stuck on an open JS dialog) can't stall the reply anywhere near readViewport's
+    // own default timeout, let alone cdp()'s full 30s.
     let elapsed = 0;
+    let vp = await readViewport(tabId, Math.max(1000 - elapsed, 100));
     while (vp && elapsed < 1000) {
       await sleep(100);
       elapsed += 100;
-      const next = await readViewport(tabId);
+      const next = await readViewport(tabId, Math.max(1000 - elapsed, 100));
       const stable = next && next.width === vp.width && next.height === vp.height;
       vp = next;
       if (stable) break;
