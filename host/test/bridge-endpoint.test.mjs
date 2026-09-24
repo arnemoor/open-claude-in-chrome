@@ -1,4 +1,4 @@
-import { test } from "node:test";
+import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import net from "node:net";
@@ -7,8 +7,10 @@ import {
   bridgeDir, bridgePath, prepareBridgeDir, verifyBridgeDir,
   verifySocketOwner, assertSocketPathFits, BridgeSecurityError,
 } from "../bridge-endpoint.js";
+import { tmpHome, cleanupTmpDirs } from "./helpers.mjs";
 
-const tmpHome = () => fs.mkdtempSync("/tmp/ocic-");
+after(cleanupTmpDirs);
+
 const mode = (p) => fs.lstatSync(p).mode & 0o777;
 
 test("paths derive from HOME", () => {

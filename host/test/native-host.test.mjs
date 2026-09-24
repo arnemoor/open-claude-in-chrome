@@ -1,11 +1,13 @@
-import { test } from "node:test";
+import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { BridgeClient } from "../bridge-client.js";
 import { bridgePath } from "../bridge-endpoint.js";
-import { tmpHome, waitFor } from "./helpers.mjs";
+import { tmpHome, waitFor, cleanupTmpDirs } from "./helpers.mjs";
+
+after(cleanupTmpDirs);
 
 const HOST = path.join(import.meta.dirname, "..", "native-host.js");
 const frame = (obj) => { const b = Buffer.from(JSON.stringify(obj)); const h = Buffer.alloc(4); h.writeUInt32LE(b.length); return Buffer.concat([h, b]); };

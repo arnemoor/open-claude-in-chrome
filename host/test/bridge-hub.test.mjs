@@ -1,4 +1,4 @@
-import { test } from "node:test";
+import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import net from "node:net";
@@ -7,7 +7,9 @@ import { spawn } from "node:child_process";
 import { BridgeHub } from "../bridge-hub.js";
 import { bridgePath, bridgeDir } from "../bridge-endpoint.js";
 import { BridgeSecurityError } from "../bridge-endpoint.js";
-import { tmpHome, startHub, waitFor, sleep, fakeExtension } from "./helpers.mjs";
+import { tmpHome, startHub, waitFor, sleep, fakeExtension, cleanupTmpDirs } from "./helpers.mjs";
+
+after(cleanupTmpDirs);
 
 function rawClient(sockPath) {
   const sock = net.createConnection(sockPath);

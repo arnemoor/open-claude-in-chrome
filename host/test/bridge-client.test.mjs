@@ -1,9 +1,11 @@
-import { test } from "node:test";
+import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { BridgeClient, NOT_CONNECTED, LOST } from "../bridge-client.js";
 import { bridgePath, bridgeDir, prepareBridgeDir } from "../bridge-endpoint.js";
-import { tmpHome, startHub, waitFor, sleep } from "./helpers.mjs";
+import { tmpHome, startHub, waitFor, sleep, cleanupTmpDirs } from "./helpers.mjs";
+
+after(cleanupTmpDirs);
 
 const client = (home, opts = {}) => {
   const c = new BridgeClient({ sockPath: bridgePath(home), hello: { pid: process.pid, ppid: process.ppid, cwd: "/w/x", label: "x" }, retryMinMs: 20, retryMaxMs: 100, ...opts });

@@ -2,7 +2,26 @@ import fs from "node:fs";
 import { BridgeHub } from "../bridge-hub.js";
 import { bridgePath } from "../bridge-endpoint.js";
 
-export const tmpHome = () => fs.mkdtempSync("/tmp/ocic-");
+// Every temp dir any test creates through mkdtemp()/tmpHome() is tracked here
+// so one cleanupTmpDirs() call (registered once per test file via node:test's
+// after()) can remove them all. /tmp stays the base rather than os.tmpdir():
+// the bridge socket path must fit under the platform's sun_path limit.
+const createdTmpDirs = [];
+
+export function mkdtemp(prefix = "/tmp/ocic-") {
+  const dir = fs.mkdtempSync(prefix);
+  createdTmpDirs.push(dir);
+  return dir;
+}
+
+export const tmpHome = () => mkdtemp();
+
+export function cleanupTmpDirs() {
+  for (const dir of createdTmpDirs.splice(0)) {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
+}
+
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 export async function waitFor(pred, timeoutMs = 3000, stepMs = 20) {

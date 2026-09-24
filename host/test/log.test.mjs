@@ -1,11 +1,13 @@
-import { test } from "node:test";
+import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { createLogger } from "../log.js";
-import { tmpHome, waitFor } from "./helpers.mjs";
+import { tmpHome, waitFor, cleanupTmpDirs } from "./helpers.mjs";
+
+after(cleanupTmpDirs);
 
 const logDir = (home) => path.join(home, ".config", "open-claude-in-chrome", "logs");
 const logFile = (home, name) => path.join(logDir(home), `${name}.log`);

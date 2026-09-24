@@ -1,12 +1,15 @@
-import { test } from "node:test";
+import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { loadUploadPolicy, checkUploadPaths } from "../upload-policy.js";
+import { mkdtemp, cleanupTmpDirs } from "./helpers.mjs";
+
+after(cleanupTmpDirs);
 
 function home() {
-  const h = fs.mkdtempSync("/tmp/ocic-");
+  const h = mkdtemp();
   fs.mkdirSync(path.join(h, "Downloads"));
   fs.mkdirSync(path.join(h, ".config", "open-claude-in-chrome"), { recursive: true });
   fs.writeFileSync(path.join(h, "Downloads", "ok.txt"), "ok");
