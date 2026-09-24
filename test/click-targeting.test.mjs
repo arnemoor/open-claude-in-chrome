@@ -9,8 +9,14 @@ let browser;
 before(async () => { if (chromeAvailable) browser = await launchChrome(); }, { timeout: 30000 });
 after(() => browser?.close());
 
-async function setup(html) {
-  const page = await openPage(browser, { html: `<body style="margin:0">${html}<script>window.clicked = [];document.addEventListener("click", (e) => clicked.push(e.target.id || e.target.tagName), true);</script></body>` });
+async function setup(html, { doctype = false } = {}) {
+  // No doctype means quirks mode, where html/body always stretch to fill the viewport
+  // regardless of content — masking the containing-block bug N1 fixes (its two html/body
+  // scenarios only reproduce in standards mode, where a short page leaves html/body only as
+  // tall as their actual content). Opt into standards mode with doctype: true where that
+  // distinction matters; every other test here relies on the existing quirks-mode behaviour.
+  const prefix = doctype ? "<!doctype html>" : "";
+  const page = await openPage(browser, { html: `${prefix}<body style="margin:0">${html}<script>window.clicked = [];document.addEventListener("click", (e) => clicked.push(e.target.id || e.target.tagName), true);</script></body>` });
   const cs = await injectContentScript(page, CONTENT);
   const bg = await loadBackground({ page, content: cs });
   const refOf = async (q) => (await cs.invoke({ type: "findElements", query: q })).result.find((r) => r.name === q);
@@ -255,14 +261,18 @@ test("a coordinate click on a label with a disabled control carries a warning", 
 // position:fixed element's only clip is the viewport, and an absolutely positioned box's
 // containing block is its nearest non-static ancestor, so it escapes any unpositioned
 // overflow:hidden wrapper in between.
+// Standards mode matters here: in quirks mode (no doctype), html/body always stretch to fill
+// the viewport regardless of content, which happens to mask this bug entirely. In standards
+// mode, a short page (its only content a position:fixed button, which contributes nothing to
+// flow sizing) leaves html/body's own rect only as tall as their actual content — here, zero.
 test("find does not flag a fixed element off-screen due to html's own overflow", { skip: !chromeAvailable, timeout: 20000 }, async () => {
-  const { bg } = await setup(`<style>html{overflow-x:hidden}</style><button id="cookie" style="position:fixed;bottom:0;left:0">Accept</button>`);
+  const { bg } = await setup(`<style>html{overflow-x:hidden}</style><button id="cookie" style="position:fixed;bottom:0;left:0">Accept</button>`, { doctype: true });
   const r = await bg.handlers.find({ query: "Accept", tabId: bg.tabId });
   assert.doesNotMatch(r.content[0].text, /off-screen/);
 });
 
 test("find does not flag a fixed element off-screen due to body's own overflow", { skip: !chromeAvailable, timeout: 20000 }, async () => {
-  const { bg } = await setup(`<style>body{overflow:hidden}</style><button id="modal-btn" style="position:fixed;top:10px;left:10px">Close</button>`);
+  const { bg } = await setup(`<style>body{overflow:hidden}</style><button id="modal-btn" style="position:fixed;top:10px;left:10px">Close</button>`, { doctype: true });
   const r = await bg.handlers.find({ query: "Close", tabId: bg.tabId });
   assert.doesNotMatch(r.content[0].text, /off-screen/);
 });
