@@ -78,7 +78,12 @@ export class BridgeHub {
 
       if (this._state === "stopped") return { outcome: "aborted" };
 
-      const tmpPath = `${this.sockPath}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
+      // A dot-prefixed 10-char name (".t" + 8 hex) is one byte shorter than
+      // "bridge.sock" itself, so any sockPath that already passed the check
+      // above cannot have its temp placement name overflow the platform's
+      // sun_path limit. Checked again anyway, in case that ever changes.
+      const tmpPath = path.join(path.dirname(this.sockPath), `.t${crypto.randomBytes(4).toString("hex")}`);
+      assertSocketPathFits(tmpPath);
       const tmpServer = net.createServer((sock) => this._onConnection(sock));
       tmpServer.on("error", () => {}); // safety net; the promise below owns real listen errors
       await new Promise((resolve, reject) => {
@@ -284,6 +289,7 @@ export class BridgeHub {
       cwd: undefined,
       buffer: Buffer.alloc(0),
       helloTimer: null,
+      rejectTimer: null,
     };
     this._conns.add(conn);
 
@@ -343,6 +349,10 @@ export class BridgeHub {
         this._writeLine(conn.socket, { type: "error", error: "Expected hello." });
         this.log("peer_rejected", { reason: "bad_hello" });
         conn.socket.end();
+        // end() alone only half-closes our side; a peer that keeps reading
+        // (allowHalfOpen) would otherwise never be dropped except by stop().
+        conn.rejectTimer = setTimeout(() => conn.socket.destroy(), 1000);
+        conn.rejectTimer.unref();
         return;
       }
       clearTimeout(conn.helloTimer);
@@ -407,6 +417,7 @@ export class BridgeHub {
 
   _onClose(conn) {
     clearTimeout(conn.helloTimer);
+    clearTimeout(conn.rejectTimer);
     this._conns.delete(conn);
     if (!conn.ready) return;
     for (const [hubId, pending] of this._pending) {

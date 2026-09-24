@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import net from "node:net";
+import path from "node:path";
 import { spawn } from "node:child_process";
 import { BridgeHub } from "../bridge-hub.js";
 import { bridgePath, bridgeDir } from "../bridge-endpoint.js";
@@ -376,4 +377,46 @@ test('sending the same request id twice while the first is pending gets "Duplica
   assert.equal(c.lines.find((l) => l.type === "tool_error").error, "Duplicate request id.");
   await sleep(50);
   assert.equal(ext.received.length, 1, "the extension must receive exactly one request");
+});
+
+// --- Re-review round 2: temp-name path length, rejected half-open peer -----
+
+test("a sockPath at the platform's maximum length still serves (the temp placement name must not overflow it)", { timeout: 10000 }, async (t) => {
+  const maxLen = process.platform === "linux" ? 107 : 103;
+  const suffixLen = bridgePath("X").length - 1; // fixed length path.join adds beyond home
+  const targetHomeLen = maxLen - suffixLen;
+  const base = tmpHome();
+  const fillerLen = targetHomeLen - base.length - 1; // -1 for path.join's separator
+  assert.ok(fillerLen > 0, "tmpHome() base is already too long to hit the target length in this test");
+  const home = path.join(base, "a".repeat(fillerLen));
+  fs.mkdirSync(home, { recursive: true });
+  const sock = bridgePath(home);
+  assert.equal(Buffer.byteLength(sock), maxLen, "test setup sanity: sockPath must be exactly at the platform maximum");
+
+  const { hub, ext, state } = await startHub(home);
+  t.after(() => hub.stop("cleanup").catch(() => {}));
+  assert.equal(state, "serving");
+  const c = await helloClient(sock);
+  t.after(() => c.sock.destroy());
+  c.send({ type: "tool_request", id: "1", tool: "find", args: {} });
+  await waitFor(() => ext.received.length === 1);
+});
+
+test("a rejected peer that stays half-open is destroyed within a bounded time, not left dangling until stop()", { timeout: 10000 }, async (t) => {
+  const home = tmpHome();
+  const { hub } = await startHub(home);
+  t.after(() => hub.stop("cleanup").catch(() => {}));
+  // allowHalfOpen keeps the peer's read side open after the hub's end() sends
+  // a FIN, so it would otherwise sit connected (and tracked) forever. Once a
+  // Unix socket's readable side has ended, the peer that still holds its
+  // writable side open gets no passive signal that the far end later fully
+  // destroyed its own end (no pending read/write to surface it on) — so this
+  // checks the hub's own bookkeeping directly rather than the peer's socket.
+  const sock = net.createConnection(bridgePath(home));
+  sock.allowHalfOpen = true;
+  sock.on("error", () => {});
+  t.after(() => sock.destroy());
+  await new Promise((r) => sock.once("connect", r));
+  sock.write(JSON.stringify({ type: "nope" }) + "\n");
+  await waitFor(() => hub._conns.size === 0, 2000);
 });
