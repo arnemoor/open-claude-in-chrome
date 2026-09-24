@@ -196,6 +196,24 @@ async function cdp(tabId, method, params = {}, timeoutMs) {
   return rawCdp(tabId, method, params, timeoutMs);
 }
 
+// Read the page's viewport size, e.g. for the screenshot/read_page/resize_window
+// replies. Returns null instead of throwing so callers can just omit that part of
+// their message (for example on a chrome:// page that refuses to attach).
+async function readViewport(tabId) {
+  try {
+    const result = await cdp(tabId, "Runtime.evaluate", {
+      expression: "[innerWidth, innerHeight]",
+      returnByValue: true,
+    });
+    const value = result?.result?.value;
+    if (result?.exceptionDetails || !Array.isArray(value)) return null;
+    const [width, height] = value;
+    return { width, height };
+  } catch {
+    return null;
+  }
+}
+
 // Clean up when tab is closed
 chrome.tabs.onRemoved.addListener((tabId) => {
   tabGroupTabs.delete(tabId);
@@ -539,14 +557,8 @@ const toolHandlers = {
     switch (action) {
       case "screenshot": {
         const { base64, imageId } = await takeScreenshot(tabId);
-        // Get viewport dimensions for the response message
-        let dims = "";
-        try {
-          const vp = await cdp(tabId, "Runtime.evaluate", {
-            expression: "window.innerWidth + 'x' + window.innerHeight",
-          });
-          if (vp?.result?.value) dims = vp.result.value;
-        } catch {}
+        const vp = await readViewport(tabId);
+        const dims = vp ? `${vp.width}x${vp.height}` : "";
         let savedNote = "";
         if (args.save_to_disk) {
           try { savedNote = ` Saved to disk: ${await saveImageToDisk(base64, "screenshot")}`; }
@@ -742,13 +754,8 @@ const toolHandlers = {
 
     let tree = resp?.result || "Error: Could not generate accessibility tree";
     // Append viewport dimensions so Claude knows the coordinate space
-    try {
-      await ensureAttached(tabId);
-      const vp = await cdp(tabId, "Runtime.evaluate", {
-        expression: "window.innerWidth + 'x' + window.innerHeight",
-      });
-      if (vp?.result?.value) tree += `\n\nViewport: ${vp.result.value}`;
-    } catch {}
+    const vp = await readViewport(tabId);
+    if (vp) tree += `\n\nViewport: ${vp.width}x${vp.height}`;
     return { content: [{ type: "text", text: tree }] };
   },
 
@@ -913,8 +920,41 @@ const toolHandlers = {
     if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
 
     const tab = await chrome.tabs.get(tabId);
-    await chrome.windows.update(tab.windowId, { width, height });
-    return { content: [{ type: "text", text: `Resized window to ${width}x${height}` }] };
+    const windowId = tab.windowId;
+
+    // A maximized/fullscreen window ignores a width/height update, so un-maximize
+    // first and wait for that to actually take effect before requesting the size.
+    let win = await chrome.windows.get(windowId);
+    if (win.state !== "normal") {
+      await chrome.windows.update(windowId, { state: "normal" });
+      for (let waited = 0; win.state !== "normal" && waited < 1000; waited += 50) {
+        win = await chrome.windows.get(windowId);
+        if (win.state !== "normal") await sleep(50);
+      }
+    }
+
+    await chrome.windows.update(windowId, { width, height });
+
+    // Wait for the page to reflow: poll until two consecutive viewport reads agree.
+    let vp = await readViewport(tabId);
+    let elapsed = 0;
+    while (vp && elapsed < 1000) {
+      await sleep(100);
+      elapsed += 100;
+      const next = await readViewport(tabId);
+      const stable = next && next.width === vp.width && next.height === vp.height;
+      vp = next;
+      if (stable) break;
+    }
+
+    win = await chrome.windows.get(windowId);
+    let text = `Resized window to ${win.width}x${win.height}`;
+    if (vp) text += ` (viewport ${vp.width}x${vp.height})`;
+    text += ".";
+    if (win.width !== width || win.height !== height) {
+      text += ` Requested ${width}x${height}: the browser limited the size (screen size or minimum window size).`;
+    }
+    return { content: [{ type: "text", text }] };
   },
 
   // Run a sequence of tool actions in order and aggregate their content blocks
