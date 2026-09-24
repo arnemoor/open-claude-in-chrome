@@ -410,4 +410,28 @@ describe("file_upload allowlist enforcement", () => {
     assert.match(res.content[0].text, /^Error: Not in an allowed upload folder/);
     assert.ok(!recorded.some((r) => r.tool === "file_upload"), "native host should not have received a file_upload request");
   });
+
+  it("rejects a browser_batch file_upload action outside the allowed folders, before anything reaches the browser", async () => {
+    const res = await session.client.callTool({
+      name: "browser_batch",
+      arguments: {
+        actions: [{ name: "file_upload", input: { paths: ["/etc/hosts"], ref: "ref_1", tabId: 123 } }],
+      },
+    });
+    assert.match(res.content[0].text, /^Error: Action 1 \(file_upload\): Not in an allowed upload folder/);
+    assert.ok(!recorded.some((r) => r.tool === "browser_batch"), "native host should not have received a browser_batch request");
+  });
+
+  it("forwards a browser_batch file_upload action with its path resolved to a realpath", async () => {
+    const reportPath = path.join(home, "Downloads", "report.txt");
+    await session.client.callTool({
+      name: "browser_batch",
+      arguments: {
+        actions: [{ name: "file_upload", input: { paths: [reportPath], ref: "ref_1", tabId: 123 } }],
+      },
+    });
+    const req = recorded.find((r) => r.tool === "browser_batch");
+    assert.ok(req, "native host should have received the browser_batch request");
+    assert.deepEqual(req.args.actions[0].input.paths, [fs.realpathSync(reportPath)]);
+  });
 });

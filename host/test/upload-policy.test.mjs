@@ -23,7 +23,7 @@ test("a file in Downloads is allowed and resolved", () => {
 
 test("files outside the allowed folders are rejected", () => {
   const h = home();
-  const r = checkUploadPaths([path.join(h, "secret.txt")], loadUploadPolicy({ home: h, tmpDirs: [] }));
+  const r = checkUploadPaths([path.join(h, "secret.txt")], loadUploadPolicy({ home: h }));
   assert.equal(r.ok, false);
   assert.match(r.error, /Not in an allowed upload folder/);
   assert.match(r.error, /fileUploadAllowedDirs/);
@@ -32,8 +32,9 @@ test("files outside the allowed folders are rejected", () => {
 test("a symlink inside Downloads that points outside is rejected", () => {
   const h = home();
   fs.symlinkSync(path.join(h, "secret.txt"), path.join(h, "Downloads", "link.txt"));
-  const r = checkUploadPaths([path.join(h, "Downloads", "link.txt")], loadUploadPolicy({ home: h, tmpDirs: [] }));
+  const r = checkUploadPaths([path.join(h, "Downloads", "link.txt")], loadUploadPolicy({ home: h }));
   assert.equal(r.ok, false);
+  assert.match(r.error, /Not in an allowed upload folder/);
 });
 
 test("relative, tilde, missing and directory paths are rejected", () => {
@@ -47,17 +48,38 @@ test("relative, tilde, missing and directory paths are rejected", () => {
 
 test("one bad path rejects the whole call", () => {
   const h = home();
-  const r = checkUploadPaths([path.join(h, "Downloads", "ok.txt"), path.join(h, "secret.txt")], loadUploadPolicy({ home: h, tmpDirs: [] }));
+  const r = checkUploadPaths([path.join(h, "Downloads", "ok.txt"), path.join(h, "secret.txt")], loadUploadPolicy({ home: h }));
   assert.equal(r.ok, false);
+  assert.match(r.error, /Not in an allowed upload folder/);
 });
 
 test("combined size over 10 MB is rejected", () => {
   const h = home();
-  const a = path.join(h, "Downloads", "a.bin");
-  const b = path.join(h, "Downloads", "b.bin");
-  fs.writeFileSync(a, Buffer.alloc(6 * 1024 * 1024));
-  fs.writeFileSync(b, Buffer.alloc(6 * 1024 * 1024));
-  assert.match(checkUploadPaths([a, b], loadUploadPolicy({ home: h })).error, /exceeds the 10 MB limit/);
+  try {
+    const a = path.join(h, "Downloads", "a.bin");
+    const b = path.join(h, "Downloads", "b.bin");
+    fs.writeFileSync(a, Buffer.alloc(6 * 1024 * 1024));
+    fs.writeFileSync(b, Buffer.alloc(6 * 1024 * 1024));
+    assert.match(checkUploadPaths([a, b], loadUploadPolicy({ home: h })).error, /exceeds the 10 MB limit/);
+  } finally {
+    fs.rmSync(h, { recursive: true, force: true });
+  }
+});
+
+test("combined size at exactly 10 MB is accepted, one byte over is rejected", () => {
+  const h = home();
+  try {
+    const a = path.join(h, "Downloads", "a.bin");
+    const b = path.join(h, "Downloads", "b.bin");
+    fs.writeFileSync(a, Buffer.alloc(5 * 1024 * 1024));
+    fs.writeFileSync(b, Buffer.alloc(5 * 1024 * 1024));
+    const p = loadUploadPolicy({ home: h });
+    assert.equal(checkUploadPaths([a, b], p).ok, true);
+    fs.appendFileSync(b, Buffer.alloc(1));
+    assert.match(checkUploadPaths([a, b], p).error, /exceeds the 10 MB limit/);
+  } finally {
+    fs.rmSync(h, { recursive: true, force: true });
+  }
 });
 
 test("fileUploadAllowedDirs replaces the defaults", () => {
@@ -70,12 +92,62 @@ test("fileUploadAllowedDirs replaces the defaults", () => {
   assert.equal(checkUploadPaths([path.join(h, "Downloads", "ok.txt")], p).ok, false);
 });
 
-// Pins the production defaults: with no tmpDirs override, the system temp
-// folders are included alongside the HOME-derived Downloads dir.
-test("defaults include the HOME Downloads dir plus the system temp folders", () => {
+// Pins the production defaults: ~/Downloads and ~/Desktop only. The system
+// temp folders are deliberately NOT defaults (they expose other sessions'
+// data, e.g. other Claude Code sessions' scratch dirs under $TMPDIR).
+test("defaults are exactly the HOME's Downloads and Desktop, never the system temp folders", () => {
   const h = home();
+  fs.mkdirSync(path.join(h, "Desktop"));
   const p = loadUploadPolicy({ home: h });
-  assert.ok(p.allowedDirs.includes(fs.realpathSync(path.join(h, "Downloads"))));
-  assert.ok(p.allowedDirs.includes(fs.realpathSync(os.tmpdir())));
-  assert.ok(p.allowedDirs.includes(fs.realpathSync("/tmp")));
+  assert.deepEqual(p.allowedDirs, [
+    fs.realpathSync(path.join(h, "Downloads")),
+    fs.realpathSync(path.join(h, "Desktop")),
+  ]);
+  assert.ok(!p.allowedDirs.includes(fs.realpathSync("/tmp")));
+  assert.ok(!p.allowedDirs.includes(fs.realpathSync(os.tmpdir())));
+});
+
+test("a relative fileUploadAllowedDirs entry is ignored with a warning, and an empty allowlist says so plainly", () => {
+  const h = home();
+  fs.writeFileSync(path.join(h, ".config", "open-claude-in-chrome", "config.json"), JSON.stringify({ fileUploadAllowedDirs: ["not/absolute"] }));
+  const warnings = [];
+  const p = loadUploadPolicy({ home: h, warn: (m) => warnings.push(m) });
+  assert.deepEqual(p.allowedDirs, []);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /not\/absolute/);
+
+  const r = checkUploadPaths([path.join(h, "Downloads", "ok.txt")], p);
+  assert.equal(r.ok, false);
+  assert.match(r.error, /No upload folder is allowed/);
+  assert.doesNotMatch(r.error, /Allowed folders: \./);
+});
+
+test("a config with a JSON syntax error fails closed and names the reason", () => {
+  const h = home();
+  fs.writeFileSync(
+    path.join(h, ".config", "open-claude-in-chrome", "config.json"),
+    '{ "fileUploadAllowedDirs": ["~/work"], }'
+  );
+  const warnings = [];
+  const p = loadUploadPolicy({ home: h, warn: (m) => warnings.push(m) });
+  assert.deepEqual(p.allowedDirs, []);
+  assert.equal(warnings.length, 1);
+
+  const r = checkUploadPaths([path.join(h, "Downloads", "ok.txt")], p);
+  assert.equal(r.ok, false);
+  assert.match(r.error, /Upload policy config is invalid/);
+  assert.match(r.error, /no folder is allowed/);
+});
+
+test("a config with a non-array fileUploadAllowedDirs fails closed and names the reason", () => {
+  const h = home();
+  fs.writeFileSync(
+    path.join(h, ".config", "open-claude-in-chrome", "config.json"),
+    JSON.stringify({ fileUploadAllowedDirs: "~/uploads" })
+  );
+  const p = loadUploadPolicy({ home: h });
+  const r = checkUploadPaths([path.join(h, "Downloads", "ok.txt")], p);
+  assert.equal(r.ok, false);
+  assert.match(r.error, /Upload policy config is invalid/);
+  assert.match(r.error, /fileUploadAllowedDirs/);
 });

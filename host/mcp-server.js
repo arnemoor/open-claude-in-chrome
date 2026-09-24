@@ -324,13 +324,26 @@ server.tool(
       })
     ).min(1).describe("List of tool calls to execute sequentially. Each item is `{name, input}`: `name` = tool name (e.g. computer, navigate, find, tabs_create_mcp; browser_batch cannot be nested); `input` = that tool's input, same shape you'd pass when calling it directly."),
   },
-  async (args) => callTool("browser_batch", args)
+  async (args) => {
+    const actions = [];
+    for (let i = 0; i < args.actions.length; i++) {
+      const action = args.actions[i];
+      if (action.name !== "file_upload") {
+        actions.push(action);
+        continue;
+      }
+      const check = checkUploadPaths(action.input?.paths, loadUploadPolicy());
+      if (!check.ok) return textResult(`Error: Action ${i + 1} (file_upload): ${check.error}`);
+      actions.push({ ...action, input: { ...action.input, paths: check.resolved } });
+    }
+    return callTool("browser_batch", { ...args, actions });
+  }
 );
 
 // 20. file_upload
 server.tool(
   "file_upload",
-  "Upload one or multiple files to a file input element on the page. Do not click on file upload buttons or file inputs — clicking opens a native file picker dialog that you cannot see or interact with. Instead, use read_page or find to locate the file input element, then use this tool with its ref to upload files directly. Only files inside the allowed upload folders can be uploaded (by default ~/Downloads, ~/Desktop and the system temp folders, configurable with fileUploadAllowedDirs in ~/.config/open-claude-in-chrome/config.json); other paths will be rejected. The combined size of all files in a single call must stay under 10 MB.",
+  "Upload one or multiple files to a file input element on the page. Do not click on file upload buttons or file inputs — clicking opens a native file picker dialog that you cannot see or interact with. Instead, use read_page or find to locate the file input element, then use this tool with its ref to upload files directly. Only files inside the allowed upload folders can be uploaded (by default ~/Downloads and ~/Desktop, configurable with fileUploadAllowedDirs in ~/.config/open-claude-in-chrome/config.json); other paths will be rejected. The combined size of all files in a single call must stay under 10 MB.",
   {
     paths: z.array(z.string()).describe("Absolute paths to the files to upload. Each must be inside an allowed upload folder."),
     ref: z.string().describe('Element reference ID of the file input from read_page/find (e.g. "ref_1").'),
