@@ -688,8 +688,10 @@ const toolHandlers = {
       const target = resp?.result;
       if (!target || target.error) return { content: [{ type: "text", text: target?.error || `Could not resolve ref "${args.ref}".` }] };
       coordinate = [target.x, target.y];
+      // Captured regardless of action: left_click_drag needs to know a ref scroll happened
+      // even though it doesn't report hit/notes the way a click does (see its case below).
+      scrolled = target.scrolled;
       if (isPointerAction) {
-        scrolled = target.scrolled;
         hit = target.hit;
         notes = target.notes;
       }
@@ -866,6 +868,12 @@ const toolHandlers = {
       case "left_click_drag": {
         if (!args.start_coordinate || !coordinate) {
           return { content: [{ type: "text", text: "start_coordinate and coordinate are required for left_click_drag" }] };
+        }
+        // start_coordinate was read from a screenshot taken before resolving the ref. If that
+        // resolution had to scroll the page, everything the caller saw (including
+        // start_coordinate) is now stale — dragging from it would start in the wrong place.
+        if (args.ref && scrolled) {
+          return { content: [{ type: "text", text: `Scrolled ${args.ref} into view, so start_coordinate is stale. Take a new screenshot and retry the drag.` }] };
         }
         const [sx, sy] = args.start_coordinate;
         const [ex, ey] = coordinate;

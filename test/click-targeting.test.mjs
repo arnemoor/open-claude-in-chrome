@@ -36,6 +36,9 @@ test("a covered target is clicked but the cover is named", { skip: !chromeAvaila
   const { bg, refOf } = await setup(`<button id="under" style="position:absolute;top:10px;left:10px">Under</button><div id="cover" style="position:fixed;inset:0;background:rgba(0,0,0,.1)"></div>`);
   const r = await bg.handlers.computer({ action: "left_click", ref: (await refOf("Under")).ref, tabId: bg.tabId });
   assert.match(r.content[0].text, /Warning: The click point is covered by div#cover/);
+  // N2: the retry scroll is a no-op on this page (nothing to scroll — it's exactly one
+  // viewport tall), so the reply must not falsely claim it scrolled anything into view.
+  assert.doesNotMatch(r.content[0].text, /after scrolling/);
 });
 
 test("a coordinate outside the viewport is refused without dispatching input", { skip: !chromeAvailable, timeout: 20000 }, async () => {
@@ -195,7 +198,10 @@ test("a target whose float center rounds to exactly the viewport edge is scrolle
 test("scroll_to reports a detached ref instead of a false success", { skip: !chromeAvailable, timeout: 20000 }, async () => {
   const { page, bg, refOf } = await setup(`<button id="gone">Gone</button>`);
   const ref = (await refOf("Gone")).ref;
-  await page.evaluate(`document.getElementById("gone").remove()`);
+  // T1: keep a page-side reference so the WeakRef inside content.js survives GC until
+  // scroll_to actually runs — otherwise this test can flake, reporting "not found" (ref
+  // resolution failed entirely) instead of "no longer exists" (resolved, but disconnected).
+  await page.evaluate(`window.__removed = document.getElementById("gone"); window.__removed.remove();`);
   const r = await bg.handlers.computer({ action: "scroll_to", ref, tabId: bg.tabId });
   assert.match(r.content[0].text, /no longer exists/);
 });
@@ -242,4 +248,72 @@ test("a coordinate click on a label with a disabled control carries a warning", 
   const { bg } = await setup(`<label id="l3" for="c3" style="position:absolute;top:0;left:0;display:block;width:200px;height:20px">Accept</label><input id="c3" type="checkbox" disabled>`);
   const r = await bg.handlers.computer({ action: "left_click", coordinate: [50, 10], tabId: bg.tabId });
   assert.match(r.content[0].text, /This label's control is disabled\./);
+});
+
+// N1: clippedByAncestor must walk the containing-block chain, not the plain DOM ancestor
+// chain — html/body's own overflow applies to the viewport (already checked separately), a
+// position:fixed element's only clip is the viewport, and an absolutely positioned box's
+// containing block is its nearest non-static ancestor, so it escapes any unpositioned
+// overflow:hidden wrapper in between.
+test("find does not flag a fixed element off-screen due to html's own overflow", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  const { bg } = await setup(`<style>html{overflow-x:hidden}</style><button id="cookie" style="position:fixed;bottom:0;left:0">Accept</button>`);
+  const r = await bg.handlers.find({ query: "Accept", tabId: bg.tabId });
+  assert.doesNotMatch(r.content[0].text, /off-screen/);
+});
+
+test("find does not flag a fixed element off-screen due to body's own overflow", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  const { bg } = await setup(`<style>body{overflow:hidden}</style><button id="modal-btn" style="position:fixed;top:10px;left:10px">Close</button>`);
+  const r = await bg.handlers.find({ query: "Close", tabId: bg.tabId });
+  assert.doesNotMatch(r.content[0].text, /off-screen/);
+});
+
+test("find does not flag a fixed popover off-screen due to a small wrapping overflow:hidden box", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  const { bg } = await setup(`<div style="height:50px;overflow:hidden"><button id="popover" style="position:fixed;top:200px;left:10px">Popover</button></div>`);
+  const r = await bg.handlers.find({ query: "Popover", tabId: bg.tabId });
+  assert.doesNotMatch(r.content[0].text, /off-screen/);
+});
+
+test("find does not flag an absolutely positioned item off-screen when it escapes an unpositioned overflow:hidden wrapper", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  const { bg } = await setup(`
+    <div style="position:relative">
+      <div style="overflow:hidden;height:20px">
+        <button id="menu-item" style="position:absolute;top:100px;left:10px">Menu item</button>
+      </div>
+    </div>`);
+  const r = await bg.handlers.find({ query: "Menu item", tabId: bg.tabId });
+  assert.doesNotMatch(r.content[0].text, /off-screen/);
+});
+
+// N2: don't scroll a target through its own label — the click already reaches the (possibly
+// visually hidden) control via the label, and don't claim a scroll happened when nothing moved.
+test("a visually-hidden checkbox behind its own label is clicked without scrolling or a false cover warning", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  const { page, cs, bg } = await setup(`
+    <input id="cb" type="checkbox" style="position:absolute;clip-path:inset(50%);top:10px;left:10px">
+    <label for="cb" style="position:absolute;top:10px;left:10px;width:20px;height:20px;display:block;background:#ccc"></label>
+    <div style="height:3000px"></div>`);
+  const found = await cs.invoke({ type: "findElements", query: "checkbox" });
+  const ref = found.result.find((r) => r.role === "checkbox").ref;
+  const r = await bg.handlers.computer({ action: "left_click", ref, tabId: bg.tabId });
+  assert.doesNotMatch(r.content[0].text, /after scrolling/);
+  assert.doesNotMatch(r.content[0].text, /Warning/);
+  assert.equal(await page.evaluate("scrollY"), 0);
+  assert.equal(await page.evaluate("document.getElementById('cb').checked"), true);
+});
+
+// N3: getRefTarget scrolls an off-screen drop target into view, which invalidates
+// start_coordinate (taken from the pre-scroll screenshot) — the drag must refuse instead of
+// dragging from a now-stale position.
+test("left_click_drag refuses a ref that had to scroll instead of dragging from a stale position", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  const { bg, refOf } = await setup(`<div style="height:3000px"></div><button id="drop">Drop</button>`);
+  const ref = (await refOf("Drop")).ref;
+  const r = await bg.handlers.computer({ action: "left_click_drag", start_coordinate: [10, 10], ref, tabId: bg.tabId });
+  assert.equal(r.content[0].text, `Scrolled ${ref} into view, so start_coordinate is stale. Take a new screenshot and retry the drag.`);
+  assert.equal(bg.calls.filter((c) => c[1] === "Input.dispatchMouseEvent").length, 0);
+});
+
+test("left_click_drag to an in-view ref still drags normally", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  const { bg, refOf } = await setup(`<button id="drop" style="position:absolute;top:10px;left:200px">Drop</button>`);
+  const ref = (await refOf("Drop")).ref;
+  const r = await bg.handlers.computer({ action: "left_click_drag", start_coordinate: [10, 10], ref, tabId: bg.tabId });
+  assert.match(r.content[0].text, /^Dragged from \(10, 10\) to \(\d+, \d+\)/);
 });
