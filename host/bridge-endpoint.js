@@ -44,13 +44,24 @@ export function verifyBridgeDir(dir, { uid = process.getuid() } = {}) {
 }
 
 export function prepareBridgeDir(dir, { uid = process.getuid() } = {}) {
+  let mkdirErr;
   try {
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  } catch {
-    // Whatever is in the way (a file, a dangling link) is judged by the checks below.
+  } catch (e) {
+    mkdirErr = e;
+    // A file or symlink in the way is judged by the checks below; if nothing
+    // is there afterward, this was a real failure (EACCES, ENOSPC, ...).
   }
-  const st = lstatOrThrow(dir, "Bridge directory");
-  if (st.isDirectory() && !st.isSymbolicLink() && st.uid === uid && (st.mode & 0o077) !== 0) {
+  let st;
+  try {
+    st = lstatOrThrow(dir, "Bridge directory");
+  } catch (e) {
+    if (e.code === "ENOENT" && mkdirErr) {
+      throw new BridgeSecurityError(`Bridge directory ${dir} cannot be created: ${mkdirErr.code || mkdirErr.message}`);
+    }
+    throw e;
+  }
+  if (st.isDirectory() && !st.isSymbolicLink() && st.uid === uid && (st.mode & 0o777) !== 0o700) {
     fs.chmodSync(dir, 0o700);
   }
   verifyBridgeDir(dir, { uid });

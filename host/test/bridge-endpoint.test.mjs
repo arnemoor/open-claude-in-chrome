@@ -30,6 +30,29 @@ test("prepareBridgeDir tightens an existing directory we own", () => {
   assert.equal(mode(dir), 0o700);
 });
 
+test("prepareBridgeDir tightens a directory missing owner bits", () => {
+  const dir = bridgeDir(tmpHome());
+  fs.mkdirSync(dir, { recursive: true });
+  fs.chmodSync(dir, 0o500);
+  prepareBridgeDir(dir);
+  assert.equal(mode(dir), 0o700);
+});
+
+test("prepareBridgeDir surfaces the real mkdir failure instead of a false ENOENT", () => {
+  const dir = bridgeDir(tmpHome());
+  const parent = path.dirname(dir);
+  fs.mkdirSync(parent, { recursive: true });
+  fs.chmodSync(parent, 0o500);
+  try {
+    assert.throws(
+      () => prepareBridgeDir(dir),
+      (e) => e instanceof BridgeSecurityError && /EACCES/.test(e.message),
+    );
+  } finally {
+    fs.chmodSync(parent, 0o700);
+  }
+});
+
 test("a symlinked directory is refused", () => {
   const home = tmpHome();
   const real = path.join(home, "real");
