@@ -37,6 +37,11 @@ test("a second caller joins the pending attach and does not resolve before the o
   await enteredOverride; // attach() has resolved; we're now blocked inside the override
   let secondResolved = false;
   const second = ensureAttached(bg.tabId).then(() => { secondResolved = true; });
+  // Yield to the event loop: the gate is still held, so this only stays false if the
+  // second caller genuinely joined the pending attach instead of resolving on its own
+  // (asserting this in the same synchronous turn as starting `second` would trivially
+  // pass no matter what, since nothing async can have run yet either way).
+  await new Promise((r) => setImmediate(r));
   assert.equal(secondResolved, false);
   releaseOverride();
   await first;
