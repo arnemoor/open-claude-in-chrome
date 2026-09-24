@@ -432,14 +432,16 @@ const FOCUSED_FIELD_KIND_EXPR = `(() => {
     break;
   }
   if (!el) return "unknown";
-  if (el.tagName === "TEXTAREA" || el.isContentEditable) return "multiline";
+  // INPUT first: an <input> inside a contenteditable host, or in a designMode document,
+  // reports isContentEditable true too, but it's still a single-line control.
   if (el.tagName === "INPUT") return "singleline";
+  if (el.tagName === "TEXTAREA" || el.isContentEditable) return "multiline";
   return "unknown";
 })()`;
 
-async function focusedFieldKind(tabId) {
+async function focusedFieldKind(tabId, timeoutMs = 2000) {
   try {
-    const result = await cdp(tabId, "Runtime.evaluate", { expression: FOCUSED_FIELD_KIND_EXPR, returnByValue: true });
+    const result = await cdp(tabId, "Runtime.evaluate", { expression: FOCUSED_FIELD_KIND_EXPR, returnByValue: true }, timeoutMs);
     const value = result?.result?.value;
     return value === "multiline" || value === "singleline" ? value : "unknown";
   } catch {
@@ -726,21 +728,22 @@ const toolHandlers = {
       case "type": {
         if (!args.text) return { content: [{ type: "text", text: "text is required for type action" }] };
         await ensureAttached(tabId);
-        // "\r\n" and a lone "\r" both mean one line break; per-character insertion of an
+        // "\r\n" and a lone "\r" both mean one line break. Per-character insertion of an
         // un-normalized "\r\n" would otherwise land as two in a multiline field.
         const text = args.text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-        // Chrome's Input.insertText treats a "\n" in the inserted text as an implicit Enter,
-        // submitting the form exactly like a real Enter keypress would — even though no
-        // keydown ever fires — but only when a single-line <input> is focused; a textarea or
-        // contenteditable just gets a real line break. So it's only inserted where it's safe,
-        // checked once up front against the actually focused element (which may be inside a
-        // shadow root or a same-origin iframe).
-        const fieldKind = text.includes("\n") ? await focusedFieldKind(tabId) : null;
         let droppedNewline = false;
+        let dropReason = null;
         for (const char of text) {
           if (char === "\n") {
+            // Chrome's Input.insertText treats a "\n" in the inserted text as an implicit
+            // Enter, submitting the form exactly like a real Enter keypress would, but only
+            // when a single-line <input> is focused. A textarea or contenteditable just gets
+            // a real line break. So it's only inserted where it's safe, checked fresh before
+            // every "\n" (not once for the whole call) since a page's own input handler can
+            // move focus between one line break and the next.
+            const fieldKind = await focusedFieldKind(tabId);
             if (fieldKind === "multiline") await cdp(tabId, "Input.insertText", { text: "\n" });
-            else droppedNewline = true;
+            else { droppedNewline = true; dropReason = fieldKind; }
           } else {
             const def = charDefinition(char);
             if (def) await pressKey(tabId, def, def.shift ? MOD_SHIFT : 0);
@@ -750,7 +753,7 @@ const toolHandlers = {
         }
         let reply = `Typed "${args.text.substring(0, 50)}${args.text.length > 50 ? "..." : ""}"`;
         if (droppedNewline) {
-          reply += fieldKind === "unknown"
+          reply += dropReason === "unknown"
             ? " (line breaks were not typed: could not be checked)"
             : " (line breaks were not typed: the focused field is single-line)";
         }
