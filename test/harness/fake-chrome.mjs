@@ -93,7 +93,7 @@ export async function loadBackground({ page = null, content = null, tab = {}, wi
         if (attached.has(tabId)) throw new Error(`Another debugger is already attached to the tab with id: ${tabId}.`);
         attached.add(tabId);
       },
-      detach: async ({ tabId }) => { attached.delete(tabId); },
+      detach: async ({ tabId }) => { calls.push(["debugger.detach", tabId]); attached.delete(tabId); },
       sendCommand: async (target, method, params) => {
         calls.push(["cdp", method, params]);
         if (page) return page.send(method, params);

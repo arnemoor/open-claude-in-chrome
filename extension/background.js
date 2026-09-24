@@ -160,18 +160,24 @@ async function ensureAttached(tabId) {
   if (!pending) {
     pending = (async () => {
       await chrome.debugger.attach({ tabId }, "1.3");
-      attachedTabs.set(tabId, { enabledDomains: new Set() });
       try {
         // Pin devicePixelRatio to 1 so screenshots use CSS pixels, the coordinate space of
         // Input.dispatchMouseEvent. Width and height 0 leave the viewport size alone, so the
         // page keeps following the real window (resize_window, window chrome).
         await rawCdp(tabId, "Emulation.setDeviceMetricsOverride", { width: 0, height: 0, deviceScaleFactor: 1, mobile: false });
       } catch (err) {
-        attachedTabs.delete(tabId);
         try { await chrome.debugger.detach({ tabId }); } catch {}
         throw err;
       }
-    })().finally(() => attaching.delete(tabId));
+      // Only mark the tab attached once the pin has actually taken effect, so a caller that
+      // joins mid-flight (below) never runs a command before it, and a failed pin never leaves
+      // attachedTabs pointing at a tab whose debugger session we just tore down.
+      attachedTabs.set(tabId, { enabledDomains: new Set() });
+    })().finally(() => {
+      // Guard against deleting a NEWER attempt: if the tab got detached and re-attached while
+      // this attempt was still in flight, `attaching` may already hold someone else's promise.
+      if (attaching.get(tabId) === pending) attaching.delete(tabId);
+    });
     attaching.set(tabId, pending);
   }
   return pending;
@@ -804,11 +810,14 @@ const toolHandlers = {
 
     await ensureAttached(tabId);
     try {
+      // Scripts may run up to the host's 60s per-request budget. Use a slightly shorter CDP
+      // timeout so a hung script times out here with a clear message instead of the generic
+      // host-level timeout.
       const result = await cdp(tabId, "Runtime.evaluate", {
         expression: text,
         returnByValue: true,
         awaitPromise: true,
-      });
+      }, 55000);
 
       if (result.exceptionDetails) {
         return {

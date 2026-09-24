@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import { loadBackground } from "./harness/fake-chrome.mjs";
 import { chromeAvailable, launchChrome, openPage, jpegSize } from "./harness/browser.mjs";
 
@@ -13,6 +14,29 @@ test("parallel first calls on a cold tab attach once and both succeed", async ()
   assert.equal(bg.calls.filter((c) => c[0] === "debugger.attach").length, 1);
 });
 
+test("a second caller joins the pending attach and does not resolve before the override settles", async () => {
+  const bg = await loadBackground({
+    overrides: {
+      debugger: {
+        sendCommand: async (t, method) => {
+          if (method === "Emulation.setDeviceMetricsOverride") await new Promise((r) => setTimeout(r, 100));
+          return {};
+        },
+      },
+    },
+  });
+  const ensureAttached = bg.get("ensureAttached");
+  const first = ensureAttached(bg.tabId);
+  await new Promise((r) => setTimeout(r, 50));
+  let secondResolved = false;
+  const second = ensureAttached(bg.tabId).then(() => { secondResolved = true; });
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(secondResolved, false);
+  await first;
+  await second;
+  assert.equal(secondResolved, true);
+});
+
 test("the dpr is pinned without overriding the size", async () => {
   const bg = await loadBackground();
   await bg.handlers.javascript_tool({ action: "javascript_exec", text: "1", tabId: bg.tabId });
@@ -24,6 +48,27 @@ test("the dpr is pinned without overriding the size", async () => {
   assert.deepEqual({ ...emu[2] }, { width: 0, height: 0, deviceScaleFactor: 1, mobile: false });
 });
 
+test("a failed device-metrics override detaches and lets the next call attach again", async () => {
+  let overrideAttempt = 0;
+  const bg = await loadBackground({
+    overrides: {
+      debugger: {
+        sendCommand: async (t, method) => {
+          if (method === "Emulation.setDeviceMetricsOverride") {
+            overrideAttempt++;
+            if (overrideAttempt === 1) throw new Error("override boom");
+          }
+          return {};
+        },
+      },
+    },
+  });
+  await assert.rejects(bg.get("ensureAttached")(bg.tabId), /override boom/);
+  assert.equal(bg.calls.filter((c) => c[0] === "debugger.detach").length, 1);
+  await bg.get("ensureAttached")(bg.tabId);
+  assert.equal(bg.calls.filter((c) => c[0] === "debugger.attach").length, 2);
+});
+
 test("a failed attach is retried by the next call", async () => {
   let fails = 1;
   const bg = await loadBackground({ overrides: { debugger: { attach: async () => { if (fails-- > 0) throw new Error("boom"); } } } });
@@ -31,7 +76,7 @@ test("a failed attach is retried by the next call", async () => {
   await bg.get("ensureAttached")(bg.tabId);
 });
 
-test("a hung CDP command times out instead of hanging the call", async () => {
+test("a hung CDP command times out instead of hanging the call", { timeout: 5000 }, async () => {
   const bg = await loadBackground({ overrides: { debugger: { sendCommand: async (t, method) => (method === "Hang.me" ? new Promise(() => {}) : {}) } } });
   await assert.rejects(bg.get("cdp")(bg.tabId, "Hang.me", {}, 50), /CDP Hang\.me timed out/);
 });
@@ -52,4 +97,12 @@ test("real Chrome: the viewport follows a window resize and screenshots stay 1x 
   } finally {
     browser.close();
   }
+});
+
+test("real Chrome: close() removes the profile directory", { skip: !chromeAvailable }, async () => {
+  const browser = await launchChrome();
+  const { profile } = browser;
+  await browser.close();
+  assert.equal(fs.existsSync(profile), false);
+  await browser.close(); // idempotent, must not throw or re-run the teardown
 });

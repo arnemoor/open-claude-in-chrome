@@ -14,11 +14,18 @@ export async function launchChrome({ args = [] } = {}) {
     "--disable-background-networking", "--disable-sync", "--window-size=1200,800",
     ...args, "about:blank",
   ], { stdio: "ignore" });
-  const portFile = `${profile}/DevToolsActivePort`;
-  for (let i = 0; i < 150 && !fs.existsSync(portFile); i++) await sleep(100);
-  const [port, wsPath] = fs.readFileSync(portFile, "utf8").trim().split("\n");
-  const ws = new WebSocket(`ws://127.0.0.1:${port}${wsPath}`);
-  await new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
+  let ws;
+  try {
+    const portFile = `${profile}/DevToolsActivePort`;
+    for (let i = 0; i < 150 && !fs.existsSync(portFile); i++) await sleep(100);
+    const [port, wsPath] = fs.readFileSync(portFile, "utf8").trim().split("\n");
+    ws = new WebSocket(`ws://127.0.0.1:${port}${wsPath}`);
+    await new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
+  } catch (err) {
+    try { proc.kill("SIGKILL"); } catch {}
+    try { fs.rmSync(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch {}
+    throw err;
+  }
   let seq = 0;
   const pending = new Map();
   const listeners = new Set();
@@ -32,17 +39,32 @@ export async function launchChrome({ args = [] } = {}) {
       for (const l of listeners) l(msg);
     }
   };
+  // A crashed/killed browser closes the socket without ever answering in-flight sends.
+  // Reject them instead of leaving those callers hanging forever.
+  ws.onclose = () => {
+    for (const { reject } of pending.values()) reject(new Error("Chrome connection closed"));
+    pending.clear();
+  };
   const send = (method, params = {}, sessionId) => new Promise((resolve, reject) => {
     const id = ++seq;
     pending.set(id, { resolve, reject });
     ws.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
   });
+  let closed = null;
   const close = () => {
-    try { ws.close(); } catch {}
-    try { proc.kill("SIGKILL"); } catch {}
-    try { fs.rmSync(profile, { recursive: true, force: true }); } catch {}
+    if (!closed) {
+      closed = (async () => {
+        try { ws.close(); } catch {}
+        try { proc.kill("SIGKILL"); } catch {}
+        if (proc.exitCode === null && proc.signalCode === null) {
+          await new Promise((resolve) => proc.once("exit", resolve));
+        }
+        try { fs.rmSync(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch {}
+      })();
+    }
+    return closed;
   };
-  return { send, onEvent: (fn) => { listeners.add(fn); return () => listeners.delete(fn); }, close };
+  return { send, onEvent: (fn) => { listeners.add(fn); return () => listeners.delete(fn); }, close, profile };
 }
 
 export async function evaluate(send, expression, contextId) {
