@@ -191,6 +191,90 @@ function genericSummary(args) {
   return json;
 }
 
+// --- rrweb event redaction (I1/I2), run in the worker (Audit.onRecorderEvents)
+// before a recorder batch is stored, so a recorder in any document cannot pass
+// through a raw secret regardless of what it actually sent. ---
+
+// I2: attributes that carry a URL, wherever they appear (any tag) — checked by
+// name only, since the attribute name alone identifies it as URL-bearing.
+const URL_ATTRS = ["href", "src", "action", "formaction", "poster"];
+
+// "url descriptor, url descriptor, ..." — redact each URL, keep its descriptor
+// (a width like "480w" or a density like "2x") untouched.
+function redactSrcset(value) {
+  return value.split(",").map((part) => {
+    const trimmed = part.trim();
+    const spaceIdx = trimmed.indexOf(" ");
+    if (spaceIdx === -1) return redactUrl(trimmed);
+    return redactUrl(trimmed.slice(0, spaceIdx)) + trimmed.slice(spaceIdx);
+  }).join(", ");
+}
+
+// I1: masks input/textarea `value` attributes with `*` of the same length.
+// `tagName` must be a positively-known "input" or "textarea" — an unknown tag
+// (an attribute mutation whose defining node this walker hasn't seen) or any
+// other tag (an <option>'s value is page content, not a typed secret; other
+// tags aren't in scope) is left untouched, matching the plan's "leave option
+// values alone" instruction literally rather than guessing at unlisted tags.
+function redactAttributes(tagName, attributes) {
+  if (!attributes || typeof attributes !== "object") return;
+  if ((tagName === "input" || tagName === "textarea") && typeof attributes.value === "string") {
+    attributes.value = "*".repeat(attributes.value.length);
+  }
+  for (const attr of URL_ATTRS) {
+    if (typeof attributes[attr] === "string") attributes[attr] = redactUrl(attributes[attr]);
+  }
+  if (typeof attributes.srcset === "string") attributes.srcset = redactSrcset(attributes.srcset);
+}
+
+// Walks a snapshot (or newly-added) node and its descendants: records each
+// element's rrweb id -> lowercase tagName into `knownTags` (so a later,
+// separate mutation event on the same id can be classified) and redacts it
+// in place.
+function walkSnapshotNode(node, knownTags) {
+  if (!node || typeof node !== "object") return;
+  if (node.type === 2 /* Element */ && typeof node.tagName === "string") {
+    const tagName = node.tagName.toLowerCase();
+    if (node.id != null) knownTags.set(node.id, tagName);
+    redactAttributes(tagName, node.attributes);
+  }
+  if (Array.isArray(node.childNodes)) {
+    for (const child of node.childNodes) walkSnapshotNode(child, knownTags);
+  }
+}
+
+// Redacts an rrweb event batch in place before it is relayed or stored:
+// - Meta (type 4): data.href through redactUrl.
+// - FullSnapshot (type 2): every element node, via walkSnapshotNode. A full
+//   snapshot means a fresh document — rrweb's node ids restart from 1 there,
+//   so `knownTags` is cleared first; a stale id from a previous document would
+//   otherwise be not just useless but actively wrong (id 9 could now be a
+//   <div> instead of the <input> it used to be).
+// - IncrementalSnapshot Mutation (type 3, source 0): each `adds` node via
+//   walkSnapshotNode, and each `attributes` entry via knownTags (a node's
+//   defining snapshot/add can land in an earlier batch than a later mutation
+//   on it — the caller keeps `knownTags` across calls for this reason).
+// Returns `events` (mutated in place) for convenient chaining.
+function redactEvents(events, knownTags) {
+  for (const event of events || []) {
+    if (!event || typeof event !== "object") continue;
+    if (event.type === 4) {
+      if (event.data && typeof event.data.href === "string") event.data.href = redactUrl(event.data.href);
+    } else if (event.type === 2) {
+      if (event.data && event.data.node) {
+        knownTags.clear();
+        walkSnapshotNode(event.data.node, knownTags);
+      }
+    } else if (event.type === 3 && event.data && event.data.source === 0) {
+      for (const add of event.data.adds || []) walkSnapshotNode(add.node, knownTags);
+      for (const mutation of event.data.attributes || []) {
+        redactAttributes(knownTags.get(mutation.id), mutation.attributes);
+      }
+    }
+  }
+  return events;
+}
+
 function auditSummary(tool, args) {
   args = args || {};
   switch (tool) {

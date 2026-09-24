@@ -9,7 +9,6 @@
 (() => {
   const KEY = Symbol.for("ocic.audit.recorder");
   if (globalThis[KEY]) return;
-  globalThis[KEY] = true;
 
   const FLUSH_MS = 1000;
   const FLUSH_COUNT = 100;
@@ -26,9 +25,14 @@
     const events = buffer;
     buffer = [];
     try {
-      chrome.runtime.sendMessage({ type: "ocic_audit_events", events });
+      // The returned promise can also reject after the call is made (the
+      // channel closing mid-flight, e.g. on a back/forward-cache entry, or the
+      // batch exceeding Chrome's message size limit) — both must be swallowed,
+      // or the rejection surfaces as an uncaught error in the page's console.
+      chrome.runtime.sendMessage({ type: "ocic_audit_events", events }).catch(() => {});
     } catch {
-      // Extension context can be gone (page torn down, extension reloaded); drop.
+      // Extension context can already be gone (page torn down, extension
+      // reloaded) before the call is even made.
     }
   }
 
@@ -48,11 +52,39 @@
     // every ancestor via closest(), so nested text and text typed straight into an
     // empty host are both covered.
     maskTextSelector: '[contenteditable]:not([contenteditable="false"])',
+    // I1: maskAllInputs only overwrites `value` with the masked live value when
+    // that value is non-empty, so a hidden input's raw HTML value attribute
+    // (a CSRF token, one set by a script, one present in markup) would
+    // otherwise go out unmasked. Blocking it drops its attributes down to
+    // class/rr_width/rr_height and skips attribute mutations on it entirely.
+    // A worker-side walker (redact.js's redactEvents, run from
+    // Audit.onRecorderEvents) additionally masks any input/textarea value that
+    // reaches the wire regardless — e.g. a prefilled password cleared by script
+    // before the recorder started, which blockSelector alone doesn't touch,
+    // since its own field type isn't hidden.
+    blockSelector: "input[type=hidden]",
     recordCanvas: false,
     collectFonts: false,
     inlineImages: false,
     sampling: { mousemove: 100, scroll: 150, input: "last" },
   });
 
+  // M5: mark this document as "has a recorder" only after record() actually
+  // succeeded. Setting it first (as an earlier version of this file did) would
+  // let a transient failure here (rrwebRecord missing, an internal rrweb
+  // error) permanently poison ensureRecorder's presence probe into believing a
+  // working recorder is already there, with no retry for the rest of the
+  // document's life. If record() throws, this line — and the listeners below —
+  // are simply never reached, which is what leaves the key unset.
+  globalThis[KEY] = true;
+
   window.addEventListener("pagehide", flush);
+  // M3: a back/forward-cache restore resumes this exact recorder instance (the
+  // page's JS state, including this closure, survives bfcache) with no new
+  // full snapshot on its own, so the stored stream would otherwise jump
+  // straight from an earlier page's snapshot to this one's increments, with no
+  // base for the replayer to apply them onto.
+  window.addEventListener("pageshow", (event) => {
+    if (event.persisted) globalThis.rrwebRecord.record.takeFullSnapshot();
+  });
 })();

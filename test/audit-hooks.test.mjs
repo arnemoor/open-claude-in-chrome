@@ -206,8 +206,8 @@ test("recorder events go to the tab's owning session and are dropped for an unow
   bg.deliver({ type: "tool_request", id: "1.s1.1", tool: "gif_creator", args: { tabId: 42 }, session: SESSION });
   await flush();
 
-  bg.chrome.runtime.onMessage.fire({ type: "ocic_audit_events", events: [{ type: 2 }] }, { id: bg.chrome.runtime.id, tab: { id: 42 } }, () => {});
-  bg.chrome.runtime.onMessage.fire({ type: "ocic_audit_events", events: [{ type: 2 }] }, { id: bg.chrome.runtime.id, tab: { id: 999 } }, () => {}); // no owner
+  bg.chrome.runtime.onMessage.fire({ type: "ocic_audit_events", events: [{ type: 2 }] }, { id: bg.chrome.runtime.id, tab: { id: 42 }, frameId: 0 }, () => {});
+  bg.chrome.runtime.onMessage.fire({ type: "ocic_audit_events", events: [{ type: 2 }] }, { id: bg.chrome.runtime.id, tab: { id: 999 }, frameId: 0 }, () => {}); // no owner
   await flush();
 
   const addEventsCalls = fakeStore.calls.filter((c) => c[0] === "addEvents");
@@ -229,7 +229,7 @@ test("recorder events for a tab whose owning session no longer exists are droppe
   assert.equal(fakeStore.sessions.size, 1);
   fakeStore.sessions.delete("1.s1"); // simulate the session row having been pruned/deleted
 
-  bg.chrome.runtime.onMessage.fire({ type: "ocic_audit_events", events: [{ type: 2 }] }, { id: bg.chrome.runtime.id, tab: { id: 42 } }, () => {});
+  bg.chrome.runtime.onMessage.fire({ type: "ocic_audit_events", events: [{ type: 2 }] }, { id: bg.chrome.runtime.id, tab: { id: 42 }, frameId: 0 }, () => {});
   await flush();
 
   assert.deepEqual(fakeStore.calls.filter((c) => c[0] === "addEvents"), []);
@@ -297,6 +297,145 @@ test("ensureRecorder swallows a scripting error instead of failing the tool call
 
   assert.equal(bg.posted.length, 1);
   assert.equal(bg.posted[0].type, "tool_response");
+});
+
+// Isolates ensureRecorder's own calls from any other scripting.executeScript call
+// a handler might make on its own (e.g. form_input's content-script injection
+// retry), which the fake also logs under "scripting.executeScript".
+const ensureRecorderCalls = (bg) => bg.calls.filter((c) => c[0] === "scripting.executeScript" && c[1].world === "ISOLATED");
+
+// M4. A custom scripting.executeScript override replaces the fake's method
+// entirely (see fake-chrome.mjs's deepAssign), so it must track its own calls
+// instead of relying on the fake's usual bg.calls.push.
+test("ensureRecorder makes only the presence check when the recorder is already there", async () => {
+  const fakeStore = makeFakeStore();
+  const executeScriptCalls = [];
+  const bg = await loadBackground({
+    beforeRun: injectFakeStore(fakeStore),
+    overrides: { scripting: { executeScript: async (p) => { executeScriptCalls.push(p); return [{ result: true }]; } } },
+  });
+  await flush();
+  await bg.chrome.storage.local.set({ audit: { enabled: true, retentionDays: 7 } });
+
+  bg.deliver({ type: "tool_request", id: "1.s1.1", tool: "gif_creator", args: { tabId: bg.tabId }, session: SESSION });
+  await flush();
+
+  assert.equal(executeScriptCalls.length, 2, "before and after: a presence check each time, no injection since the fake always reports 'present'");
+  for (const call of executeScriptCalls) assert.equal(call.files, undefined, "a presence check has no files field, only func");
+});
+
+// M4
+test("ensureRecorder still probes after the handler throws", async () => {
+  const fakeStore = makeFakeStore();
+  const bg = await loadBackground({ beforeRun: injectFakeStore(fakeStore) }); // no content: form_input's sendContentMessage rejects and its retry throws
+  await flush();
+  await bg.chrome.storage.local.set({ audit: { enabled: true, retentionDays: 7 } });
+
+  bg.deliver({ type: "tool_request", id: "1.s1.1", tool: "form_input", args: { ref: "ref_1", value: "x", tabId: bg.tabId }, session: SESSION });
+  await flush();
+
+  assert.equal(ensureRecorderCalls(bg).length, 4, "before AND after the failed call: a check+inject pair each time");
+});
+
+// I4: a page stuck on an open JS dialog (or one that hasn't reached the default
+// document_idle injection point) never answers chrome.scripting.executeScript.
+// Without a bound, that hangs ensureRecorder, and therefore every audited call
+// on that tab, until the host's own request timeout.
+test("I4: a never-settling executeScript still gives a prompt tool reply, not an unbounded hang", async () => {
+  const fakeStore = makeFakeStore();
+  const bg = await loadBackground({
+    beforeRun: injectFakeStore(fakeStore),
+    overrides: { scripting: { executeScript: async () => new Promise(() => {}) } },
+  });
+  await flush();
+  await bg.chrome.storage.local.set({ audit: { enabled: true, retentionDays: 7 } });
+
+  bg.deliver({ type: "tool_request", id: "1.s1.1", tool: "gif_creator", args: { tabId: bg.tabId }, session: SESSION });
+  await flush(600); // comfortably more than the ~300ms probe bound, nowhere near "hangs forever"
+
+  assert.equal(bg.posted.length, 1, "expected a prompt reply despite the stuck renderer");
+  assert.equal(bg.posted[0].type, "tool_response");
+});
+
+// I5 (plan-mandated): a tabId the tool itself would refuse (outside the MCP
+// group) must not get a recorder or become that tab's owner. gif_creator has no
+// group check of its own — the review's own example of a stub that injected
+// regardless — so the gate has to come from audit.js, not from the handler.
+test("I5: a tab outside the MCP group gets no recorder, and its later recorder batches are not stored", async () => {
+  const fakeStore = makeFakeStore();
+  const OUTSIDE_TAB = 999;
+  const bg = await loadBackground({
+    beforeRun: injectFakeStore(fakeStore),
+    overrides: { tabs: { get: async (id) => ({ id, windowId: 1, status: "complete", url: "https://example.test/", groupId: id === OUTSIDE_TAB ? -1 : 7 }) } },
+  });
+  await flush();
+  await bg.chrome.storage.local.set({ audit: { enabled: true, retentionDays: 7 } });
+
+  bg.deliver({ type: "tool_request", id: "1.s1.1", tool: "gif_creator", args: { tabId: OUTSIDE_TAB }, session: SESSION });
+  await flush();
+
+  assert.deepEqual(ensureRecorderCalls(bg), []);
+
+  bg.chrome.runtime.onMessage.fire({ type: "ocic_audit_events", events: [{ type: 2 }] }, { id: bg.chrome.runtime.id, tab: { id: OUTSIDE_TAB }, frameId: 0 }, () => {});
+  await flush();
+  assert.deepEqual(fakeStore.calls.filter((c) => c[0] === "addEvents"), []);
+});
+
+// I5: a tab inside the group is unaffected by the new gate.
+test("I5: a tab inside the MCP group still gets a recorder", async () => {
+  const fakeStore = makeFakeStore();
+  const bg = await loadBackground({ beforeRun: injectFakeStore(fakeStore) });
+  await flush();
+  await bg.chrome.storage.local.set({ audit: { enabled: true, retentionDays: 7 } });
+
+  bg.deliver({ type: "tool_request", id: "1.s1.1", tool: "gif_creator", args: { tabId: bg.tabId }, session: SESSION });
+  await flush();
+
+  assert.equal(ensureRecorderCalls(bg).length, 4);
+});
+
+// M1: `started` used to be captured after the before-hook but `ms` was computed
+// after the after-hook too, so a slow ensureRecorder call (a large page's full
+// snapshot, or now I4's own timeout budget) inflated the recorded duration of
+// completely unrelated actions such as navigate.
+test("M1: the recorded duration does not include the (unawaited) after-hook's own executeScript time", async () => {
+  const fakeStore = makeFakeStore();
+  const bg = await loadBackground({
+    beforeRun: injectFakeStore(fakeStore),
+    // Well under I4's 300ms probe timeout, so this test is only about M1's
+    // ordering, not I4's timeout race.
+    overrides: { scripting: { executeScript: async () => { await new Promise((r) => setTimeout(r, 200)); return []; } } },
+  });
+  await flush();
+  await bg.chrome.storage.local.set({ audit: { enabled: true, retentionDays: 7 } });
+
+  bg.deliver({ type: "tool_request", id: "1.s1.1", tool: "gif_creator", args: { tabId: bg.tabId }, session: SESSION });
+  await flush(700); // long enough for both the awaited before-hook and the unawaited after-hook to actually finish in the background
+
+  assert.equal(fakeStore.actions.length, 1);
+  assert.ok(fakeStore.actions[0].ms < 100, `expected ms well under the 200ms executeScript delay, got ${fakeStore.actions[0].ms}`);
+});
+
+// M6: sender.id is always the extension's own for anything reaching onMessage
+// (no externally_connectable), so it alone is a weak gate. frameId must be the
+// top frame (injection always targets frame 0), and origin must not be the
+// extension's own pages (e.g. Task 17's options.html opened in a tab), which
+// also pass the sender.id/sender.tab checks.
+test("M6: recorder events are ignored unless sender.frameId is 0 and sender.origin is not the extension's own", async () => {
+  const fakeStore = makeFakeStore();
+  const bg = await loadBackground({ beforeRun: injectFakeStore(fakeStore) });
+  await flush();
+  await bg.chrome.storage.local.set({ audit: { enabled: true, retentionDays: 7 } });
+
+  bg.deliver({ type: "tool_request", id: "1.s1.1", tool: "gif_creator", args: { tabId: 42 }, session: SESSION });
+  await flush();
+
+  const extensionOrigin = `chrome-extension://${bg.chrome.runtime.id}`;
+  bg.chrome.runtime.onMessage.fire({ type: "ocic_audit_events", events: [{ type: 2 }] }, { id: bg.chrome.runtime.id, tab: { id: 42 }, frameId: 1, origin: "https://example.test" }, () => {}); // sub-frame
+  bg.chrome.runtime.onMessage.fire({ type: "ocic_audit_events", events: [{ type: 2 }] }, { id: bg.chrome.runtime.id, tab: { id: 42 }, frameId: 0, origin: extensionOrigin }, () => {}); // the extension's own page
+  await flush();
+
+  assert.deepEqual(fakeStore.calls.filter((c) => c[0] === "addEvents"), []);
 });
 
 // I3: the plan runs prune "on init, and every 60 minutes" with no condition.
@@ -410,7 +549,7 @@ test("the tab owner is set before the handler runs, so a batch arriving mid-call
   bg.deliver({ type: "tool_request", id: "1.s1.1", tool: "gif_creator", args: { tabId: 42 }, session: SESSION });
   await flush(); // tabOwners.set + the early session touch land; ensureRecorder's first executeScript call is now stalled on the gate
 
-  bg.chrome.runtime.onMessage.fire({ type: "ocic_audit_events", events: [{ type: 2 }] }, { id: bg.chrome.runtime.id, tab: { id: 42 } }, () => {});
+  bg.chrome.runtime.onMessage.fire({ type: "ocic_audit_events", events: [{ type: 2 }] }, { id: bg.chrome.runtime.id, tab: { id: 42 }, frameId: 0 }, () => {});
   await flush();
   releaseGate();
   await flush();

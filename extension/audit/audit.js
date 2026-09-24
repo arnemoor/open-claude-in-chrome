@@ -13,9 +13,16 @@
   const AUDIT_PRUNE_ALARM = "audit-prune";
   const AUDIT_MAX_SESSIONS = 200;
   const AUDIT_ERROR_CLIP = 200;
+  const ENSURE_RECORDER_PROBE_TIMEOUT_MS = 300;
+  const ENSURE_RECORDER_INJECT_TIMEOUT_MS = 2000;
 
   let store = null;
+  // I5 (plan-mandated): which tabs may be recorded at all, e.g. background's own
+  // isInGroup. Defaults to "every tab", so callers that don't pass one (existing
+  // tests, and any future caller) keep today's behaviour.
+  let isTabAllowed = async () => true;
   const tabOwners = new Map(); // tabId -> "<runId>.<session.id>", the last session to act on that tab
+  const knownTagsByTab = new Map(); // tabId -> Map(rrweb node id -> lowercase tagName), for redactEvents (I1)
 
   async function settings() {
     const { audit } = await chrome.storage.local.get("audit");
@@ -55,8 +62,9 @@
     }
   }
 
-  function init({ store: injected = AuditStore } = {}) {
+  function init({ store: injected = AuditStore, isTabAllowed: allowed } = {}) {
     store = injected;
+    if (allowed) isTabAllowed = allowed;
     runPrune();
     chrome.alarms.create(AUDIT_PRUNE_ALARM, { periodInMinutes: 60 });
     chrome.alarms.onAlarm.addListener((alarm) => {
@@ -102,25 +110,53 @@
     }
   }
 
+  // Rejects with a timeout error if `promise` hasn't settled within `ms`, without
+  // cancelling the underlying operation (there is no way to cancel a real
+  // chrome.scripting.executeScript call). A late resolution/rejection after the
+  // timeout has already fired is just ignored (a promise only settles once).
+  function withTimeout(promise, ms) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms);
+      promise.then(
+        (value) => { clearTimeout(timer); resolve(value); },
+        (err) => { clearTimeout(timer); reject(err); },
+      );
+    });
+  }
+
   // Makes sure the tab has a running rrweb recorder (Task 16), injecting
   // vendor/rrweb-record.min.js and audit/recorder.js only when one isn't already there.
-  // No-op while audit is off. Errors (a chrome:// tab, a tab that just closed) are
-  // swallowed: recording is best-effort and must never break the action it wraps.
+  // No-op while audit is off. Errors (a chrome:// tab, a tab that just closed, or
+  // I4's own timeout below) are swallowed: recording is best-effort and must
+  // never break the action it wraps.
+  //
+  // I4: a page stuck on an open JS dialog (or one that hasn't reached the
+  // default document_idle injection point) never answers
+  // chrome.scripting.executeScript, so both calls race a short timeout instead
+  // of awaiting it unbounded — matching background.js's own rule for renderer
+  // round-trips (readViewport, focusedFieldKind, resize_window all bound theirs
+  // the same way, for the same reason).
   async function ensureRecorder(tabId) {
     try {
       const { enabled } = await settings();
       if (!enabled) return;
-      const [check] = await chrome.scripting.executeScript({
-        target: { tabId },
-        world: "ISOLATED",
-        func: () => !!globalThis[Symbol.for("ocic.audit.recorder")],
-      });
+      const [check] = await withTimeout(
+        chrome.scripting.executeScript({
+          target: { tabId },
+          world: "ISOLATED",
+          func: () => !!globalThis[Symbol.for("ocic.audit.recorder")],
+        }),
+        ENSURE_RECORDER_PROBE_TIMEOUT_MS,
+      );
       if (check?.result) return;
-      await chrome.scripting.executeScript({
-        target: { tabId },
-        world: "ISOLATED",
-        files: ["vendor/rrweb-record.min.js", "audit/recorder.js"],
-      });
+      await withTimeout(
+        chrome.scripting.executeScript({
+          target: { tabId },
+          world: "ISOLATED",
+          files: ["vendor/rrweb-record.min.js", "audit/recorder.js"],
+        }),
+        ENSURE_RECORDER_INJECT_TIMEOUT_MS,
+      );
     } catch {
       // Best-effort only; see comment above.
     }
@@ -132,27 +168,37 @@
       handlers[name] = async function auditWrapped(args, ctx) {
         const tabId = args && args.tabId != null ? args.tabId : null;
         const key = sessionKey(ctx);
+        // I5 (plan-mandated): a tabId the tool itself would refuse (outside the
+        // MCP group) must not get a recorder or become that tab's owner — some
+        // handlers (gif_creator and other stubs) have no group check of their
+        // own to piggyback on, so this is checked independently here.
+        const allowed = tabId != null && (await isTabAllowed(tabId));
         // M1: before the call (not after recordAction, which used to run only
         // once the whole handler had already returned) — otherwise a recorder
         // batch that arrives mid-call, or from a different session reusing a
         // tab another session last owned, finds no owner yet, or the wrong one.
-        if (tabId != null && key) tabOwners.set(tabId, key);
+        if (allowed && key) tabOwners.set(tabId, key);
         if (key) touchSession(key, ctx.session);
-        if (tabId != null) await ensureRecorder(tabId);
+        if (allowed) await ensureRecorder(tabId);
         const started = Date.now();
         let result;
         try {
           result = await original(args, ctx);
         } catch (err) {
-          if (tabId != null) await ensureRecorder(tabId);
+          // M1: computed before the after-hook below, which — per I4 — is not
+          // awaited, so a slow or timed-out ensureRecorder call never inflates
+          // the tool's own recorded duration.
+          const ms = Date.now() - started;
+          if (allowed) ensureRecorder(tabId);
           // M2: fire-and-forget — safeRecord never rejects (its own try/catch
           // guarantees that), and a stalled store write must never delay the
           // tool's actual response to the host.
-          safeRecord(name, args, ctx, `error: ${scrubUrls(String(err.message), AUDIT_ERROR_CLIP)}`, Date.now() - started);
+          safeRecord(name, args, ctx, `error: ${scrubUrls(String(err.message), AUDIT_ERROR_CLIP)}`, ms);
           throw err;
         }
-        if (tabId != null) await ensureRecorder(tabId);
-        safeRecord(name, args, ctx, "ok", Date.now() - started);
+        const ms = Date.now() - started;
+        if (allowed) ensureRecorder(tabId);
+        safeRecord(name, args, ctx, "ok", ms);
         return result;
       };
     }
@@ -171,7 +217,13 @@
       // remembers it — don't resurrect an orphan row, and forget the mapping
       // so it isn't rechecked on every future batch for this tab.
       if (!(await store.hasSession(key))) { tabOwners.delete(tabId); return; }
-      await store.addEvents(key, tabId, events || []);
+      // I1/I2: redact hidden-input/cleared-value leftovers and URL-bearing
+      // attributes before they are ever written to disk, in the worker, so a
+      // recorder in any document cannot bypass it. knownTags is kept per tab
+      // across batches — see redact.js's redactEvents for why.
+      let knownTags = knownTagsByTab.get(tabId);
+      if (!knownTags) { knownTags = new Map(); knownTagsByTab.set(tabId, knownTags); }
+      await store.addEvents(key, tabId, redactEvents(events || [], knownTags));
     } catch (err) {
       console.error("[audit] failed to record recorder events:", err);
     }

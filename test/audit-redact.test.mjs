@@ -15,6 +15,7 @@ function load() {
     auditSummary: vm.runInContext("auditSummary", ctx),
     redactUrl: vm.runInContext("redactUrl", ctx),
     scrubUrls: vm.runInContext("scrubUrls", ctx),
+    redactEvents: vm.runInContext("redactEvents", ctx),
   };
 }
 
@@ -294,4 +295,161 @@ test("scrubUrls redacts every URL-like token in free text and clips to 200 chars
 test("scrubUrls leaves plain text with no URL untouched (aside from clipping)", () => {
   const { scrubUrls } = load();
   assert.equal(scrubUrls("Not attached to tab", 200), "Not attached to tab");
+});
+
+// --- redactEvents (I1/I2): the worker-side walker over rrweb event batches, run
+// in Audit.onRecorderEvents before anything is stored, so a recorder in any
+// document cannot bypass it. `knownTags` is a Map the caller (audit.js) keeps
+// per tab across batches, since a node's defining snapshot/add can arrive in an
+// earlier batch than a later attribute mutation on the same node. ---
+
+function inputNode(id, attributes) {
+  return { type: 2, tagName: "input", attributes, id, childNodes: [] };
+}
+
+test("I1: a hidden input's raw value in the full snapshot is masked", () => {
+  const { redactEvents } = load();
+  const events = [{
+    type: 2,
+    data: { node: { type: 0, id: 1, childNodes: [{ type: 2, tagName: "body", attributes: {}, id: 7, childNodes: [inputNode(8, { type: "hidden", name: "csrf", value: "HIDDENLOAD111" })] }] } },
+    timestamp: 1,
+  }];
+  redactEvents(events, new Map());
+  const json = JSON.stringify(events);
+  assert.doesNotMatch(json, /HIDDENLOAD111/);
+  assert.equal(events[0].data.node.childNodes[0].childNodes[0].attributes.value, "*".repeat("HIDDENLOAD111".length));
+});
+
+// I1's core gap: rrweb only overwrites `value` with the masked live value when
+// the live value is non-empty, so a field cleared by script after being
+// prefilled in markup keeps its raw HTML attribute untouched by rrweb itself.
+test("I1: a cleared password field's raw value attribute is masked even though rrweb's own masking never touched it", () => {
+  const { redactEvents } = load();
+  const events = [{
+    type: 2,
+    data: { node: { type: 0, id: 1, childNodes: [inputNode(9, { type: "password", value: "CLEAREDPW555" })] } },
+    timestamp: 1,
+  }];
+  redactEvents(events, new Map());
+  assert.doesNotMatch(JSON.stringify(events), /CLEAREDPW555/);
+});
+
+test("I1: a textarea's raw value is masked the same way as an input's", () => {
+  const { redactEvents } = load();
+  const events = [{ type: 2, data: { node: { type: 0, id: 1, childNodes: [{ type: 2, tagName: "textarea", attributes: { value: "SECRETNOTE" }, id: 5, childNodes: [] }] } }, timestamp: 1 }];
+  redactEvents(events, new Map());
+  assert.doesNotMatch(JSON.stringify(events), /SECRETNOTE/);
+});
+
+test("I1: an option's value is left alone, since it is page content, not a typed secret", () => {
+  const { redactEvents } = load();
+  const events = [{
+    type: 2,
+    data: { node: { type: 0, id: 1, childNodes: [{ type: 2, tagName: "select", attributes: {}, id: 10, childNodes: [{ type: 2, tagName: "option", attributes: { value: "US" }, id: 11, childNodes: [] }] }] } },
+    timestamp: 1,
+  }];
+  redactEvents(events, new Map());
+  assert.equal(events[0].data.node.childNodes[0].childNodes[0].attributes.value, "US");
+});
+
+test("I1: a late-added hidden input (a mutation's adds entry) is masked", () => {
+  const { redactEvents } = load();
+  const events = [{ type: 3, data: { source: 0, texts: [], removes: [], attributes: [], adds: [{ parentId: 7, nextId: null, node: inputNode(14, { type: "hidden", value: "LATEHIDDEN1414" }) }] }, timestamp: 1 }];
+  redactEvents(events, new Map());
+  assert.doesNotMatch(JSON.stringify(events), /LATEHIDDEN1414/);
+});
+
+test("I1: an attribute mutation's value is masked when the target id was already known to be an input", () => {
+  const { redactEvents } = load();
+  const knownTags = new Map([[9, "input"]]);
+  const events = [{ type: 3, data: { source: 0, texts: [], removes: [], adds: [], attributes: [{ id: 9, attributes: { value: "CLEAREDPW555" } }] } }];
+  redactEvents(events, knownTags);
+  assert.doesNotMatch(JSON.stringify(events), /CLEAREDPW555/);
+});
+
+test("I1: an attribute mutation's value is left alone when the target id is a known option", () => {
+  const { redactEvents } = load();
+  const knownTags = new Map([[11, "option"]]);
+  const events = [{ type: 3, data: { source: 0, texts: [], removes: [], adds: [], attributes: [{ id: 11, attributes: { value: "CA" } }] } }];
+  redactEvents(events, knownTags);
+  assert.equal(events[0].data.attributes[0].attributes.value, "CA");
+});
+
+// A node's defining snapshot/add can land in an earlier batch than a later
+// attribute mutation on it (rrweb flushes on its own 1s/100-event schedule) —
+// the caller must be able to reuse the same knownTags Map across two separate
+// redactEvents calls and still have the second one recognize the id.
+test("I1: knownTags persists across two calls, so a later batch's mutation on an earlier batch's input is still masked", () => {
+  const { redactEvents } = load();
+  const knownTags = new Map();
+  const batch1 = [{ type: 2, data: { node: { type: 0, id: 1, childNodes: [inputNode(9, { type: "password", value: "" })] } } }];
+  redactEvents(batch1, knownTags);
+  assert.equal(knownTags.get(9), "input");
+
+  const batch2 = [{ type: 3, data: { source: 0, texts: [], removes: [], adds: [], attributes: [{ id: 9, attributes: { value: "TYPEDLATER99" } }] } }];
+  redactEvents(batch2, knownTags);
+  assert.doesNotMatch(JSON.stringify(batch2), /TYPEDLATER99/);
+});
+
+// A full snapshot means a fresh document (a navigation): rrweb's node ids
+// restart from 1 there, so a stale id->tagName mapping from the previous
+// document is not just useless but actively wrong (id 9 could now be a <div>).
+test("I1: a new full snapshot resets knownTags, so a stale id from a previous document is not treated as an input", () => {
+  const { redactEvents } = load();
+  const knownTags = new Map([[9, "input"]]);
+  const freshSnapshot = [{ type: 2, data: { node: { type: 0, id: 1, childNodes: [{ type: 2, tagName: "select", attributes: {}, id: 10, childNodes: [{ type: 2, tagName: "option", attributes: { value: "US" }, id: 9, childNodes: [] }] }] } } }];
+  redactEvents(freshSnapshot, knownTags);
+  assert.equal(knownTags.get(9), "option");
+});
+
+// --- redactEvents (I2): Meta href, and href/src/action/formaction/poster/srcset
+// attributes in snapshots and mutations, all through redactUrl. ---
+
+test("I2: a Meta event's href is redacted of its query and fragment", () => {
+  const { redactEvents } = load();
+  const events = [{ type: 4, data: { href: "http://127.0.0.1:9/a?token=SECRETQ#access_token=SECRETF", width: 1200, height: 800 }, timestamp: 1 }];
+  redactEvents(events, new Map());
+  assert.doesNotMatch(JSON.stringify(events), /SECRETQ|SECRETF/);
+  assert.equal(events[0].data.href, "http://127.0.0.1:9/a?…#…");
+});
+
+test("I2: href/src/action/formaction/poster attributes are redacted in a full snapshot", () => {
+  const { redactEvents } = load();
+  const events = [{
+    type: 2,
+    data: {
+      node: {
+        type: 0, id: 1, childNodes: [
+          { type: 2, tagName: "a", attributes: { href: "https://x.test/reset?token=abc" }, id: 2, childNodes: [] },
+          { type: 2, tagName: "form", attributes: { action: "https://x.test/submit?token=abc" }, id: 3, childNodes: [] },
+          { type: 2, tagName: "button", attributes: { formaction: "https://x.test/go?token=abc" }, id: 4, childNodes: [] },
+          { type: 2, tagName: "video", attributes: { poster: "https://x.test/poster.jpg?token=abc" }, id: 5, childNodes: [] },
+        ],
+      },
+    },
+    timestamp: 1,
+  }];
+  redactEvents(events, new Map());
+  const json = JSON.stringify(events);
+  assert.doesNotMatch(json, /token=abc/);
+  const [a, form, button, video] = events[0].data.node.childNodes;
+  assert.equal(a.attributes.href, "https://x.test/reset?…");
+  assert.equal(form.attributes.action, "https://x.test/submit?…");
+  assert.equal(button.attributes.formaction, "https://x.test/go?…");
+  assert.equal(video.attributes.poster, "https://x.test/poster.jpg?…");
+});
+
+test("I2: each URL inside a srcset is redacted, keeping the width/density descriptors", () => {
+  const { redactEvents } = load();
+  const events = [{ type: 2, data: { node: { type: 0, id: 1, childNodes: [{ type: 2, tagName: "img", attributes: { srcset: "https://x.test/a.png?tok=1 1x, https://x.test/b.png?tok=2 2x" }, id: 2, childNodes: [] }] } }, timestamp: 1 }];
+  redactEvents(events, new Map());
+  const srcset = events[0].data.node.childNodes[0].attributes.srcset;
+  assert.doesNotMatch(srcset, /tok=/);
+  assert.equal(srcset, "https://x.test/a.png?… 1x, https://x.test/b.png?… 2x");
+});
+
+test("redactEvents returns the same array it was given, for convenient chaining", () => {
+  const { redactEvents } = load();
+  const events = [{ type: 4, data: { href: "https://x.test/" } }];
+  assert.equal(redactEvents(events, new Map()), events);
 });
