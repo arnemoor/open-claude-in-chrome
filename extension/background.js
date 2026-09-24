@@ -352,8 +352,10 @@ function charDefinition(ch) {
   if (/^[a-z]$/.test(ch)) return { key: ch, code: `Key${ch.toUpperCase()}`, keyCode: ch.toUpperCase().charCodeAt(0), text: ch, shift: false };
   if (/^[A-Z]$/.test(ch)) return { key: ch, code: `Key${ch}`, keyCode: ch.charCodeAt(0), text: ch, shift: true };
   if (/^[0-9]$/.test(ch)) return { key: ch, code: `Digit${ch}`, keyCode: ch.charCodeAt(0), text: ch, shift: false };
-  if (ch in SHIFTED_DIGITS) return { key: ch, code: `Digit${SHIFTED_DIGITS[ch]}`, keyCode: SHIFTED_DIGITS[ch].charCodeAt(0), text: ch, shift: true };
-  if (ch in PUNCTUATION) {
+  // Object.hasOwn, not `in` or a truthy read: ch could otherwise match an inherited
+  // Object.prototype name and resolve to that (non-key) value.
+  if (Object.hasOwn(SHIFTED_DIGITS, ch)) return { key: ch, code: `Digit${SHIFTED_DIGITS[ch]}`, keyCode: SHIFTED_DIGITS[ch].charCodeAt(0), text: ch, shift: true };
+  if (Object.hasOwn(PUNCTUATION, ch)) {
     const [code, keyCode, shift] = PUNCTUATION[ch];
     return { key: ch, code, keyCode, text: ch, shift };
   }
@@ -361,9 +363,12 @@ function charDefinition(ch) {
 }
 
 function keyDefinition(name) {
-  if (NAMED_KEYS[name]) return NAMED_KEYS[name];
-  const alias = KEY_ALIASES[name.toLowerCase()];
-  if (alias) return NAMED_KEYS[alias];
+  // Object.hasOwn: a plain `NAMED_KEYS[name]`/`KEY_ALIASES[...]` read matches inherited
+  // Object.prototype names too ("toString", "constructor", "__proto__", "valueOf"),
+  // resolving to a non-key value instead of reporting an unknown key.
+  if (Object.hasOwn(NAMED_KEYS, name)) return NAMED_KEYS[name];
+  const lower = name.toLowerCase();
+  if (Object.hasOwn(KEY_ALIASES, lower)) return NAMED_KEYS[KEY_ALIASES[lower]];
   if (/^f([1-9]|1[0-2])$/i.test(name)) return NAMED_KEYS[name.toUpperCase()];
   if ([...name].length === 1) return charDefinition(name);
   return null;
@@ -401,10 +406,45 @@ async function pressKey(tabId, def, modifiers) {
   const text = commandHeld ? undefined : shifted ? key : def.text;
   const down = { type: text ? "keyDown" : "rawKeyDown", key, code: def.code, windowsVirtualKeyCode: def.keyCode, modifiers };
   if (text) down.text = text;
-  if (IS_MAC && modifiers === MOD_META && MAC_EDIT_COMMANDS[def.key]) down.commands = [MAC_EDIT_COMMANDS[def.key]];
+  // Look up by the letter's lowercase form: def.key is uppercase for a bare "A", so a
+  // case-sensitive lookup would miss "cmd+A" even though "cmd+a" resolves it.
+  const macKey = def.key.toLowerCase();
+  if (IS_MAC && modifiers === MOD_META && Object.hasOwn(MAC_EDIT_COMMANDS, macKey)) down.commands = [MAC_EDIT_COMMANDS[macKey]];
   if (IS_MAC && modifiers === (MOD_META | MOD_SHIFT) && def.key === "z") down.commands = ["redo"];
   await cdp(tabId, "Input.dispatchKeyEvent", down);
   await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyUp", key, code: def.code, windowsVirtualKeyCode: def.keyCode, modifiers });
+}
+
+// Whether the page's focused element accepts a literal line break: "multiline" for a
+// <textarea> or a contenteditable element, "singleline" for an <input>, "unknown" when
+// nothing editable is focused or a cross-origin iframe hides the real target.
+const FOCUSED_FIELD_KIND_EXPR = `(() => {
+  let el = document.activeElement;
+  while (el) {
+    if (el.shadowRoot && el.shadowRoot.activeElement) { el = el.shadowRoot.activeElement; continue; }
+    if (el.tagName === "IFRAME") {
+      let doc = null;
+      try { doc = el.contentDocument; } catch (e) { doc = null; }
+      if (!doc) return "unknown";
+      el = doc.activeElement;
+      continue;
+    }
+    break;
+  }
+  if (!el) return "unknown";
+  if (el.tagName === "TEXTAREA" || el.isContentEditable) return "multiline";
+  if (el.tagName === "INPUT") return "singleline";
+  return "unknown";
+})()`;
+
+async function focusedFieldKind(tabId) {
+  try {
+    const result = await cdp(tabId, "Runtime.evaluate", { expression: FOCUSED_FIELD_KIND_EXPR, returnByValue: true });
+    const value = result?.result?.value;
+    return value === "multiline" || value === "singleline" ? value : "unknown";
+  } catch {
+    return "unknown";
+  }
 }
 
 function parseModifierString(modStr) {
@@ -686,18 +726,35 @@ const toolHandlers = {
       case "type": {
         if (!args.text) return { content: [{ type: "text", text: "text is required for type action" }] };
         await ensureAttached(tabId);
-        for (const char of args.text) {
-          // Chrome's Input.insertText treats a "\n"/"\r" in the inserted text as an implicit
-          // Enter, submitting the form exactly like a real Enter keypress would — even though
-          // no keydown ever fires. So newlines and tabs are skipped rather than inserted.
-          if (char !== "\n" && char !== "\r" && char !== "\t") {
+        // "\r\n" and a lone "\r" both mean one line break; per-character insertion of an
+        // un-normalized "\r\n" would otherwise land as two in a multiline field.
+        const text = args.text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+        // Chrome's Input.insertText treats a "\n" in the inserted text as an implicit Enter,
+        // submitting the form exactly like a real Enter keypress would — even though no
+        // keydown ever fires — but only when a single-line <input> is focused; a textarea or
+        // contenteditable just gets a real line break. So it's only inserted where it's safe,
+        // checked once up front against the actually focused element (which may be inside a
+        // shadow root or a same-origin iframe).
+        const fieldKind = text.includes("\n") ? await focusedFieldKind(tabId) : null;
+        let droppedNewline = false;
+        for (const char of text) {
+          if (char === "\n") {
+            if (fieldKind === "multiline") await cdp(tabId, "Input.insertText", { text: "\n" });
+            else droppedNewline = true;
+          } else {
             const def = charDefinition(char);
             if (def) await pressKey(tabId, def, def.shift ? MOD_SHIFT : 0);
             else await cdp(tabId, "Input.insertText", { text: char });
           }
           await sleep(10);
         }
-        return { content: [{ type: "text", text: `Typed "${args.text.substring(0, 50)}${args.text.length > 50 ? "..." : ""}"` }] };
+        let reply = `Typed "${args.text.substring(0, 50)}${args.text.length > 50 ? "..." : ""}"`;
+        if (droppedNewline) {
+          reply += fieldKind === "unknown"
+            ? " (line breaks were not typed: could not be checked)"
+            : " (line breaks were not typed: the focused field is single-line)";
+        }
+        return { content: [{ type: "text", text: reply }] };
       }
 
       case "key": {
