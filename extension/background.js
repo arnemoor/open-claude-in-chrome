@@ -1,6 +1,8 @@
 // Background service worker for Open Claude in Chrome extension.
 // Handles: native messaging, CDP via chrome.debugger, tool dispatch, tab group management.
 
+importScripts("audit/redact.js", "audit/store.js", "audit/audit.js");
+
 // Prevent unhandled rejections from killing the service worker
 self.addEventListener("unhandledrejection", (event) => {
   event.preventDefault();
@@ -33,7 +35,7 @@ function connectNativeHost() {
 
     nativePort.onMessage.addListener((msg) => {
       if (msg.type === "tool_request" && msg.id) {
-        handleToolRequest(msg.id, msg.tool, msg.args || {});
+        handleToolRequest(msg.id, msg.tool, msg.args || {}, msg.session);
       }
     });
 
@@ -1147,7 +1149,7 @@ const toolHandlers = {
   // (text and images interleave naturally). Each action is { name, input } and
   // dispatches through the same toolHandlers map as a normal request. Stops on
   // the first action that throws; nested browser_batch is rejected.
-  async browser_batch(args) {
+  async browser_batch(args, ctx) {
     const actions = Array.isArray(args.actions) ? args.actions : [];
     if (actions.length === 0) {
       return { content: [{ type: "text", text: "browser_batch requires a non-empty 'actions' array." }] };
@@ -1170,7 +1172,7 @@ const toolHandlers = {
 
       content.push({ type: "text", text: `--- Action ${i + 1}/${actions.length}: ${name} ---` });
       try {
-        const result = await handler(input);
+        const result = await handler(input, ctx);
         if (result?.content) content.push(...result.content);
       } catch (err) {
         content.push({ type: "text", text: `Action ${i + 1} (${name}) failed: ${err.message}` });
@@ -1285,21 +1287,36 @@ const toolHandlers = {
 
 };
 
+// Wrap once, in place, so browser_batch's own toolHandlers[name] lookups reach the
+// wrapped nested handlers too. Keeps exactly the same 22 keys, just new function values.
+Audit.wrapHandlers(toolHandlers);
+
 // --- Tool dispatch ---
-async function handleToolRequest(id, tool, args) {
+async function handleToolRequest(id, tool, args, session) {
   const handler = toolHandlers[tool];
   if (!handler) {
     sendError(id, `Unknown tool: ${tool}`);
     return;
   }
 
+  const ctx = { session, requestId: id };
   try {
-    const result = await handler(args);
+    const result = await handler(args, ctx);
     sendResponse(id, result);
   } catch (err) {
     sendError(id, `${tool} failed: ${err.message}`);
   }
 }
+
+// --- Audit: recorder events relayed from the in-page recorder (Task 16) ---
+// Sender-derived tabId (not a field in msg): a content script can't spoof another
+// tab's id, and onRecorderEvents itself drops events for a tab with no owner.
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg && msg.type === "auditRecorderEvents" && sender.tab) {
+    Audit.onRecorderEvents(sender.tab.id, msg.events || []);
+    sendResponse({ ok: true });
+  }
+});
 
 // --- Init ---
 
@@ -1319,3 +1336,4 @@ async function recoverTabGroupState() {
 
 recoverTabGroupState();
 connectNativeHost();
+Audit.init({ store: AuditStore });
