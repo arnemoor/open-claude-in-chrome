@@ -13,8 +13,7 @@
     "tabGroups",
     "windows",
     "storage",
-    "alarms",
-    "downloads"
+    "alarms"
   ],
   "host_permissions": [
     "<all_urls>"
