@@ -42,13 +42,11 @@
     emit: onEmit,
     maskAllInputs: true,
     maskInputOptions: { password: true },
-    // maskAllInputs only covers form controls (<input>/<textarea>/<select>) — a
-    // contenteditable region (a rich-text editor, a chat box) is just as much a
-    // typed-text surface (Review Focus 5) and needs its own mask. rrweb applies
-    // maskTextSelector to an element and then propagates that decision down to
-    // every descendant text node, so a plain selector on the host covers nested
-    // markup too — verified in test/audit-recorder.test.mjs against a
-    // deliberately nested structure.
+    // maskAllInputs covers form controls only. Contenteditable regions (rich-text
+    // editors, chat boxes) hold typed text as DOM text, so mask them too. The selector
+    // matches the host element: rrweb checks the element itself and, for mutations,
+    // every ancestor via closest(), so nested text and text typed straight into an
+    // empty host are both covered.
     maskTextSelector: '[contenteditable]:not([contenteditable="false"])',
     recordCanvas: false,
     collectFonts: false,

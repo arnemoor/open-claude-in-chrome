@@ -27,7 +27,7 @@ after(() => browser?.close());
 // actually relaying it to a background page.
 async function withRecorderPage(fn) {
   const server = http.createServer((req, res) => {
-    res.end(`<!doctype html><title>audit-recorder test</title><input id="t"><input id="p" type="password"><div id="ce" contenteditable="true"><p id="ce-p">existing</p></div>`);
+    res.end(`<!doctype html><title>audit-recorder test</title><input id="t"><input id="p" type="password"><div id="c" contenteditable="true"></div><div id="ce" contenteditable="true"><p id="ce-p">existing</p></div>`);
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = server.address().port;
@@ -106,6 +106,17 @@ test("masks text typed into a contenteditable region, including nested elements"
     const sent = JSON.parse(sentJson);
     const events = sent.flatMap((m) => m.events);
     assert.ok(events.some((e) => e.type === 2), `expected a full snapshot (type 2) event among: ${events.map((e) => e.type)}`);
+  });
+});
+
+test("masks text typed into an empty contenteditable element", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  await withRecorderPage(async (page, world) => {
+    await page.evaluate(`document.querySelector("#c").focus()`);
+    await page.send("Input.insertText", { text: "hunter2" });
+    await sleep(1500);
+
+    const sentJson = await world("JSON.stringify(globalThis.sent)");
+    assert.doesNotMatch(sentJson, /hunter2/);
   });
 });
 
