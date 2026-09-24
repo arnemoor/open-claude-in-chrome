@@ -21,9 +21,9 @@
 // switch_browser, list_connected_browsers, select_browser, gif_creator) pass
 // dispatch but their real effects are NOT verified here. See issue #1.
 //
-// Harness (isolatedEnv / mock native host / spawned server) is reused from
-// multi-session.test.mjs and auth.test.mjs. Ports 18850+ keep this suite from
-// clashing with those (18831/18832) and auth (18841).
+// Harness: an isolated HOME per block, an in-process bridge hub standing in for
+// the browser extension, and a real `node mcp-server.js` child connected to it
+// as a bridge client.
 //
 // Run: npm test   (from host/)
 
@@ -31,10 +31,9 @@ import { test, describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import net from "node:net";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import { startHub } from "./helpers.mjs";
 
 const SERVER = path.join(import.meta.dirname, "..", "mcp-server.js");
 const FIXTURE = path.join(import.meta.dirname, "claude-in-chrome-tools.schema.json");
@@ -85,52 +84,27 @@ const EXAMPLE_INPUTS = {
   upload_image: { imageId: "screenshot_1730000000000", ref: "ref_5", filename: "image.png", tabId: 123 },
 };
 
-// --- Test harness (adapted from multi-session.test.mjs / auth.test.mjs) -------
+// --- Test harness --------------------------------------------------------------
 
-function isolatedEnv(port) {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), "ocic-parity-"));
-  const cfgDir = path.join(home, ".config", "open-claude-in-chrome");
-  fs.mkdirSync(cfgDir, { recursive: true });
-  fs.writeFileSync(path.join(cfgDir, "config.json"), JSON.stringify({ port }));
-  const token = `test-token-${port}`;
-  fs.writeFileSync(path.join(cfgDir, "token"), token, { mode: 0o600 });
-  return { env: { ...process.env, HOME: home }, home, token };
+function isolatedEnv() {
+  const home = fs.mkdtempSync("/tmp/ocic-");
+  return { env: { ...process.env, HOME: home, OCIC_CONNECT_GRACE_MS: "2000" }, home };
 }
 
-// A stand-in for the browser's native host: connects, authenticates with
-// native_hello, RECORDS every tool_request it receives into `recorded`, and
-// answers each with MOCK_OK so the caller's callTool resolves.
-function startRecordingNativeHost(port, token, recorded) {
-  let sock;
-  let alive = true;
-  function connect() {
-    sock = net.createConnection(port, "127.0.0.1", () => {
-      sock.write(JSON.stringify({ type: "native_hello", token }) + "\n");
-    });
-    let buf = Buffer.alloc(0);
-    sock.on("data", (chunk) => {
-      buf = Buffer.concat([buf, chunk]);
-      let i;
-      while ((i = buf.indexOf(10)) !== -1) {
-        const line = buf.subarray(0, i).toString("utf-8").trim();
-        buf = buf.subarray(i + 1);
-        if (!line) continue;
-        let msg;
-        try { msg = JSON.parse(line); } catch { continue; }
-        if (msg.type === "tool_request") {
-          recorded.push({ id: msg.id, tool: msg.tool, args: msg.args });
-          sock.write(JSON.stringify({
-            id: msg.id, type: "tool_response",
-            result: { content: [{ type: "text", text: "MOCK_OK" }] },
-          }) + "\n");
-        }
-      }
-    });
-    sock.on("error", () => {});
-    sock.on("close", () => { if (alive) setTimeout(connect, 300); });
-  }
-  connect();
-  return { stop() { alive = false; try { sock.destroy(); } catch {} } };
+// A stand-in for the browser's native host, on an in-process bridge hub: RECORDS
+// every tool_request the hub forwards into `recorded`, and answers each with a
+// canned OK result so the caller's callTool resolves.
+async function startRecordingHub(home, recorded) {
+  const { hub, ext } = await startHub(home);
+  // startHub() wires the hub's sendToExtension to ext.send at construction time,
+  // so reassigning ext.send afterward would not be seen by the hub. Overriding
+  // the hub's own property works, since it re-reads this.sendToExtension on
+  // every call.
+  hub.sendToExtension = (msg) => {
+    recorded.push({ id: msg.id, tool: msg.tool, args: msg.args });
+    ext.reply(msg, { content: [{ type: "text", text: "ok" }] });
+  };
+  return { stop: () => hub.stop("test") };
 }
 
 // Spawn `node mcp-server.js` and connect a real MCP SDK client over stdio.
@@ -149,13 +123,13 @@ async function listToolsMap(client) {
 }
 
 // Poll a real tool call until the mock native host is attached and routing (so
-// dispatch tests don't race the native host's TCP handshake).
+// dispatch tests don't race the bridge client's connect handshake).
 async function waitForRoute(client, timeoutMs = 15000) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     try {
       const res = await client.callTool({ name: "tabs_context_mcp", arguments: {} });
-      if (JSON.stringify(res).includes("MOCK_OK")) return true;
+      if (JSON.stringify(res).includes("ok")) return true;
     } catch { /* server up, native host not attached yet */ }
     await sleep(250);
   }
@@ -293,13 +267,12 @@ test("harness self-check: fixture defines 22 prefixed tools with matching exampl
 // One spawned server; listTools() needs no native host.
 
 describe("tool surface parity (loadability + schema compliance)", () => {
-  const PORT = 18850;
   let session;
   let home;
   let served; // Map<name, inputSchema>
 
   before(async () => {
-    const iso = isolatedEnv(PORT);
+    const iso = isolatedEnv();
     home = iso.home;
     session = await startSession(iso.env);
     served = await listToolsMap(session.client);
@@ -340,20 +313,19 @@ describe("tool surface parity (loadability + schema compliance)", () => {
 });
 
 // --- TEST 3: DISPATCH, per tool ----------------------------------------------
-// One spawned server + a recording mock native host. Each tool is called with
-// its exampleInput; the native host must receive a matching tool_request.
+// One spawned server + a recording in-process hub. Each tool is called with
+// its exampleInput; the hub must receive a matching tool_request.
 
 describe("dispatch parity (each tool reaches the browser with matching args)", () => {
-  const PORT = 18851;
   let session;
   let home;
   let nativeHost;
   const recorded = [];
 
   before(async () => {
-    const iso = isolatedEnv(PORT);
+    const iso = isolatedEnv();
     home = iso.home;
-    nativeHost = startRecordingNativeHost(PORT, iso.token, recorded);
+    nativeHost = await startRecordingHub(home, recorded);
     session = await startSession(iso.env);
     const routed = await waitForRoute(session.client);
     assert.ok(routed, "mock native host should attach to the primary and route tool calls");
@@ -362,7 +334,7 @@ describe("dispatch parity (each tool reaches the browser with matching args)", (
 
   after(async () => {
     if (session) await session.transport.close().catch(() => {});
-    if (nativeHost) nativeHost.stop();
+    if (nativeHost) await nativeHost.stop();
     try { fs.rmSync(home, { recursive: true, force: true }); } catch {}
   });
 

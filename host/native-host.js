@@ -1,45 +1,23 @@
 #!/usr/bin/env node
 
-// Native Messaging Host for Open Claude in Chrome extension.
-// Launched by Chrome when the extension calls connectNative().
-// Bridges between Chrome native messaging (stdin/stdout, 4-byte LE length prefix + JSON)
-// and the MCP server (TCP on localhost).
+// Native messaging host for Open Claude in Chrome. The browser starts it when the
+// extension calls connectNative(). It owns the bridge hub: MCP servers connect to its
+// Unix socket, and it relays their tool requests to the extension over native
+// messaging (4-byte little-endian length + JSON on stdin/stdout). Nothing but
+// native-messaging frames may ever be written to stdout.
 
-import net from "node:net";
-import fs from "node:fs";
-import path from "node:path";
-import os from "node:os";
-import { getAuthToken } from "./auth-token.js";
+import { BridgeHub } from "./bridge-hub.js";
+import { bridgePath, BridgeSecurityError } from "./bridge-endpoint.js";
 
-const DEFAULT_PORT = 18765;
-
-function getPort() {
-  const configPath = path.join(
-    os.homedir(),
-    ".config",
-    "open-claude-in-chrome",
-    "config.json"
-  );
-  try {
-    const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-    return config.port || DEFAULT_PORT;
-  } catch {
-    return DEFAULT_PORT;
-  }
-}
-
-// --- Native messaging protocol (Chrome <-> this process) ---
-
-function readNativeMessage(buffer) {
+function readNativeMessages(buffer) {
   const messages = [];
   let offset = 0;
   while (offset + 4 <= buffer.length) {
     const len = buffer.readUInt32LE(offset);
     if (offset + 4 + len > buffer.length) break;
-    const json = buffer.subarray(offset + 4, offset + 4 + len).toString("utf-8");
     try {
-      messages.push(JSON.parse(json));
-    } catch (e) {
+      messages.push(JSON.parse(buffer.subarray(offset + 4, offset + 4 + len).toString("utf-8")));
+    } catch {
       // skip malformed
     }
     offset += 4 + len;
@@ -48,98 +26,46 @@ function readNativeMessage(buffer) {
 }
 
 function writeNativeMessage(obj) {
-  const json = JSON.stringify(obj);
-  const buf = Buffer.from(json, "utf-8");
+  const body = Buffer.from(JSON.stringify(obj), "utf-8");
   const header = Buffer.alloc(4);
-  header.writeUInt32LE(buf.length, 0);
-  process.stdout.write(Buffer.concat([header, buf]));
+  header.writeUInt32LE(body.length, 0);
+  process.stdout.write(Buffer.concat([header, body]));
 }
 
-// --- TCP connection to MCP server ---
-
-let tcpSocket = null;
-let tcpBuffer = Buffer.alloc(0);
-let reconnectTimer = null;
-let reconnectAttempts = 0;
-const MAX_RECONNECT_ATTEMPTS = 60; // 30 seconds at 500ms intervals
-const TCP_PORT = getPort();
-const AUTH_TOKEN = getAuthToken();
-
-function connectTcp() {
-  if (tcpSocket) return;
-
-  tcpSocket = new net.Socket();
-
-  tcpSocket.connect(TCP_PORT, "127.0.0.1", () => {
-    reconnectAttempts = 0;
-    if (reconnectTimer) {
-      clearInterval(reconnectTimer);
-      reconnectTimer = null;
-    }
-    // Authenticate to the primary. Without a valid token the primary drops us.
-    tcpSocket.write(JSON.stringify({ type: "native_hello", token: AUTH_TOKEN }) + "\n");
-  });
-
-  tcpSocket.on("data", (chunk) => {
-    // newline-delimited JSON from MCP server
-    tcpBuffer = Buffer.concat([tcpBuffer, chunk]);
-    let newlineIdx;
-    while ((newlineIdx = tcpBuffer.indexOf(10)) !== -1) {
-      const line = tcpBuffer.subarray(0, newlineIdx).toString("utf-8").trim();
-      tcpBuffer = tcpBuffer.subarray(newlineIdx + 1);
-      if (!line) continue;
-      try {
-        const msg = JSON.parse(line);
-        // Forward to extension via native messaging
-        writeNativeMessage(msg);
-      } catch {
-        // skip malformed
-      }
-    }
-  });
-
-  tcpSocket.on("error", () => {
-    tcpSocket = null;
-  });
-
-  tcpSocket.on("close", () => {
-    tcpSocket = null;
-    if (!reconnectTimer) {
-      reconnectTimer = setInterval(() => {
-        reconnectAttempts++;
-        if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
-          // MCP server is gone — exit cleanly so we don't linger as a zombie
-          clearInterval(reconnectTimer);
-          process.exit(0);
-        }
-        if (!tcpSocket) connectTcp();
-      }, 500);
-    }
-  });
-}
-
-// --- Main: bridge stdin (from extension) <-> TCP (to MCP server) ---
+const log = (event, data = {}) => process.stderr.write(`[native-host] ${event} ${JSON.stringify(data)}\n`);
+const hub = new BridgeHub({ sockPath: bridgePath(), sendToExtension: writeNativeMessage, log });
 
 let stdinBuffer = Buffer.alloc(0);
-
 process.stdin.on("data", (chunk) => {
   stdinBuffer = Buffer.concat([stdinBuffer, chunk]);
-  const { messages, remainder } = readNativeMessage(stdinBuffer);
+  const { messages, remainder } = readNativeMessages(stdinBuffer);
   stdinBuffer = remainder;
+  for (const msg of messages) hub.handleExtensionMessage(msg);
+});
 
-  for (const msg of messages) {
-    // Forward to MCP server via TCP
-    if (tcpSocket && !tcpSocket.destroyed) {
-      tcpSocket.write(JSON.stringify(msg) + "\n");
-    }
+let exiting = false;
+async function exit(code, reason) {
+  if (exiting) return;
+  exiting = true;
+  log("exit", { reason, code });
+  await hub.stop(reason).catch(() => {});
+  process.exit(code);
+}
+
+process.stdin.on("end", () => exit(0, "stdin closed"));
+process.on("SIGTERM", () => exit(0, "SIGTERM"));
+process.on("SIGINT", () => exit(0, "SIGINT"));
+process.on("uncaughtException", (err) => exit(1, `uncaught: ${err.stack || err.message}`));
+
+// An unsafe bridge directory must not crash-loop us: the extension would respawn this
+// process every 2 s. Stay alive and retry, so the problem shows up in the log.
+async function startHub() {
+  try {
+    await hub.start();
+  } catch (err) {
+    log("start_failed", { message: err.message });
+    if (err instanceof BridgeSecurityError) setTimeout(startHub, 30000);
+    else exit(1, `start failed: ${err.message}`);
   }
-});
-
-process.stdin.on("end", () => {
-  // Extension disconnected
-  if (tcpSocket) tcpSocket.destroy();
-  process.exit(0);
-});
-
-// Start TCP connection
-connectTcp();
+}
+startHub();

@@ -67,7 +67,11 @@ export class BridgeClient {
       const doWrite = () => {
         if (this._pending.get(id) !== entry) return; // already settled elsewhere
         entry.written = true;
-        this._socket.write(JSON.stringify({ type: "tool_request", id, tool, args }) + "\n");
+        try {
+          this._socket.write(JSON.stringify({ type: "tool_request", id, tool, args }) + "\n");
+        } catch {
+          // socket went away mid-write; the 'close' handler fails this with LOST
+        }
       };
 
       if (this._connected) {
