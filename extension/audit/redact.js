@@ -6,19 +6,30 @@ const AUDIT_STRING_CLIP = 100;
 const AUDIT_SUMMARY_CLIP = 300;
 const AUDIT_JS_CODE_CLIP = 500;
 
-// A scheme + "://" + a run of non-whitespace/non-quote/non-bracket characters
-// for the host/path part; once a "?" or "#" starts a query/fragment, ")" and "'"
-// are valid unencoded characters there (fix round 2, pulled in) so the run
-// continues through them too, stopping only at whitespace, a double quote or an
-// angle bracket. Good enough to find a URL embedded in a free-text Chrome error
-// message.
-const URL_TOKEN_RE = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()?#]*(?:[?#][^\s"<>]*)?/gi;
+// A scheme + "://" + a run of characters for the host/path part, continuing
+// through a "?"/"#" query or fragment (fix round 3, item 3: a URL token now
+// ends only at whitespace, a quote, "<" or ">" — "(" no longer ends it early,
+// so a path like "/a(b?token=..." still reaches its own query). Good enough to
+// find a URL embedded in a free-text Chrome error message or a page attribute.
+//
+// Fix round 3, item 2 (new Important): the scheme's own suffix is bounded to
+// {0,31} (any real scheme name is far shorter), not left unbounded. An
+// unbounded `[a-z0-9+.-]*` here, combined with \b matching at every letter in
+// a long alternating run like "a.a.a...", made the regex engine retry an
+// O(remaining-length) "no ':' found" backtrack at O(n) different starting
+// points — O(n^2) overall. A 100 KB attribute value cost 4.1s; bounding the
+// scheme caps the work at each starting point to a constant, restoring O(n).
+const URL_TOKEN_RE = /\b[a-z][a-z0-9+.-]{0,31}:\/\/[^\s"'<>]*(?:[?#][^\s"<>]*)?/gi;
 // A data: URI has no "//" after its scheme, so it never matches URL_TOKEN_RE —
 // scrubbed separately, the same way navigateSummary's own data: rule collapses
 // one to its length instead of leaving it (and whatever it encodes) verbatim.
-// Unlike URL_TOKEN_RE, "<"/">" are not excluded: a data:text/html,... payload
-// legitimately contains raw markup, and stopping there would leave it exposed.
-const DATA_URI_RE = /\bdata:[^\s"']+/gi;
+// "<"/">" are not excluded: a data:text/html,... payload legitimately contains
+// raw markup, and stopping there would leave it exposed. Nor is whitespace
+// (fix round 3, item 3, pulled): a data:text/html,... payload can legitimately
+// contain spaces (page text), so it is masked to the end of the value (a
+// quote, if this text is quoted, or otherwise the true end of the string) —
+// not just up to the first space, which would leave the rest exposed.
+const DATA_URI_RE = /\bdata:[^"']*/gi;
 
 function clipTo(s, max) {
   return typeof max === "number" && s.length > max ? `${s.slice(0, max)}…` : s;
@@ -122,8 +133,14 @@ function computerSummary(args) {
 
 // Mirrors the navigate handler's own scheme-less normalization (background.js)
 // so the audit summary reflects the URL it will actually navigate to, not a
-// literal reading of whatever the caller passed (M4).
-function normalizeNavigateUrl(url) {
+// literal reading of whatever the caller passed (M4). Named distinctly from
+// background.js's own like-named helper (fix round 3, item 5): redact.js is a
+// classic script sharing the worker's global scope with everything else
+// importScripts loads, and on the integration branch (Task 12) background.js
+// declares its own `normalizeNavigateUrl(input, ownExtensionId)` — importScripts
+// runs after background.js's own declarations are hoisted, so the identically-
+// named function here silently replaced it and broke navigate.
+function auditNavigateTarget(url) {
   if (/^https?:\/\//i.test(url) || url.startsWith("about:") || url.startsWith("chrome:") || url.startsWith("brave:")) return url;
   return `https://${url.replace(/^[a-z]{1,5}:\/+/i, "")}`;
 }
@@ -133,7 +150,7 @@ function navigateSummary(args) {
   if (url === "back" || url === "forward") return url;
   // M3: match case-insensitively and after trimming ("DATA:...", " data:...").
   if (typeof url === "string" && /^\s*data:/i.test(url)) return `data:[${url.length} chars]`;
-  return redactUrl(normalizeNavigateUrl(url));
+  return redactUrl(auditNavigateTarget(url));
 }
 
 function formInputSummary(args) {
@@ -143,125 +160,112 @@ function formInputSummary(args) {
   return `${ref} value [${String(value).length} chars]`;
 }
 
-// I5: replaces the contents of every '...', "..." and `...` literal, and every
-// regex literal's body, with [N chars], while leaving comments and surrounding
-// code untouched. A template literal's whole span (backtick to its own
-// matching backtick) is masked as one unit, including any nested ${...}
-// substitutions — those are walked, not masked separately, purely to find the
-// TRUE matching backtick without being fooled by a string, a regex, a comment,
-// or a further nested template inside the substitution (fix round 2: a bare
-// "find the next backtick" scan mistook a nested template's own backtick for
-// the outer one's close, leaking the inner template's content as ordinary
-// code). Comments (// and /* */) are skipped as comments, not scanned for
-// quotes, so a quote inside one no longer desynchronizes the scanner onto a
-// later, real secret. A "/" is treated as opening a regex only where an
-// expression can start (the position rules below), the same way a JS parser
-// itself decides, so ordinary division is never mistaken for one. This is a
-// lexical scan, not a full JS parser — it fails closed instead: an unterminated
-// string, template, regex or (top-level) block comment has its remainder, to
-// the end of input, replaced with [N chars] rather than echoed as real code.
+// I5: replaces the contents of every '...', "..." and `...` literal with
+// [N chars], while leaving comments and surrounding code untouched. A template
+// literal's whole span (backtick to its own matching backtick) is masked as
+// one unit, including any nested ${...} substitutions — those are walked (via
+// skipTemplate below), not masked separately, purely to find the TRUE matching
+// backtick without being fooled by a string, a comment, or a further nested
+// template inside the substitution. Comments (// and /* */) are skipped as
+// comments, not scanned for quotes, so a quote inside one no longer
+// desynchronizes the scanner onto a later, real secret.
+//
+// Fix round 3, item 1 (binding): earlier drafts also tried to guess whether a
+// "/" opened a regex literal or was a division operator, by the token before
+// it. That heuristic itself leaked real secrets — 13 of 61 adversarial inputs
+// in re-review, the main family a postfix "++"/"--" right before a "/" (e.g.
+// `done++ / total`), which was misjudged as a regex opener and swallowed
+// everything up to a LATER, unrelated "/" inside a real string, un-masking it.
+// The rule now: outside a string, a template or a comment, ANY "/" that isn't
+// "//" or "/*" ends the kept part — everything from that "/" to the end of
+// input becomes one [N chars] span. This over-masks a real regex or division,
+// but it can no longer leak a secret no matter how the "/" was introduced.
+//
+// This is a lexical scan, not a full JS parser — it fails closed instead: an
+// unterminated string, template or (top-level) block comment has its
+// remainder, to the end of input, replaced with [N chars] rather than echoed
+// as real code. Nesting inside skipTemplate uses an explicit stack, not
+// recursion, and gives up (failing closed) past MAX_TEMPLATE_DEPTH levels, so
+// a script holding thousands of nested template literals cannot throw a
+// RangeError and drop the whole action unrecorded.
 
-// Punctuation and keywords after which a "/" starts an expression (a regex),
-// not a division operator.
-const REGEX_OK_PUNCT = new Set(["(", ",", "=", ":", "[", "!", "&", "|", "?", "{", "}", ";", "+", "-", "*", "%", "<", ">", "~", "^"]);
-const REGEX_OK_WORDS = new Set(["return", "typeof", "instanceof", "in", "of", "new", "delete", "void", "throw", "do", "else", "yield", "case"]);
-const IDENT_CHAR_RE = /[A-Za-z0-9_$]/;
+const MAX_TEMPLATE_DEPTH = 100;
 
-function regexAllowedAfter(lastSig) {
-  return lastSig === null || REGEX_OK_PUNCT.has(lastSig) || REGEX_OK_WORDS.has(lastSig);
-}
-
-// Returns { next, end }: the updated lastSig and the position after consuming
-// one ordinary (non-string/regex/comment) unit starting at `i` — a whole
-// identifier/keyword/number run at once, a single REGEX_OK_PUNCT character, or
-// (whitespace aside, which never changes lastSig) any other punctuation, which
-// is value-like (")", "]", "." and so on: a "/" right after one of those is
-// division, so it resets lastSig to a non-preceding marker).
-function advancePlainToken(code, i, lastSig) {
-  const ch = code[i];
-  if (IDENT_CHAR_RE.test(ch)) {
-    let j = i + 1;
-    while (j < code.length && IDENT_CHAR_RE.test(code[j])) j++;
-    return { next: code.slice(i, j), end: j };
-  }
-  if (ch === " " || ch === "\t" || ch === "\n" || ch === "\r") return { next: lastSig, end: i + 1 };
-  if (REGEX_OK_PUNCT.has(ch)) return { next: ch, end: i + 1 };
-  return { next: "value", end: i + 1 };
-}
-
-// Position-finding helpers below never build output themselves — everything
-// nested inside a template's ${...} is ultimately discarded into that
-// template's own single [N chars] span, so only *where things end* matters
-// until control returns to maskJsStringLiterals itself.
-
-function skipStringBody(code, i, quote) {
+// Finds the position of a template literal's TRUE matching closing backtick,
+// given the position right after its OPENING one. A "${" inside it starts a
+// substitution — ordinary code, which can itself hold strings, comments and
+// further nested templates (each with their own "${...}") — so an explicit
+// stack tracks every level currently open: "template" (scanning that level's
+// own literal text) or a number (scanning a substitution's code, counting its
+// own unmatched "{" so the "}" that closes it is never confused with one
+// nested deeper inside it). A bare "/" encountered anywhere in this walk — at
+// any depth — means nothing past it can be trusted either, so the whole
+// search fails closed (returns n, "never closed") from there, same as running
+// out of input while any level is still open.
+function skipTemplate(code, start) {
   const n = code.length;
-  while (i < n && code[i] !== quote) i += code[i] === "\\" && i + 1 < n ? 2 : 1;
-  return i; // index of the closing quote, or n if never found
-}
-
-// Honors \ escapes and does not treat "/" as closing while inside a [...]
-// character class (e.g. /[a/b]/).
-function skipRegexBody(code, i) {
-  const n = code.length;
-  let inClass = false;
+  let i = start;
+  const stack = ["template"];
   while (i < n) {
+    const top = stack[stack.length - 1];
     const ch = code[i];
-    if (ch === "\\" && i + 1 < n) i += 2;
-    else if (ch === "[") { inClass = true; i++; }
-    else if (ch === "]") { inClass = false; i++; }
-    else if (ch === "/" && !inClass) return i;
-    else i++;
-  }
-  return i;
-}
 
-function skipBlockCommentBody(code, i) {
-  const idx = code.indexOf("*/", i);
-  return idx === -1 ? code.length : idx;
-}
+    if (top === "template") {
+      if (ch === "\\" && i + 1 < n) { i += 2; continue; }
+      if (ch === "`") {
+        if (stack.length === 1) return i; // our own outermost template's true close
+        stack.pop();
+        i++;
+        continue;
+      }
+      if (ch === "$" && code[i + 1] === "{") {
+        i += 2;
+        if (stack.length >= MAX_TEMPLATE_DEPTH) return n;
+        stack.push(0);
+        continue;
+      }
+      i++;
+      continue;
+    }
 
-// Skips code inside a ${...} substitution up to (and past) its own matching
-// "}", tracking any {} nesting within it and stepping over any strings,
-// templates, regexes or comments along the way so a delimiter inside one of
-// those is never mistaken for this substitution's closing brace.
-function skipSubstitution(code, i) {
-  const n = code.length;
-  let depth = 0;
-  let lastSig = null;
-  while (i < n) {
-    const ch = code[i];
-    if (ch === "/" && code[i + 1] === "/") { while (i < n && code[i] !== "\n") i++; }
-    else if (ch === "/" && code[i + 1] === "*") { i = skipBlockCommentBody(code, i + 2); if (i < n) i += 2; }
-    else if (ch === "'" || ch === '"') { i = skipStringBody(code, i + 1, ch); if (i < n) i++; lastSig = "value"; }
-    else if (ch === "`") { i = skipTemplateBody(code, i + 1); if (i < n) i++; lastSig = "value"; }
-    else if (ch === "/" && regexAllowedAfter(lastSig)) { i = skipRegexBody(code, i + 1); if (i < n) i++; lastSig = "value"; }
-    else if (ch === "{") { depth++; i++; lastSig = "{"; }
-    else if (ch === "}") { if (depth === 0) return i + 1; depth--; i++; lastSig = "}"; }
-    else { const adv = advancePlainToken(code, i, lastSig); lastSig = adv.next; i = adv.end; }
+    // top is a number: scanning code inside a "${...}" substitution.
+    if (ch === "/" && code[i + 1] === "/") { while (i < n && code[i] !== "\n") i++; continue; }
+    if (ch === "/" && code[i + 1] === "*") {
+      const end = code.indexOf("*/", i + 2);
+      if (end === -1) return n;
+      i = end + 2;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      let j = i + 1;
+      while (j < n && code[j] !== ch) j += code[j] === "\\" && j + 1 < n ? 2 : 1;
+      if (j >= n) return n;
+      i = j + 1;
+      continue;
+    }
+    if (ch === "`") {
+      i++;
+      if (stack.length >= MAX_TEMPLATE_DEPTH) return n;
+      stack.push("template");
+      continue;
+    }
+    if (ch === "/") return n; // fail closed: see the file-level comment above
+    if (ch === "{") { stack[stack.length - 1] = top + 1; i++; continue; }
+    if (ch === "}") {
+      if (top === 0) { stack.pop(); i++; continue; }
+      stack[stack.length - 1] = top - 1;
+      i++;
+      continue;
+    }
+    i++;
   }
-  return i; // unterminated substitution; bubbles up as "template never closed"
-}
-
-// Finds a template literal's matching closing backtick, starting right after
-// its opening one.
-function skipTemplateBody(code, i) {
-  const n = code.length;
-  while (i < n) {
-    const ch = code[i];
-    if (ch === "\\" && i + 1 < n) i += 2;
-    else if (ch === "`") return i;
-    else if (ch === "$" && code[i + 1] === "{") i = skipSubstitution(code, i + 2);
-    else i++;
-  }
-  return i;
+  return n; // ran out of input before this template's own closing backtick
 }
 
 function maskJsStringLiterals(code) {
   let out = "";
   let i = 0;
   const n = code.length;
-  let lastSig = null; // start of input: a "/" here would open a regex
   while (i < n) {
     const ch = code[i];
     if (ch === "/" && code[i + 1] === "/") {
@@ -270,8 +274,8 @@ function maskJsStringLiterals(code) {
       out += code.slice(start, i); // comments are kept as-is, never masked
     } else if (ch === "/" && code[i + 1] === "*") {
       const bodyStart = i + 2;
-      const end = skipBlockCommentBody(code, bodyStart);
-      const closed = end < n;
+      const end = code.indexOf("*/", bodyStart);
+      const closed = end !== -1;
       if (closed) {
         out += code.slice(i, end + 2);
         i = end + 2;
@@ -279,41 +283,32 @@ function maskJsStringLiterals(code) {
         // Fail closed: an unterminated comment might not really be "just a
         // comment" — don't echo whatever follows as if it were safely inert.
         out += "/*" + `[${n - bodyStart} chars]`;
-        i = n;
+        return out;
       }
     } else if (ch === "'" || ch === '"') {
       const start = i + 1;
-      const end = skipStringBody(code, start, ch);
-      const closed = end < n;
-      out += ch + `[${end - start} chars]` + (closed ? ch : "");
-      i = closed ? end + 1 : n;
-      lastSig = "value";
+      let j = start;
+      while (j < n && code[j] !== ch) j += code[j] === "\\" && j + 1 < n ? 2 : 1;
+      const closed = j < n;
+      out += ch + `[${j - start} chars]` + (closed ? ch : "");
+      if (!closed) return out;
+      i = j + 1;
     } else if (ch === "`") {
       const start = i + 1;
-      const end = skipTemplateBody(code, start);
+      const end = skipTemplate(code, start);
       const closed = end < n;
       out += "`" + `[${end - start} chars]` + (closed ? "`" : "");
-      i = closed ? end + 1 : n;
-      lastSig = "value";
-    } else if (ch === "/" && regexAllowedAfter(lastSig)) {
-      const start = i + 1;
-      const end = skipRegexBody(code, start);
-      const closed = end < n;
-      out += "/" + `[${end - start} chars]`;
-      if (closed) {
-        i = end + 1;
-        const flagStart = i;
-        while (i < n && /[a-z]/i.test(code[i])) i++;
-        out += "/" + code.slice(flagStart, i);
-      } else {
-        i = n;
-      }
-      lastSig = "value";
+      if (!closed) return out;
+      i = end + 1;
+    } else if (ch === "/") {
+      // Item 1's binding rule: stop guessing whether this is a regex or a
+      // division — either way we cannot safely keep parsing past it, so
+      // everything from here to the end of input becomes one opaque span.
+      out += `[${n - i} chars]`;
+      return out;
     } else {
-      const adv = advancePlainToken(code, i, lastSig);
-      out += code.slice(i, adv.end);
-      lastSig = adv.next;
-      i = adv.end;
+      out += ch;
+      i++;
     }
   }
   return out;
@@ -383,15 +378,31 @@ function redactSrcset(value) {
 // dedicated URL_ATTRS (e.g. a <meta property="og:url" content="...?token=...">).
 function redactAttributes(shouldMaskValue, attributes) {
   if (!attributes || typeof attributes !== "object") return;
-  if (shouldMaskValue && typeof attributes.value === "string") {
-    attributes.value = "*".repeat(attributes.value.length);
+  if (typeof attributes.value === "string") {
+    // Fix round 3, item 4 (pulled): a value the controller's ruling keeps
+    // (an <option>'s or a <button>'s — page content, not a typed secret) can
+    // still carry a URL's query as its own text (e.g. an <option value="https:
+    // //...?token=...">) — scrub that even though the value itself isn't
+    // asterisk-masked.
+    if (shouldMaskValue) attributes.value = "*".repeat(attributes.value.length);
+    else attributes.value = scrubUrls(attributes.value);
   }
   for (const attr of URL_ATTRS) {
     if (typeof attributes[attr] === "string") attributes[attr] = redactUrl(attributes[attr]);
   }
   if (typeof attributes.srcset === "string") attributes.srcset = redactSrcset(attributes.srcset);
+  // Fix round 3, item 4 (pulled): rrweb represents a style change shorter
+  // than the whole style as a diff object (CSS property -> new value) rather
+  // than a plain string — a framework setting el.style.backgroundImage takes
+  // this path, so a signed image URL's query needs the same scrub either shape
+  // arrives in.
+  if (attributes.style && typeof attributes.style === "object") {
+    for (const [prop, value] of Object.entries(attributes.style)) {
+      if (typeof value === "string") attributes.style[prop] = scrubUrls(value);
+    }
+  }
   for (const [name, value] of Object.entries(attributes)) {
-    if (name === "value" || name === "srcset" || URL_ATTRS.includes(name)) continue; // already handled above
+    if (name === "value" || name === "srcset" || name === "style" || URL_ATTRS.includes(name)) continue; // already handled above
     if (typeof value === "string") attributes[name] = scrubUrls(value);
   }
 }

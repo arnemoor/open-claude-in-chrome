@@ -689,6 +689,34 @@ test("a recorder batch that arrives before the session row is written is retried
   assert.equal(addEventsCalls.length, 1, "expected the batch to be stored once the retry found the row");
 });
 
+// Fix round 3, item 6 (test gap, pulled): the retry test above only proves a
+// retry happens well inside the window (a bare flush() after delivering the
+// tool_request) — it says nothing about the window's upper bound. "Always
+// retry once, regardless of age" would pass that test identically. This
+// waits past RECENT_OWNER_WINDOW_MS (10s) before the batch ever arrives, so
+// hasSessionWithRetry must see the owner as stale and skip the retry outright
+// — the row really is gone (pruned, or deleted from the options page), not
+// just delayed.
+test("a recorder batch arriving more than 10s after the owner was set is dropped without a retry", async () => {
+  const fakeStore = makeFakeStore();
+  let hasSessionCalls = 0;
+  fakeStore.hasSession = async () => { hasSessionCalls++; return false; }; // the row is genuinely gone, not just delayed
+  const bg = await loadBackground({ beforeRun: injectFakeStore(fakeStore) });
+  await flush();
+  await bg.chrome.storage.local.set({ audit: { enabled: true, retentionDays: 7 } });
+
+  bg.deliver({ type: "tool_request", id: "1.s1.1", tool: "gif_creator", args: { tabId: 42 }, session: SESSION });
+  await flush(); // owner set
+
+  await flush(10200); // comfortably past the 10s window, before the batch below ever arrives
+
+  bg.chrome.runtime.onMessage.fire({ type: "ocic_audit_events", events: [{ type: 2 }] }, { id: bg.chrome.runtime.id, tab: { id: 42 }, frameId: 0 }, () => {});
+  await flush(700); // long enough for a (wrongly-taken) ~500ms retry to actually elapse
+
+  assert.equal(hasSessionCalls, 1, "a stale (>10s) owner must not get the 500ms retry at all");
+  assert.deepEqual(fakeStore.calls.filter((c) => c[0] === "addEvents"), []);
+});
+
 // New Minor 3 (fix round 2): tabOwners and the walker's per-tab tag map were
 // never cleared when a tab closed, growing unboundedly (the tag map holds one
 // entry per element — tens of thousands on a large page) for as long as the
@@ -709,4 +737,49 @@ test("the tab owner is forgotten when the tab closes, so a later batch for it is
   await flush();
 
   assert.deepEqual(fakeStore.calls.filter((c) => c[0] === "addEvents"), []);
+});
+
+// Fix round 3, item 6 (test gap, pulled): the test above only proves
+// tabOwners is forgotten — onRecorderEvents already returns early with no
+// owner, before it ever touches knownTagsByTab, so that alone says nothing
+// about whether the tag map itself is cleared. A closed tab's id is routinely
+// reused by a fresh document (rrweb's node ids restart from 1 there), so a
+// surviving id->tagName entry is not just useless but actively wrong: the
+// same numeric id could now be a password input instead of the option it
+// used to be. This re-establishes ownership on the same tabId after the
+// close (a fresh document's first tool call would do the same) and sends a
+// mutation on the old id with deliberately no new full snapshot in between —
+// a full snapshot would reset knownTags on its own and prove nothing here.
+test("chrome.tabs.onRemoved clears the tab's known-tags map too, not just its owner", async () => {
+  const fakeStore = makeFakeStore();
+  const bg = await loadBackground({ beforeRun: injectFakeStore(fakeStore) });
+  await flush();
+  await bg.chrome.storage.local.set({ audit: { enabled: true, retentionDays: 7 } });
+
+  bg.deliver({ type: "tool_request", id: "1.s1.1", tool: "gif_creator", args: { tabId: 42 }, session: SESSION });
+  await flush();
+
+  const snapshot = [{
+    type: 2,
+    data: { node: { type: 0, id: 1, childNodes: [{ type: 2, tagName: "option", attributes: { value: "US" }, id: 9, childNodes: [] }] } },
+  }];
+  bg.chrome.runtime.onMessage.fire({ type: "ocic_audit_events", events: snapshot }, { id: bg.chrome.runtime.id, tab: { id: 42 }, frameId: 0 }, () => {});
+  await flush();
+
+  bg.chrome.tabs.onRemoved.fire(42);
+  await flush();
+
+  // Same tab id, reused by a fresh document: re-establish ownership like that
+  // document's first tool call would, but send no new full snapshot — id 9
+  // is only reachable as "option" if a stale map entry survived the close.
+  bg.deliver({ type: "tool_request", id: "1.s1.2", tool: "gif_creator", args: { tabId: 42 }, session: SESSION });
+  await flush();
+
+  const mutation = [{ type: 3, data: { source: 0, texts: [], removes: [], adds: [], attributes: [{ id: 9, attributes: { value: "FRESHDOC9SECRET" } }] } }];
+  bg.chrome.runtime.onMessage.fire({ type: "ocic_audit_events", events: mutation }, { id: bg.chrome.runtime.id, tab: { id: 42 }, frameId: 0 }, () => {});
+  await flush();
+
+  const addEventsCalls = fakeStore.calls.filter((c) => c[0] === "addEvents");
+  const lastStored = JSON.stringify(addEventsCalls[addEventsCalls.length - 1][3]);
+  assert.doesNotMatch(lastStored, /FRESHDOC9SECRET/, "id 9's stale \"option\" tag must not survive the tab close");
 });

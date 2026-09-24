@@ -225,23 +225,48 @@ test("javascript_tool: an apostrophe inside a /* */ block comment does not desyn
   assert.match(s, /^\/\* the user's token \*\/ /);
 });
 
-test("javascript_tool: a quote inside a regex literal does not desynchronize the scanner", () => {
+// Fix round 3, item 1: the regex-vs-division heuristic itself was the bug — 13
+// of 61 adversarial inputs still leaked a later string literal through it (a
+// postfix ++/-- before a "/", or a "/" after if(...)/while(...)/await/...).
+// The ruling replaced guessing with a fail-closed rule: outside a string,
+// template or comment, ANY "/" that isn't "//" or "/*" ends the kept part —
+// everything from that "/" to the end of input becomes one [N chars] span.
+// This over-masks a real regex or a real division, but it can no longer
+// leak, no matter how the "/" was introduced.
+test("javascript_tool: a bare / (division or otherwise) masks everything from there to the end", () => {
   const { auditSummary } = load();
-  const s3 = auditSummary("javascript_tool", { text: `s = s.replace(/"/g, ''); pw.value = "S3cr3tC";` });
-  assert.doesNotMatch(s3, /S3cr3tC/);
-  const s4 = auditSummary("javascript_tool", { text: `t = t.replace(/'/g, ''); pw.value = 'S3cr3tD';` });
-  assert.doesNotMatch(s4, /S3cr3tD/);
+  const s = auditSummary("javascript_tool", { text: "let a = width / 2; let b = 'secret';" });
+  assert.doesNotMatch(s, /secret/);
+  assert.match(s, /^let a = width \[\d+ chars\]$/);
 });
 
-test("javascript_tool: division is not mistaken for a regex literal", () => {
-  const { auditSummary } = load();
-  // "a / 2" after an identifier is division; a stray "/2" scanned as a regex
-  // opener would swallow everything up to the next "/" (here, none exists,
-  // which would trip the fail-closed path and hide "b" and "secret").
-  const s = auditSummary("javascript_tool", { text: `let a = width / 2; let b = 'secret';` });
-  assert.doesNotMatch(s, /secret/);
-  assert.match(s, /width \/ 2;/, "division must be left as ordinary code, not treated as a regex");
-});
+// The re-review's exact adversarial P (postfix ++/--) and K (if/while/await/
+// spread/keyword-as-identifier) families — every one used to desynchronize
+// the old heuristic and leak its own named secret.
+const NO_LEAK_CASES = [
+  ["P1", "r = a++ / 'x' / 'S3cr3tP1';"],
+  ["P2", "r = a++ / 'x/' + 'S3cr3tP2';"],
+  ["P3", "r = i++ / 2; parts = s.split('/'); pw = 'S3cr3tP3';"],
+  ["P4", "pct = done++ / total; url = base + '/api/login'; fetch(url, {body: 'password=S3cr3tP4'});"],
+  ["P5", "r = n-- / 2; s = 'x/S3cr3tP5';"],
+  ["P6", "r = a++ / 2; // done/it's\npw = 'S3cr3tP6';"],
+  ["P7", "r = i++ / 2;\nconst u = '/v1/users';\nconst pw = 'S3cr3tP7';"],
+  ["K1", "if (ok) /'/.test(s); pw = 'S3cr3tK1';"],
+  ["K2", "x = {} / 2; y = 'a/b'; z = 'S3cr3tK2';"],
+  ["K3", "let of = 4; x = of / 2; s = 'a/b'; t = 'S3cr3tK3';"],
+  ["K4", "x = r.in / 2; s = 'a/b'; t = 'S3cr3tK4';"],
+  ["K5", "async () => { await /'/; pw = 'S3cr3tK5'; }"],
+  ["K6", "a = [.../'/g.exec(s)]; pw = 'S3cr3tK6';"],
+  ["K7", 'while (x) /"/.exec(s); pw = "S3cr3tK7";'],
+  ["K8", "x = ++i / 2; pw = 'S3cr3tK8';"],
+];
+for (const [name, code] of NO_LEAK_CASES) {
+  const secret = code.match(/S3cr3t\w+/)[0];
+  test(`javascript_tool: ${name} does not leak its secret literal`, () => {
+    const { auditSummary } = load();
+    assert.doesNotMatch(auditSummary("javascript_tool", { text: code }), new RegExp(secret));
+  });
+}
 
 test("javascript_tool: a template literal nested inside another's ${} does not leak", () => {
   const { auditSummary } = load();
@@ -249,11 +274,44 @@ test("javascript_tool: a template literal nested inside another's ${} does not l
   assert.doesNotMatch(s, /S3cr3tE/);
 });
 
+test("javascript_tool: a comment with a quote inside a template's ${} substitution does not corrupt what follows it", () => {
+  const { auditSummary } = load();
+  const code = "const h = `outer ${ // it's a comment\n 'value' }`; console.log('AFTER');";
+  const s = auditSummary("javascript_tool", { text: code });
+  assert.doesNotMatch(s, /AFTER/);
+  assert.match(s, /console\.log\('\[\d+ chars\]'\);$/, "expected normal code to resume correctly once the template closed");
+});
+
 test("javascript_tool: an unterminated string is masked to the end, not echoed as code", () => {
   const { auditSummary } = load();
   const s = auditSummary("javascript_tool", { text: `pw.value = 'never closes and the rest of the file is EOFSECRET` });
   assert.doesNotMatch(s, /EOFSECRET/);
   assert.match(s, /^pw\.value = '\[\d+ chars\]$/);
+});
+
+test("javascript_tool: an unterminated block comment fails closed instead of echoing what follows", () => {
+  const { auditSummary } = load();
+  const s = auditSummary("javascript_tool", { text: "/* never closes and the rest of the file is EOFSECRET" });
+  assert.doesNotMatch(s, /EOFSECRET/);
+  assert.match(s, /^\/\*\[\d+ chars\]$/);
+});
+
+// Item 1's explicit depth bound: with an explicit stack (not recursion), deep
+// nesting can no longer throw a RangeError and drop the whole action — it
+// fails closed past 100 levels instead.
+test("javascript_tool: 200 levels of nested template literals fail closed instead of throwing, and never leak the innermost secret", () => {
+  const { auditSummary } = load();
+  let code = "'SECRET_AT_BOTTOM'";
+  for (let i = 0; i < 200; i++) code = "`L" + i + " ${" + code + "}`";
+  assert.doesNotThrow(() => auditSummary("javascript_tool", { text: code }));
+  assert.doesNotMatch(auditSummary("javascript_tool", { text: code }), /SECRET_AT_BOTTOM/);
+});
+
+test("javascript_tool: a plain snippet with no / anywhere keeps its exact code structure", () => {
+  const { auditSummary } = load();
+  const code = "function greet(name) { return `Hello, ${name}!`; }";
+  const s = auditSummary("javascript_tool", { text: code });
+  assert.match(s, /^function greet\(name\) \{ return `\[\d+ chars\]`; \}$/);
 });
 
 // --- file_upload ---
@@ -366,7 +424,50 @@ test("scrubUrls replaces a data: URL with its length, the same way navigate's ow
   const { scrubUrls } = load();
   const s = scrubUrls("failed to load data:text/html,<p>apikey=SECRET123</p> here", 300);
   assert.doesNotMatch(s, /SECRET123/);
-  assert.match(s, /^failed to load data:\[\d+ chars\] here$/);
+  // Fix round 3, item 3: masked to the true end of the value (nothing here
+  // quotes or otherwise bounds it), so the trailing " here" is absorbed too —
+  // not left exposed after a truncated match, which is exactly the residual
+  // this item closed (see the "data: URL containing a space" test below).
+  assert.match(s, /^failed to load data:\[\d+ chars\]$/);
+});
+
+// Fix round 3, item 3 (pulled): "(" used to end the host/path part, so a URL
+// containing one before its query kept that query in the clear.
+test("scrubUrls (item 3): a ( in the path no longer ends the match before it reaches the query", () => {
+  const { scrubUrls } = load();
+  const s = scrubUrls("see https://x.test/a(b?token=PARENPATH1 for details", 300);
+  assert.doesNotMatch(s, /PARENPATH1/);
+});
+
+// A URL token now ends only at whitespace, a quote, < or > — a bare URL (no
+// query) still doesn't swallow unrelated trailing text once whitespace hits.
+test("scrubUrls (item 3): a bare URL still stops at whitespace before unrelated trailing text", () => {
+  const { scrubUrls } = load();
+  const s = scrubUrls("(see https://x.test/page) more text", 300);
+  assert.match(s, /more text$/);
+});
+
+// Fix round 3, item 3 (pulled): a data: URL containing a space used to stop
+// there, leaving the rest of the payload (e.g. HTML text content) exposed.
+test("scrubUrls (item 3): a data: URL containing a space is masked to the end of the value, not just to the space", () => {
+  const { scrubUrls } = load();
+  const s = scrubUrls("data:text/html,<p>my password is DATASPACE1</p>", 300);
+  assert.doesNotMatch(s, /DATASPACE1/);
+});
+
+// Fix round 3, item 2 (new Important): URL_TOKEN_RE's unbounded scheme part
+// backtracked quadratically once it started running over every page
+// attribute (I2's walker), not just short error texts — a 100 KB attribute
+// cost 4.1s. The reviewer's worst case: a long run alternating a word
+// character and a non-word character (each "a" is its own \b anchor point),
+// with no ":" anywhere to let the scheme part ever succeed.
+test("scrubUrls (item 2): a long, colon-less run does not backtrack quadratically", () => {
+  const { scrubUrls } = load();
+  const input = "a.".repeat(500_000); // ~1 MB, the reviewer's worst case
+  const start = Date.now();
+  scrubUrls(input, 300);
+  const elapsed = Date.now() - start;
+  assert.ok(elapsed < 200, `expected under 200ms, took ${elapsed}ms (quadratic regex backtracking regression?)`);
 });
 
 // --- redactEvents (I1/I2): the worker-side walker over rrweb event batches, run
@@ -411,6 +512,50 @@ test("I1: a textarea's raw value is masked the same way as an input's", () => {
   const events = [{ type: 2, data: { node: { type: 0, id: 1, childNodes: [{ type: 2, tagName: "textarea", attributes: { value: "SECRETNOTE" }, id: 5, childNodes: [] }] } }, timestamp: 1 }];
   redactEvents(events, new Map());
   assert.doesNotMatch(JSON.stringify(events), /SECRETNOTE/);
+});
+
+// Fix round 3, item 4 (pulled): an unmasked value (option/button) still kept
+// a URL's query. The controller's ruling keeps these values (page content),
+// but they still need the same URL scrub every other attribute gets.
+test("I1/item 4: an option's URL-bearing value is scrubbed of its query, even though it isn't masked", () => {
+  const { redactEvents } = load();
+  const events = [{
+    type: 2,
+    data: { node: { type: 0, id: 1, childNodes: [{ type: 2, tagName: "option", attributes: { value: "https://x.test/cb?token=OPTVAL1" }, id: 2, childNodes: [] }] } },
+  }];
+  redactEvents(events, new Map());
+  const value = events[0].data.node.childNodes[0].attributes.value;
+  assert.doesNotMatch(value, /OPTVAL1/);
+  assert.doesNotMatch(value, /^\*+$/, "an option's value is page content — scrubbed, not asterisk-masked");
+});
+
+test("I1/item 4: a button's URL-bearing value is scrubbed of its query", () => {
+  const { redactEvents } = load();
+  const events = [{
+    type: 2,
+    data: { node: { type: 0, id: 1, childNodes: [{ type: 2, tagName: "button", attributes: { value: "https://x.test/go?token=BTNVAL1" }, id: 2, childNodes: [] }] } },
+  }];
+  redactEvents(events, new Map());
+  assert.doesNotMatch(events[0].data.node.childNodes[0].attributes.value, /BTNVAL1/);
+});
+
+test("I1/item 4: an option value mutation on a known option id is scrubbed of its query", () => {
+  const { redactEvents } = load();
+  const knownTags = new Map([[11, "option"]]);
+  const events = [{ type: 3, data: { source: 0, texts: [], removes: [], adds: [], attributes: [{ id: 11, attributes: { value: "https://x.test/cb?token=OPTMUT1" } }] } }];
+  redactEvents(events, knownTags);
+  assert.doesNotMatch(events[0].data.attributes[0].attributes.value, /OPTMUT1/);
+});
+
+// Fix round 3, item 4 (pulled): rrweb sends a style change as a diff object
+// (property -> new value) when the diff is shorter than the whole style
+// string — a framework-style el.style.backgroundImage = "url(...)" takes this
+// path, and a signed image URL's query rode along unscrubbed.
+test("I1/item 4: a style attribute mutation's diff object has its string properties scrubbed", () => {
+  const { redactEvents } = load();
+  const events = [{ type: 3, data: { source: 0, texts: [], removes: [], adds: [], attributes: [{ id: 6, attributes: { style: { "background-image": 'url("https://x.test/i.png?token=STYMUT2")' } } }] } }];
+  redactEvents(events, new Map());
+  assert.doesNotMatch(JSON.stringify(events), /STYMUT2/);
 });
 
 test("I1: an option's value is left alone, since it is page content, not a typed secret", () => {
