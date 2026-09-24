@@ -7,7 +7,9 @@ test("un-maximizes before resizing and reports real sizes", async () => {
   let size = { width: 1400, height: 900 };
   const bg = await loadBackground({ overrides: { windows: {
     get: async (id) => ({ id, state, ...size }),
-    update: async (id, p) => { if (p.state) state = p.state; if (p.width) size = { width: p.width, height: p.height }; },
+    // A real maximized window ignores a width/height request; only apply it once
+    // un-maximized, so this test actually proves the ordering, not just the outcome.
+    update: async (id, p) => { if (p.state) state = p.state; if (p.width && state === "normal") size = { width: p.width, height: p.height }; },
   }, debugger: { sendCommand: async (t, m) => (m === "Runtime.evaluate" ? { result: { value: [size.width, size.height - 87] } } : {}) } } });
   const r = await bg.handlers.resize_window({ width: 900, height: 600, tabId: bg.tabId });
   assert.equal(state, "normal");
@@ -32,5 +34,14 @@ test("a hung viewport read doesn't stall the reply near the CDP timeout", { time
   const start = Date.now();
   const r = await bg.handlers.resize_window({ width: 900, height: 600, tabId: bg.tabId });
   assert.ok(Date.now() - start < 2500, `took ${Date.now() - start}ms`);
+  assert.equal(r.content[0].text, "Resized window to 900x600.");
+});
+
+test("omits the viewport clause when it can't be read", async () => {
+  const bg = await loadBackground({ overrides: { windows: {
+    get: async (id) => ({ id, state: "normal", width: 900, height: 600 }),
+    update: async () => {},
+  }, debugger: { sendCommand: async (t, m) => { if (m === "Runtime.evaluate") throw new Error("no execution context"); return {}; } } } });
+  const r = await bg.handlers.resize_window({ width: 900, height: 600, tabId: bg.tabId });
   assert.equal(r.content[0].text, "Resized window to 900x600.");
 });

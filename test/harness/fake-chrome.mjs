@@ -97,7 +97,7 @@ export async function loadBackground({ page = null, content = null, tab = {}, wi
       sendCommand: async (target, method, params) => {
         calls.push(["cdp", method, params]);
         if (page) return page.send(method, params);
-        if (method === "Runtime.evaluate") return { result: { value: "1200x800" } };
+        if (method === "Runtime.evaluate") return { result: { value: [1200, 713] } };
         if (method === "Page.captureScreenshot") return { data: "AAAA" };
         return {};
       },

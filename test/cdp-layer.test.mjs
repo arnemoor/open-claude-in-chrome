@@ -102,6 +102,9 @@ test("real Chrome: the viewport follows a window resize and screenshots stay 1x 
     const [w, h] = jpegSize(shot.content[1].data);
     const [iw, ih] = await page.evaluate("[innerWidth, innerHeight]");
     assert.deepEqual([w, h], [iw, ih]);
+    // Pins the real CDP result shape: readViewport needs returnByValue: true to get
+    // an actual array back instead of a remote object handle with no `.value`.
+    assert.ok(shot.content[0].text.includes(`${iw}x${ih}`), shot.content[0].text);
     const { windowId } = await browser.send("Browser.getWindowForTarget", { targetId: page.targetId });
     await browser.send("Browser.setWindowBounds", { windowId, bounds: { width: 900, height: 600, windowState: "normal" } });
     await new Promise((r) => setTimeout(r, 300));
