@@ -12,7 +12,7 @@ const FORM = `<form id=f><input id=i autofocus><button id=b type=button>b</butto
 </script>`;
 
 let browser;
-before(async () => { if (chromeAvailable) browser = await launchChrome(); });
+before(async () => { if (chromeAvailable) browser = await launchChrome(); }, { timeout: 20000 });
 after(() => browser?.close());
 
 async function setup() {
@@ -23,7 +23,7 @@ async function setup() {
   return { page, run };
 }
 
-test("type sends real key events and lands exactly", { skip: !chromeAvailable }, async () => {
+test("type sends real key events and lands exactly", { skip: !chromeAvailable, timeout: 20000 }, async () => {
   const { page, run } = await setup();
   await run({ action: "type", text: "hi!" });
   assert.equal(await page.evaluate("i.value"), "hi!");
@@ -31,14 +31,15 @@ test("type sends real key events and lands exactly", { skip: !chromeAvailable },
   assert.deepEqual(ev.filter((e) => e[0] === "keydown").map((e) => e.slice(1)), [["h", "KeyH", 72, false], ["i", "KeyI", 73, false], ["!", "Digit1", 49, true]]);
 });
 
-test("type handles umlauts, emoji and CJK, and \\n never submits", { skip: !chromeAvailable }, async () => {
+test("type handles umlauts, emoji and CJK, and \\n never submits", { skip: !chromeAvailable, timeout: 20000 }, async () => {
   const { page, run } = await setup();
-  await run({ action: "type", text: "Grüße 😀 日本\nx" });
+  const reply = await run({ action: "type", text: "Grüße 😀 日本\nx" });
   assert.equal(await page.evaluate("i.value"), "Grüße 😀 日本x");
   assert.equal(await page.evaluate("submits"), 0);
+  assert.match(reply.content[0].text, /line breaks were not typed: the focused field is single-line/);
 });
 
-test("key Enter submits, letters type, Backspace deletes", { skip: !chromeAvailable }, async () => {
+test("key Enter submits, letters type, Backspace deletes", { skip: !chromeAvailable, timeout: 20000 }, async () => {
   const { page, run } = await setup();
   await run({ action: "key", text: "a shift+b Backspace a" });
   assert.equal(await page.evaluate("i.value"), "aa");
@@ -46,7 +47,7 @@ test("key Enter submits, letters type, Backspace deletes", { skip: !chromeAvaila
   assert.equal(await page.evaluate("submits"), 1);
 });
 
-test("key space presses a focused button, Tab moves focus", { skip: !chromeAvailable }, async () => {
+test("key space presses a focused button, Tab moves focus", { skip: !chromeAvailable, timeout: 20000 }, async () => {
   const { page, run } = await setup();
   await run({ action: "key", text: "Tab" });
   assert.equal(await page.evaluate("document.activeElement.id"), "b");
@@ -54,10 +55,17 @@ test("key space presses a focused button, Tab moves focus", { skip: !chromeAvail
   assert.equal(await page.evaluate("clicks"), 1);
 });
 
-test("select-all shortcut selects and types nothing", { skip: !chromeAvailable }, async () => {
+test("select-all shortcut selects and types nothing", { skip: !chromeAvailable, timeout: 20000 }, async () => {
   const { page, run } = await setup();
   await run({ action: "type", text: "hello" });
   await run({ action: "key", text: process.platform === "darwin" ? "cmd+a" : "ctrl+a" });
+  assert.deepEqual(await page.evaluate("[i.value, i.selectionStart, i.selectionEnd]"), ["hello", 0, 5]);
+});
+
+test("cmd+A (uppercase) selects on macOS like cmd+a", { skip: !chromeAvailable || process.platform !== "darwin", timeout: 20000 }, async () => {
+  const { page, run } = await setup();
+  await run({ action: "type", text: "hello" });
+  await run({ action: "key", text: "cmd+A" });
   assert.deepEqual(await page.evaluate("[i.value, i.selectionStart, i.selectionEnd]"), ["hello", 0, 5]);
 });
 
@@ -66,4 +74,70 @@ test("unknown key names are reported, not sent", async () => {
   const r = await bg.handlers.computer({ action: "key", text: "Foo", tabId: bg.tabId });
   assert.equal(r.content[0].text, "Unknown key: Foo");
   assert.equal(bg.calls.filter((c) => c[1] === "Input.dispatchKeyEvent").length, 0);
+});
+
+test("Object.prototype names are reported as unknown keys, not sent", async () => {
+  const bg = await loadBackground();
+  for (const name of ["toString", "constructor", "__proto__", "valueOf"]) {
+    const r = await bg.handlers.computer({ action: "key", text: name, tabId: bg.tabId });
+    assert.equal(r.content[0].text, `Unknown key: ${name}`);
+  }
+  assert.equal(bg.calls.filter((c) => c[1] === "Input.dispatchKeyEvent").length, 0);
+});
+
+test("an unresolvable focus kind skips newlines and notes it could not be checked", async () => {
+  const bg = await loadBackground({ overrides: { debugger: { sendCommand: async (t, m) => (m === "Runtime.evaluate" ? { result: { value: null } } : {}) } } });
+  const r = await bg.handlers.computer({ action: "type", text: "a\nb", tabId: bg.tabId });
+  assert.match(r.content[0].text, /line breaks were not typed: could not be checked/);
+  assert.equal(bg.calls.filter((c) => c[1] === "Input.insertText" && c[2].text === "\n").length, 0);
+});
+
+// --- Multi-line fields: textarea and contenteditable, alongside a single-line input ---
+
+const MULTI_PAGE = `<form id=f><input id=inp><textarea id=ta></textarea><div id=ce contenteditable=true></div></form>
+<script>
+  window.submits = 0;
+  document.getElementById("f").addEventListener("submit", (e) => { e.preventDefault(); submits++; });
+</script>`;
+
+const FOCUS_MULTI = {
+  inp: "document.getElementById('inp').focus()",
+  ta: "document.getElementById('ta').focus()",
+  ce: "(() => { const ce = document.getElementById('ce'); ce.focus(); const r = document.createRange(); r.selectNodeContents(ce); r.collapse(false); const s = getSelection(); s.removeAllRanges(); s.addRange(r); })()",
+};
+
+async function setupMulti(target) {
+  const page = await openPage(browser, { html: MULTI_PAGE });
+  await page.evaluate(FOCUS_MULTI[target]);
+  const bg = await loadBackground({ page });
+  const run = (a) => bg.handlers.computer({ tabId: bg.tabId, ...a });
+  return { page, run };
+}
+
+test("type lands newlines exactly in a textarea, normalizing CRLF", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  const { page, run } = await setupMulti("ta");
+  await run({ action: "type", text: "l1\nl2\r\nl3" });
+  assert.equal(await page.evaluate("ta.value"), "l1\nl2\nl3");
+  assert.equal(await page.evaluate("submits"), 0);
+});
+
+test("type lands a tab character in a textarea", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  const { page, run } = await setupMulti("ta");
+  await run({ action: "type", text: "a\tb" });
+  assert.equal(await page.evaluate("ta.value"), "a\tb");
+});
+
+test("type lands newlines in a contenteditable", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  const { page, run } = await setupMulti("ce");
+  await run({ action: "type", text: "l1\nl2" });
+  const text = await page.evaluate("ce.innerText");
+  assert.equal(text, "l1\nl2");
+});
+
+test("type on a single-line input never submits and the reply notes dropped line breaks", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  const { page, run } = await setupMulti("inp");
+  const reply = await run({ action: "type", text: "l1\nl2" });
+  assert.equal(await page.evaluate("inp.value"), "l1l2");
+  assert.equal(await page.evaluate("submits"), 0);
+  assert.match(reply.content[0].text, /line breaks were not typed: the focused field is single-line/);
 });
