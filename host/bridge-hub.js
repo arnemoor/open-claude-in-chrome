@@ -362,7 +362,7 @@ export class BridgeHub {
       conn.pid = msg.pid;
       conn.cwd = msg.cwd;
       this._writeLine(conn.socket, { type: "welcome", protocol: PROTOCOL_VERSION, session: conn.session });
-      this.log("client_connected", { session: conn.session });
+      this.log("client_connected", { session: conn.session, pid: conn.pid, label: conn.label, clients: this.clientCount });
       return;
     }
 
@@ -423,7 +423,7 @@ export class BridgeHub {
     for (const [hubId, pending] of this._pending) {
       if (pending.conn === conn) this._pending.delete(hubId);
     }
-    this.log("client_disconnected", { session: conn.session });
+    this.log("client_disconnected", { session: conn.session, pid: conn.pid, label: conn.label, clients: this.clientCount });
   }
 
   _writeLine(socket, obj) {

@@ -6,8 +6,10 @@
 // messaging (4-byte little-endian length + JSON on stdin/stdout). Nothing but
 // native-messaging frames may ever be written to stdout.
 
+import fs from "node:fs";
 import { BridgeHub } from "./bridge-hub.js";
 import { bridgePath, BridgeSecurityError } from "./bridge-endpoint.js";
+import { createLogger } from "./log.js";
 
 function readNativeMessages(buffer) {
   const messages = [];
@@ -32,8 +34,15 @@ function writeNativeMessage(obj) {
   process.stdout.write(Buffer.concat([header, body]));
 }
 
-const log = (event, data = {}) => process.stderr.write(`[native-host] ${event} ${JSON.stringify(data)}\n`);
+const logger = createLogger("native-host");
+const log = (event, data = {}) => {
+  process.stderr.write(`[native-host] ${event} ${JSON.stringify(data)}\n`);
+  logger.info(event, data);
+};
 const hub = new BridgeHub({ sockPath: bridgePath(), sendToExtension: writeNativeMessage, log });
+
+const { version } = JSON.parse(fs.readFileSync(new URL("./package.json", import.meta.url), "utf-8"));
+log("start", { version, node: process.version });
 
 let stdinBuffer = Buffer.alloc(0);
 process.stdin.on("data", (chunk) => {
@@ -47,7 +56,8 @@ let exiting = false;
 async function exit(code, reason) {
   if (exiting) return;
   exiting = true;
-  log("exit", { reason, code });
+  process.stderr.write(`[native-host] exit ${JSON.stringify({ reason, code })}\n`);
+  logger.error("exit", { reason, code });
   await hub.stop(reason).catch(() => {});
   process.exit(code);
 }

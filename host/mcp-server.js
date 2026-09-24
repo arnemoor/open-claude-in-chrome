@@ -13,12 +13,20 @@ import { BridgeClient } from "./bridge-client.js";
 import { bridgePath } from "./bridge-endpoint.js";
 import { checkUploadPaths, loadUploadPolicy } from "./upload-policy.js";
 import { applySaveToDisk } from "./save-to-disk.js";
+import { createLogger } from "./log.js";
+
+const logger = createLogger("mcp-server");
+const log = (event, data = {}) => {
+  process.stderr.write(`[mcp-server] ${event} ${JSON.stringify(data)}\n`);
+  logger.info(event, data);
+};
+log("start", { cwd: process.cwd() });
 
 const bridge = new BridgeClient({
   sockPath: bridgePath(),
   hello: { pid: process.pid, ppid: process.ppid, cwd: process.cwd(), label: path.basename(process.cwd()) },
   graceMs: Number(process.env.OCIC_CONNECT_GRACE_MS) || 5000,
-  log: (event, data = {}) => process.stderr.write(`[mcp-server] ${event} ${JSON.stringify(data)}\n`),
+  log,
 });
 bridge.start();
 
@@ -26,22 +34,34 @@ function sendToExtension(tool, args) {
   return bridge.request(tool, args);
 }
 
-function shutdown() {
+function shutdown(reason) {
+  process.stderr.write(`[mcp-server] exit ${JSON.stringify({ reason })}\n`);
+  logger.error("exit", { reason });
   bridge.close();
   process.exit(0);
 }
 
-process.on("SIGTERM", shutdown);
-process.on("SIGINT", shutdown);
-process.on("SIGHUP", shutdown);
-process.stdin.on("end", shutdown);
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGHUP", () => shutdown("SIGHUP"));
+process.stdin.on("end", () => shutdown("stdin closed"));
 process.stdin.resume();
 
 // Exit if the parent dies without closing our stdin: we get re-parented.
 const initialPpid = process.ppid;
 setInterval(() => {
-  if (process.ppid !== initialPpid) shutdown();
+  if (process.ppid !== initialPpid) shutdown("parent exited");
 }, 5000).unref();
+
+// The MCP SDK runs tool handlers inside its own request loop; a bug there
+// would otherwise crash us with no record of why. Log it and exit non-zero
+// rather than let Node print to a stderr nobody is watching.
+process.on("uncaughtException", (err) => {
+  const reason = `uncaught: ${err.stack || err.message}`;
+  process.stderr.write(`[mcp-server] exit ${JSON.stringify({ reason })}\n`);
+  logger.error("exit", { reason });
+  process.exit(1);
+});
 
 // --- Helper to wrap tool results for MCP ---
 
