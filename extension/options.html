@@ -2,6 +2,13 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<!-- Fix round 1 / I1: a replayed session can reference remote resource URLs
+     (images, stylesheets, @import, backgrounds) recorded from the page it
+     touched. Without this, opening or seeking a replay fetches them from the
+     extension page, which breaks "nothing is sent anywhere". This must come
+     before any resource-loading element below, and the replay iframe inherits
+     it. 'unsafe-inline' styles are required by the vendored player. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; media-src 'self' data: blob:; connect-src 'self' blob:">
 <title>Open Claude in Chrome — Options</title>
 <link rel="stylesheet" href="options.css">
 <link rel="stylesheet" href="vendor/rrweb-player.min.css">
@@ -35,6 +42,7 @@
     <tbody id="sessions-body"></tbody>
   </table>
   <p id="sessions-empty" hidden>No recorded sessions.</p>
+  <p id="sessions-notice" hidden></p>
 </section>
 
 <section id="session-detail" aria-labelledby="session-detail-heading" hidden>
@@ -55,6 +63,7 @@
     <label for="tab-select">Tab</label>
     <select id="tab-select"></select>
   </div>
+  <p id="player-notice" hidden></p>
   <div id="player-container"></div>
 </section>
 

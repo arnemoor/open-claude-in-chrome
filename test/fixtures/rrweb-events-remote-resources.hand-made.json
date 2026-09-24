@@ -1,0 +1,80 @@
+[
+  {
+    "type": 4,
+    "timestamp": 1000,
+    "data": { "href": "https://example.test/fixture", "width": 400, "height": 300 }
+  },
+  {
+    "type": 2,
+    "timestamp": 1000,
+    "data": {
+      "initialOffset": { "left": 0, "top": 0 },
+      "node": {
+        "type": 0,
+        "id": 1,
+        "childNodes": [
+          { "type": 1, "id": 2, "name": "html", "publicId": "", "systemId": "" },
+          {
+            "type": 2,
+            "id": 3,
+            "tagName": "html",
+            "attributes": {},
+            "childNodes": [
+              {
+                "type": 2,
+                "id": 4,
+                "tagName": "head",
+                "attributes": {},
+                "childNodes": [
+                  {
+                    "type": 2,
+                    "id": 8,
+                    "tagName": "link",
+                    "attributes": { "rel": "stylesheet", "href": "__REMOTE__/style.css" },
+                    "childNodes": []
+                  },
+                  {
+                    "type": 2,
+                    "id": 9,
+                    "tagName": "style",
+                    "attributes": {},
+                    "childNodes": [
+                      { "type": 3, "id": 10, "textContent": "@import url(\"__REMOTE__/import.css\");" }
+                    ]
+                  }
+                ]
+              },
+              {
+                "type": 2,
+                "id": 5,
+                "tagName": "body",
+                "attributes": {},
+                "childNodes": [
+                  {
+                    "type": 2,
+                    "id": 6,
+                    "tagName": "img",
+                    "attributes": { "src": "__REMOTE__/img.png" },
+                    "childNodes": []
+                  },
+                  {
+                    "type": 2,
+                    "id": 7,
+                    "tagName": "div",
+                    "attributes": { "style": "background: url(__REMOTE__/bg.png)" },
+                    "childNodes": []
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": 3,
+    "timestamp": 2000,
+    "data": { "source": 3, "id": 5, "x": 0, "y": 10 }
+  }
+]
