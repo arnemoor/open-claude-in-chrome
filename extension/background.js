@@ -583,6 +583,46 @@ function pointerReply(verb, coordinate, hit, scrolled, notes) {
   return text;
 }
 
+// Normalizes a navigate URL, keeping explicit schemes intact instead of forcing everything
+// through the http(s) rewrite. Returns { url } on success or { error } to report to the agent.
+const NAVIGATE_SCHEME_RE = /^([a-z][a-z0-9+.-]*):/i;
+const BROKEN_PROTOCOL_RE = /^[a-z]{1,5}:\/+/i;
+const KEEP_AS_IS_SCHEMES = new Set([
+  "http", "https", "file", "data", "about", "chrome", "brave", "edge",
+  "view-source", "blob", "ftp", "chrome-extension",
+]);
+function normalizeNavigateUrl(input, ownExtensionId) {
+  let url = input.trim();
+  const schemeMatch = url.match(NAVIGATE_SCHEME_RE);
+  if (schemeMatch) {
+    const scheme = schemeMatch[1].toLowerCase();
+    if (scheme === "javascript") {
+      return { error: "javascript: URLs are not allowed. Use javascript_tool to run code." };
+    }
+    if (!KEEP_AS_IS_SCHEMES.has(scheme)) {
+      // Not a recognized scheme: either a broken protocol prefix (e.g. "hps://") to strip,
+      // or a bare "host:port" to treat as the start of a URL.
+      if (BROKEN_PROTOCOL_RE.test(url)) url = url.replace(BROKEN_PROTOCOL_RE, "");
+      url = "https://" + url;
+    }
+  } else {
+    url = "https://" + url;
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return { error: `Invalid URL: "${input}". Could not parse as a valid URL.` };
+  }
+
+  if (parsed.protocol === "chrome-extension:" && parsed.hostname === ownExtensionId) {
+    return { error: "This extension's own pages cannot be opened by the agent." };
+  }
+
+  return { url };
+}
+
 // --- Tool handlers ---
 const toolHandlers = {
   async tabs_context_mcp(args) {
@@ -621,24 +661,27 @@ const toolHandlers = {
     const { url, tabId } = args;
     if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
 
+    const FILE_URL_HINT = ` To open local files, enable "Allow access to file URLs" for Open Claude in Chrome in chrome://extensions.`;
+    let targetUrl = null;
     if (url === "back") {
       await chrome.tabs.goBack(tabId);
     } else if (url === "forward") {
       await chrome.tabs.goForward(tabId);
     } else {
-      let targetUrl = url;
-      // Strip any malformed protocol prefix before normalizing
-      if (!targetUrl.match(/^https?:\/\//i) && !targetUrl.startsWith("about:") && !targetUrl.startsWith("chrome:") && !targetUrl.startsWith("brave:")) {
-        // Remove any partial/broken protocol prefix (e.g., "hps://", "http:/", "ht://")
-        targetUrl = targetUrl.replace(/^[a-z]{1,5}:\/+/i, "");
-        targetUrl = "https://" + targetUrl;
+      const normalized = normalizeNavigateUrl(url, chrome.runtime.id);
+      if (normalized.error) {
+        return { content: [{ type: "text", text: normalized.error }] };
       }
+      targetUrl = normalized.url;
       try {
-        new URL(targetUrl); // Validate URL before passing to Chrome
-      } catch {
-        return { content: [{ type: "text", text: `Invalid URL: "${url}". Could not parse as a valid URL.` }] };
+        await chrome.tabs.update(tabId, { url: targetUrl });
+      } catch (err) {
+        let message = err.message;
+        if (!message.endsWith(".")) message += ".";
+        let text = `Could not navigate to ${targetUrl}: ${message}`;
+        if (targetUrl.startsWith("file:")) text += FILE_URL_HINT;
+        return { content: [{ type: "text", text }] };
       }
-      await chrome.tabs.update(tabId, { url: targetUrl });
     }
 
     // Wait for page load — short timeout to avoid service worker idle kill
@@ -661,8 +704,9 @@ const toolHandlers = {
     const tab = await chrome.tabs.get(tabId);
     const tabs = await chrome.tabs.query({ groupId: tabGroupId });
     const loading = tab.status !== "complete" ? " (still loading)" : "";
-    const text = `Navigated to ${tab.url}${loading}.\n## Pages\n` +
+    let text = `Navigated to ${tab.url}${loading}.\n## Pages\n` +
       tabs.map((t, i) => `${i + 1}: ${t.url}${t.id === tabId ? " [selected]" : ""}`).join("\n");
+    if (targetUrl && targetUrl.startsWith("file:") && !tab.url.startsWith("file:")) text += FILE_URL_HINT;
 
     return { content: [{ type: "text", text }] };
   },
