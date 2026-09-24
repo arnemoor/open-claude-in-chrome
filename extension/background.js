@@ -33,6 +33,10 @@ function connectNativeHost() {
 
     nativePort.onMessage.addListener((msg) => {
       if (msg.type === "tool_request" && msg.id) {
+        if (!firstDelivery(msg.id)) {
+          console.warn("Ignoring duplicate tool_request", msg.id);
+          return;
+        }
         handleToolRequest(msg.id, msg.tool, msg.args || {});
       }
     });
@@ -65,6 +69,26 @@ function sendError(id, error) {
   } catch {
     // Port disconnected
   }
+}
+
+// --- Duplicate request dedupe ---
+// Keeps the ids of the last 500 delivered tool_requests for 10 minutes, so a
+// request re-delivered (e.g. after a reconnect) is ignored instead of running twice.
+const DEDUPE_TTL_MS = 10 * 60 * 1000;
+const DEDUPE_MAX_IDS = 500;
+const deliveredIds = new Map(); // id -> first-seen timestamp, in insertion order
+
+function firstDelivery(id) {
+  const now = Date.now();
+  for (const [seenId, seenAt] of deliveredIds) {
+    if (now - seenAt > DEDUPE_TTL_MS) deliveredIds.delete(seenId);
+  }
+  if (deliveredIds.has(id)) return false;
+  deliveredIds.set(id, now);
+  while (deliveredIds.size > DEDUPE_MAX_IDS) {
+    deliveredIds.delete(deliveredIds.keys().next().value);
+  }
+  return true;
 }
 
 // --- Tab group management ---
@@ -598,7 +622,9 @@ const toolHandlers = {
 
   async tabs_create_mcp(args) {
     await ensureTabGroup(true);
-    const tab = await chrome.tabs.create({ active: true });
+    const groupTabs = await chrome.tabs.query({ groupId: tabGroupId });
+    const createArgs = groupTabs[0] ? { windowId: groupTabs[0].windowId, active: true } : { active: true };
+    const tab = await chrome.tabs.create(createArgs);
     await chrome.tabs.group({ tabIds: [tab.id], groupId: tabGroupId });
     tabGroupTabs.add(tab.id);
     const tabs = await chrome.tabs.query({ groupId: tabGroupId });
