@@ -28,8 +28,9 @@ test("find and read_page survive every clobbering control name", { skip: !chrome
 // content.js only ever runs in an isolated world (see manifest content_scripts / the executeScript
 // call in background.js), where Chrome does not expose document-level named properties: a same-page
 // <form name="title">/<img name="body"> cannot override document.title/document.body there, so these
-// two tests already pass pre-fix. They still pin the dom.docTitle()/dom.docBody() routing as defense
-// in depth, not as a regression test against today's runtime.
+// two tests already pass pre-fix and would keep passing even if the dom.docTitle()/dom.docBody()
+// routing were removed. They document a defense that would only matter in the main world, not a
+// regression test against today's runtime.
 test("get_page_text reads the real title when a form is named title", { skip: !chromeAvailable, timeout: 20000 }, async () => {
   const page = await openPage(browser, { html: `<title>Real</title><form name="title"></form><p>body text</p>` });
   const cs = await injectContentScript(page, CONTENT);
@@ -79,6 +80,18 @@ test("read_page and find survive inline MathML", { skip: !chromeAvailable, timeo
   const page = await openPage(browser, { html: `<button>Go</button><math><mi>x</mi></math>` });
   const cs = await injectContentScript(page, CONTENT);
   const tree = await cs.invoke({ type: "generateAccessibilityTree", options: {} });
+  assert.match(tree.result, /button "Go"/);
+  const found = await cs.invoke({ type: "findElements", query: "go" });
+  assert.ok(found.result.some((r) => r.name === "Go"));
+});
+
+// A <select> inside <svg> parses as a "select" in the SVG namespace, not HTMLSelectElement, so
+// tag-name equality alone can't be trusted to mean el.options exists.
+test("read_page and find survive a <select> inside <svg> (foreign-namespace select)", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  const page = await openPage(browser, { html: `<svg><select><option>a</option></select></svg><button>Go</button>` });
+  const cs = await injectContentScript(page, CONTENT);
+  const tree = await cs.invoke({ type: "generateAccessibilityTree", options: {} });
+  assert.equal(typeof tree.result, "string");
   assert.match(tree.result, /button "Go"/);
   const found = await cs.invoke({ type: "findElements", query: "go" });
   assert.ok(found.result.some((r) => r.name === "Go"));

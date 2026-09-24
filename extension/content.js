@@ -31,7 +31,7 @@
   const docByIdFn = Document.prototype.getElementById;
   const docElementFromPointFn = Document.prototype.elementFromPoint;
   // Not part of the public dom object (not in E4b's interface): captured the same way, called
-  // directly at their one call site each (isVisible, getPageText).
+  // directly at their one call site each (both in getPageText).
   const cloneNodeFn = Node.prototype.cloneNode;
   const querySelectorAllFn = Element.prototype.querySelectorAll;
 
