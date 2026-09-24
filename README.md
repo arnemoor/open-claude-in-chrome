@@ -66,15 +66,15 @@ Open Claude in Chrome has **none of these restrictions**.
 ## Architecture
 
 ```
-Claude Code <--stdio MCP--> mcp-server.js <--TCP--> native-host.js <--native messaging--> Extension <--> Browser
+Claude Code <--stdio MCP--> mcp-server.js <--Unix socket--> native-host.js <--native messaging--> Extension <--> Browser
 ```
 
 Three components:
 1. **Extension** — Manifest V3 with CDP-based browser automation (all 22 tools)
 2. **MCP Server** — Node.js process started by Claude Code, exposes tools via MCP
-3. **Native Messaging Host** — Bridge between the MCP server and the extension
+3. **Native Messaging Host** — owns the bridge and relays between MCP servers and the extension
 
-The MCP server and native host authenticate to each other over the loopback TCP channel with a shared secret at `~/.config/open-claude-in-chrome/token` (created automatically on first run, mode `0600`). This stops any other local process, or another user on a shared machine, from driving your browser through the port.
+The native host is spawned by the browser and owns the bridge: it listens on a Unix domain socket at `~/.config/open-claude-in-chrome/run/bridge.sock`, inside a directory it creates with mode `0700`. Every MCP server — any number of them, across any number of Claude Code sessions — connects to that socket as a client. Ownership of the directory (yours, not a symlink, not open to other users) replaces the old shared token: any local process able to open the socket is already running as you.
 
 ## Installation
 
@@ -173,11 +173,10 @@ No build step. All files are plain JavaScript. After pulling or editing code:
 | What changed | What to do |
 |---|---|
 | `extension/background.js` or `extension/content.js` or `extension/manifest.json` | Reload the extension: `brave://extensions` > click the reload icon |
-| `host/mcp-server.js` | Kill stale servers and reconnect: `pkill -f "node.*mcp-server"` then `/mcp` in Claude Code |
-| `host/native-host.js` | Restart the browser (close all windows, reopen) |
+| `host/*.js` (`native-host.js`, `mcp-server.js`, `bridge-hub.js`, `bridge-client.js`, `bridge-endpoint.js`) | Restart the browser (new native host), then `pkill -f "node.*open-claude-in-chrome/host/mcp-server"` and `/mcp` in each Claude Code session |
 | `install.sh` or native host name changed | Re-run `./install.sh <extension-id>`, restart browser, re-add MCP |
 
-> The MCP server and native host share an auth token, so after changing either `host/native-host.js` or `host/mcp-server.js` refresh **both** sides (restart the browser **and** `pkill` + `/mcp`). A new server talking to an old native host will refuse the connection. Reloading the extension also picks up any new manifest permission (for example `downloads`, used by `save_to_disk`).
+> Old and new versions of the bridge cannot talk to each other, so after changing anything under `host/`, refresh **both** sides: restart the browser (spawns a fresh native host) **and** `pkill` + `/mcp` in every session (spawns fresh MCP servers). Reloading the extension also picks up any new manifest permission (for example `downloads`, used by `save_to_disk`).
 
 ### Quick reset (nuclear option)
 
@@ -185,7 +184,7 @@ If things are broken and you're not sure why:
 
 ```bash
 # 1. Kill all MCP servers
-pkill -f "node.*mcp-server"
+pkill -f "node.*open-claude-in-chrome/host/mcp-server"
 
 # 2. Re-run install
 ./install.sh <your-extension-id>
@@ -200,7 +199,7 @@ pkill -f "node.*mcp-server"
 
 ## Multiple Sessions
 
-Multiple Claude Code sessions can share the same browser extension. The first session becomes the "primary" (owns the TCP port), and later sessions connect as clients through it. All can use the browser simultaneously. If the primary session ends, a surviving session promotes itself to primary automatically, so the others keep working without a manual restart.
+Any number of Claude Code sessions can share the same browser. Each session's MCP server connects to the native host's bridge as an equal client, none of them owns the link, so one session ending never disconnects the others, and there is no "primary" to promote or lose.
 
 ## Troubleshooting
 
@@ -230,24 +229,9 @@ The MCP server is running but no native host is attached. Check, in order:
 4. Check service worker logs: `chrome://extensions` > "Inspect views: service worker".
 5. Verify `host/native-host-wrapper.sh` exists and its `node` path is valid.
 
-### Tools fail immediately after reconnect
+### Socket permission error
 
-Stale MCP server processes from previous sessions may be holding the port. Fix:
-
-```bash
-pkill -f "node.*mcp-server"
-```
-
-Then `/mcp` in Claude Code to reconnect. The fresh server will bind the port and accept the native host connection.
-
-### Port conflict
-
-Default port is 18765. To change:
-1. Create `~/.config/open-claude-in-chrome/config.json`:
-   ```json
-   { "port": 19000 }
-   ```
-2. Restart browser and Claude Code
+The native host refuses to serve the bridge, and logs the reason, when the directory `~/.config/open-claude-in-chrome/run` is a symlink, not owned by you, or open to other users (anything but mode `0700`). Remove or fix the directory so the native host can recreate it correctly, then restart the browser.
 
 ## License
 

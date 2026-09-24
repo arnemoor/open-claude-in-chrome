@@ -1,414 +1,76 @@
 #!/usr/bin/env node
 
-// MCP Server for Open Claude in Chrome extension.
-// Started by Claude Code via stdio MCP transport.
-//
-// Operates in one of two modes:
-// - PRIMARY: Owns the TCP port, accepts native host + client connections
-// - CLIENT: Port already taken by another session, connects as a client
-//
-// This allows multiple Claude Code sessions to share one browser extension.
+// MCP server for Open Claude in Chrome, started once per session over stdio.
+// Every server is a client of the bridge hub that the browser's native host owns
+// (see bridge-hub.js). No session owns the browser link, so a session that exits
+// never cuts off the others.
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import net from "node:net";
-import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
-import crypto from "node:crypto";
 import { z } from "zod";
-import { getAuthToken } from "./auth-token.js";
+import { BridgeClient } from "./bridge-client.js";
+import { bridgePath } from "./bridge-endpoint.js";
+import { checkUploadPaths, loadUploadPolicy } from "./upload-policy.js";
+import { applySaveToDisk } from "./save-to-disk.js";
+import { createLogger } from "./log.js";
 
+const logger = createLogger("mcp-server");
+const log = (event, data = {}) => {
+  process.stderr.write(`[mcp-server] ${event} ${JSON.stringify(data)}\n`);
+  logger.info(event, data);
+};
 
-const DEFAULT_PORT = 18765;
-
-function getPort() {
-  const configPath = path.join(os.homedir(), ".config", "open-claude-in-chrome", "config.json");
-  try {
-    const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-    return config.port || DEFAULT_PORT;
-  } catch {
-    return DEFAULT_PORT;
-  }
-}
-
-const TCP_PORT = getPort();
-const AUTH_TOKEN = getAuthToken();
-
-// Constant-time check that a peer presented the shared secret.
-function validAuth(token) {
-  if (typeof token !== "string" || token.length !== AUTH_TOKEN.length) return false;
-  return crypto.timingSafeEqual(Buffer.from(token), Buffer.from(AUTH_TOKEN));
-}
-
-// --- Mode detection ---
-// Try to bind the port. If it's taken, switch to client mode.
-let mode = "primary"; // or "client"
-
-// --- Shared state ---
-let nativeHostSocket = null;
-const pendingRequests = new Map(); // id -> { resolve, reject, timer, tool, args, resent }
-let requestIdCounter = 0;
-
-// Primary mode: track client MCP server connections
-const clientSockets = new Map(); // clientId -> socket
-let clientIdCounter = 0;
-// Map from prefixed request ID -> { clientId, originalId }
-const clientRequestMap = new Map();
-
-// Client mode: TCP connection to the primary
-let primarySocket = null;
-let clientBuffer = Buffer.alloc(0);
-
-// --- sendToExtension: works in both modes ---
+const bridge = new BridgeClient({
+  sockPath: bridgePath(),
+  hello: { pid: process.pid, ppid: process.ppid, cwd: process.cwd(), label: path.basename(process.cwd()) },
+  graceMs: Number(process.env.OCIC_CONNECT_GRACE_MS) || 5000,
+  log,
+});
 
 function sendToExtension(tool, args) {
-  return new Promise((resolve, reject) => {
-    const id = String(++requestIdCounter);
-    const timer = setTimeout(() => {
-      pendingRequests.delete(id);
-      reject(new Error("Tool request timed out after 60s"));
-    }, 60000);
-    pendingRequests.set(id, { resolve, reject, timer, tool, args, resent: false });
-
-    if (mode === "primary") {
-      if (!nativeHostSocket || nativeHostSocket.destroyed) {
-        clearTimeout(timer);
-        pendingRequests.delete(id);
-        reject(new Error("Browser extension is not connected. Make sure a supported Chromium browser is running with the Open Claude in Chrome extension installed and enabled."));
-        return;
-      }
-      const msg = JSON.stringify({ id, type: "tool_request", tool, args }) + "\n";
-      nativeHostSocket.write(msg);
-    } else {
-      // Client mode: send to primary server
-      if (!primarySocket || primarySocket.destroyed) {
-        clearTimeout(timer);
-        pendingRequests.delete(id);
-        reject(new Error("Lost connection to primary MCP server."));
-        return;
-      }
-      const msg = JSON.stringify({ id, type: "tool_request", tool, args }) + "\n";
-      primarySocket.write(msg);
-    }
-  });
+  return bridge.request(tool, args);
 }
 
-function shutdown() {
-  if (nativeHostSocket && !nativeHostSocket.destroyed) nativeHostSocket.destroy();
-  if (primarySocket && !primarySocket.destroyed) primarySocket.destroy();
-  for (const [, sock] of clientSockets) {
-    if (!sock.destroyed) sock.destroy();
-  }
-  for (const [, { reject, timer }] of pendingRequests) {
-    clearTimeout(timer);
-    reject(new Error("Server shutting down"));
-  }
-  pendingRequests.clear();
-  if (mode === "primary") tcpServer.close();
+function shutdown(reason) {
+  process.stderr.write(`[mcp-server] exit ${JSON.stringify({ reason })}\n`);
+  logger.error("exit", { reason });
+  bridge.close();
   process.exit(0);
 }
 
-process.on("SIGTERM", shutdown);
-process.on("SIGINT", shutdown);
-process.on("SIGHUP", shutdown);
-process.stdin.on("end", shutdown);
+// Registered before the "start" log line below (and before bridge.start()):
+// until a signal has a registered handler, the OS default disposition
+// applies and can terminate the process immediately — even mid synchronous
+// execution, since signal delivery is not blocked by JS being single
+// threaded — with no exit line at all. Nothing here awaits, so by the time
+// any of these can actually fire (which requires yielding back to the event
+// loop), the whole synchronous setup below has already finished running.
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGHUP", () => shutdown("SIGHUP"));
+process.stdin.on("end", () => shutdown("stdin closed"));
 process.stdin.resume();
-
-// --- Primary mode: handle incoming TCP connections ---
-
-function handleResponse(msg) {
-  // Check if this response is for a client request (prefixed ID)
-  if (msg.id && clientRequestMap.has(msg.id)) {
-    const { clientId, originalId } = clientRequestMap.get(msg.id);
-    clientRequestMap.delete(msg.id);
-    const clientSocket = clientSockets.get(clientId);
-    if (clientSocket && !clientSocket.destroyed) {
-      const fwd = JSON.stringify({ ...msg, id: originalId }) + "\n";
-      clientSocket.write(fwd);
-    }
-    return;
-  }
-
-  // Otherwise it's for a local request
-  if (msg.id && pendingRequests.has(msg.id)) {
-    const { resolve, reject, timer } = pendingRequests.get(msg.id);
-    clearTimeout(timer);
-    pendingRequests.delete(msg.id);
-    if (msg.type === "tool_error") {
-      reject(new Error(msg.error || "Tool execution failed"));
-    } else {
-      resolve(msg.result);
-    }
-  }
-}
-
-function processLine(line) {
-  if (!line) return;
-  try {
-    const msg = JSON.parse(line);
-    handleResponse(msg);
-  } catch {}
-}
-
-const tcpServer = net.createServer((socket) => {
-  // Every legitimate peer authenticates with a hello line the moment it
-  // connects: the native host sends {type:"native_hello",token}, a client MCP
-  // server sends {type:"client_hello",token}. Anything that presents a bad
-  // token, an unknown hello, or stays silent past the timeout is dropped — so a
-  // random local process (or another local user) can't hijack the port or the
-  // native host slot. This also replaces the old timing-based classification.
-  let classified = false;
-  let earlyBuffer = Buffer.alloc(0);
-
-  const helloTimeout = setTimeout(() => {
-    if (!classified) {
-      classified = true;
-      socket.destroy();
-    }
-  }, 2000);
-
-  socket.on("data", function onEarlyData(chunk) {
-    if (classified) return; // Already classified, data handler was replaced
-    earlyBuffer = Buffer.concat([earlyBuffer, chunk]);
-    const newlineIdx = earlyBuffer.indexOf(10);
-    if (newlineIdx === -1) {
-      if (earlyBuffer.length > 8192) { // no hello line in a sane amount of data
-        classified = true;
-        clearTimeout(helloTimeout);
-        socket.destroy();
-      }
-      return; // No full line yet, keep buffering
-    }
-
-    classified = true;
-    clearTimeout(helloTimeout);
-    socket.removeListener("data", onEarlyData);
-
-    const firstLine = earlyBuffer.subarray(0, newlineIdx).toString("utf-8").trim();
-    const rest = earlyBuffer.subarray(newlineIdx + 1);
-    let msg = null;
-    try { msg = JSON.parse(firstLine); } catch {}
-
-    if (!msg || !validAuth(msg.token)) {
-      socket.end(JSON.stringify({ type: "error", error: "Authentication failed." }) + "\n");
-      return;
-    }
-    if (msg.type === "client_hello") {
-      setupClientConnection(socket, rest);
-    } else if (msg.type === "native_hello") {
-      setupNativeHostConnection(socket, rest);
-    } else {
-      socket.end(JSON.stringify({ type: "error", error: "Unknown hello type." }) + "\n");
-    }
-  });
+// The MCP SDK runs tool handlers inside its own request loop; a bug there
+// would otherwise crash us with no record of why. Log it and exit non-zero
+// rather than let Node print to a stderr nobody is watching.
+// `throw undefined` / `throw null` is legal JS; err.stack would then throw
+// inside this handler itself, so Node's crash exits with no exit line at all.
+process.on("uncaughtException", (err) => {
+  const reason = `uncaught: ${String(err?.stack ?? err)}`;
+  process.stderr.write(`[mcp-server] exit ${JSON.stringify({ reason })}\n`);
+  logger.error("exit", { reason });
+  process.exit(1);
 });
 
-function setupNativeHostConnection(socket, initialBuffer) {
-  if (nativeHostSocket && !nativeHostSocket.destroyed) {
-    // Already have a native host. Reject.
-    socket.end(JSON.stringify({ type: "error", error: "Another browser profile is already connected." }) + "\n");
-    socket.destroy();
-    return;
-  }
+log("start", { cwd: process.cwd() });
+bridge.start();
 
-  nativeHostSocket = socket;
-  let buffer = initialBuffer;
-
-  // Process any data already in the buffer
-  let idx;
-  while ((idx = buffer.indexOf(10)) !== -1) {
-    processLine(buffer.subarray(0, idx).toString("utf-8").trim());
-    buffer = buffer.subarray(idx + 1);
-  }
-
-  socket.on("data", (chunk) => {
-    buffer = Buffer.concat([buffer, chunk]);
-    let newlineIdx;
-    while ((newlineIdx = buffer.indexOf(10)) !== -1) {
-      processLine(buffer.subarray(0, newlineIdx).toString("utf-8").trim());
-      buffer = buffer.subarray(newlineIdx + 1);
-    }
-  });
-
-  socket.on("error", () => { nativeHostSocket = null; });
-
-  socket.on("close", () => {
-    if (nativeHostSocket === socket) nativeHostSocket = null;
-    if (pendingRequests.size > 0) {
-      setTimeout(() => {
-        if (nativeHostSocket && !nativeHostSocket.destroyed) {
-          for (const [id, entry] of pendingRequests) {
-            if (entry.resent) continue;
-            entry.resent = true;
-            nativeHostSocket.write(JSON.stringify({ id, type: "tool_request", tool: entry.tool, args: entry.args }) + "\n");
-          }
-        } else {
-          for (const [, { reject, timer }] of pendingRequests) {
-            clearTimeout(timer);
-            reject(new Error("Native host disconnected"));
-          }
-          pendingRequests.clear();
-        }
-      }, 5000);
-    }
-  });
-}
-
-function setupClientConnection(socket, initialBuffer) {
-  const clientId = String(++clientIdCounter);
-  clientSockets.set(clientId, socket);
-  process.stderr.write(`Client MCP server connected (client ${clientId})\n`);
-
-  // Send ack
-  socket.write(JSON.stringify({ type: "client_ack", clientId }) + "\n");
-
-  let buffer = initialBuffer;
-
-  function processClientData() {
-    let idx;
-    while ((idx = buffer.indexOf(10)) !== -1) {
-      const line = buffer.subarray(0, idx).toString("utf-8").trim();
-      buffer = buffer.subarray(idx + 1);
-      if (!line) continue;
-      try {
-        const msg = JSON.parse(line);
-        if (msg.type === "tool_request" && msg.id) {
-          // Forward to native host with a prefixed ID
-          const prefixedId = `c${clientId}_${msg.id}`;
-          clientRequestMap.set(prefixedId, { clientId, originalId: msg.id });
-
-          if (!nativeHostSocket || nativeHostSocket.destroyed) {
-            // Send error back to client
-            socket.write(JSON.stringify({ id: msg.id, type: "tool_error", error: "Browser extension is not connected." }) + "\n");
-            clientRequestMap.delete(prefixedId);
-          } else {
-            nativeHostSocket.write(JSON.stringify({ ...msg, id: prefixedId }) + "\n");
-          }
-        }
-      } catch {}
-    }
-  }
-
-  // Process initial buffer
-  processClientData();
-
-  socket.on("data", (chunk) => {
-    buffer = Buffer.concat([buffer, chunk]);
-    processClientData();
-  });
-
-  socket.on("error", () => {});
-  socket.on("close", () => {
-    clientSockets.delete(clientId);
-    // Clean up any pending client requests
-    for (const [prefixedId, info] of clientRequestMap) {
-      if (info.clientId === clientId) clientRequestMap.delete(prefixedId);
-    }
-    process.stderr.write(`Client MCP server disconnected (client ${clientId})\n`);
-  });
-}
-
-// --- Role acquisition: own the port (primary) or connect to it (client) ---
-// Run at startup AND whenever the primary we were using dies. Re-running this on
-// primary loss is what lets a surviving client promote itself to primary instead
-// of being stranded forever waiting for a primary that will never come back.
-
-function runAsPrimary() {
-  mode = "primary";
-  process.stderr.write(`Primary MCP server listening on :${TCP_PORT}\n`);
-}
-
-// Try to bind the port. Resolves "ok" if we became the listener, "in-use" if
-// another live session already holds it, or "error" for anything else.
-function attemptListen() {
-  return new Promise((resolve) => {
-    const onError = (err) => {
-      tcpServer.removeListener("listening", onListening);
-      if (err.code === "EADDRINUSE") resolve("in-use");
-      else {
-        process.stderr.write(`TCP server error: ${err.message}\n`);
-        resolve("error");
-      }
-    };
-    const onListening = () => {
-      tcpServer.removeListener("error", onError);
-      resolve("ok");
-    };
-    tcpServer.once("error", onError);
-    tcpServer.once("listening", onListening);
-    tcpServer.listen(TCP_PORT, "127.0.0.1");
-  });
-}
-
-async function acquireRole() {
-  const outcome = await attemptListen();
-  if (outcome === "ok") runAsPrimary();
-  else if (outcome === "in-use") connectToPrimary();
-  else setTimeout(acquireRole, 1000); // transient bind error — retry
-}
-
-function connectToPrimary() {
-  mode = "client";
-  clientBuffer = Buffer.alloc(0); // fresh connection — drop any stale partial line
-  process.stderr.write(`Port ${TCP_PORT} in use. Connecting as client to primary MCP server...\n`);
-
-  primarySocket = net.createConnection(TCP_PORT, "127.0.0.1", () => {
-    process.stderr.write(`Connected to primary MCP server on :${TCP_PORT}\n`);
-    // Authenticated handshake — the primary drops us without a valid token.
-    primarySocket.write(JSON.stringify({ type: "client_hello", token: AUTH_TOKEN }) + "\n");
-  });
-
-  primarySocket.on("data", (chunk) => {
-    clientBuffer = Buffer.concat([clientBuffer, chunk]);
-    let idx;
-    while ((idx = clientBuffer.indexOf(10)) !== -1) {
-      const line = clientBuffer.subarray(0, idx).toString("utf-8").trim();
-      clientBuffer = clientBuffer.subarray(idx + 1);
-      if (!line) continue;
-      try {
-        const msg = JSON.parse(line);
-        if (msg.type === "client_ack") continue;
-        if (msg.type === "error") {
-          process.stderr.write(`Primary server error: ${msg.error}\n`);
-          continue;
-        }
-        // Tool response routed back from primary
-        if (msg.id && pendingRequests.has(msg.id)) {
-          const { resolve, reject, timer } = pendingRequests.get(msg.id);
-          clearTimeout(timer);
-          pendingRequests.delete(msg.id);
-          if (msg.type === "tool_error") {
-            reject(new Error(msg.error || "Tool execution failed"));
-          } else {
-            resolve(msg.result);
-          }
-        }
-      } catch {}
-    }
-  });
-
-  primarySocket.on("error", (err) => {
-    process.stderr.write(`Client connection error: ${err.message}\n`);
-  });
-
-  primarySocket.on("close", () => {
-    primarySocket = null;
-    // Reject in-flight requests; a dead primary can't answer them.
-    for (const [, { reject, timer }] of pendingRequests) {
-      clearTimeout(timer);
-      reject(new Error("Primary MCP server disconnected"));
-    }
-    pendingRequests.clear();
-    // The primary is gone. Try to take over the port ourselves; if another
-    // session beats us to it, acquireRole reconnects us to that new primary.
-    setTimeout(acquireRole, 200);
-  });
-}
-
-// --- Startup: own the port (primary) or connect to whoever already does ---
-
-await acquireRole();
+// Exit if the parent dies without closing our stdin: we get re-parented.
+const initialPpid = process.ppid;
+setInterval(() => {
+  if (process.ppid !== initialPpid) shutdown("parent exited");
+}, 5000).unref();
 
 // --- Helper to wrap tool results for MCP ---
 
@@ -428,7 +90,7 @@ async function callTool(toolName, args) {
   try {
     const result = await sendToExtension(toolName, args);
     if (typeof result === "string") return textResult(result);
-    if (result && result.content) return result;
+    if (result && result.content) return applySaveToDisk(result);
     return textResult(JSON.stringify(result, null, 2));
   } catch (err) {
     return textResult(`Error: ${err.message}`);
@@ -692,19 +354,40 @@ server.tool(
       })
     ).min(1).describe("List of tool calls to execute sequentially. Each item is `{name, input}`: `name` = tool name (e.g. computer, navigate, find, tabs_create_mcp; browser_batch cannot be nested); `input` = that tool's input, same shape you'd pass when calling it directly."),
   },
-  async (args) => callTool("browser_batch", args)
+  async (args) => {
+    const uploadPolicy = loadUploadPolicy();
+    const actions = [];
+    for (let i = 0; i < args.actions.length; i++) {
+      const action = args.actions[i];
+      if (action.name === "browser_batch") {
+        return textResult(`Error: Action ${i + 1} (browser_batch): nested browser_batch is not allowed.`);
+      }
+      if (action.name !== "file_upload") {
+        actions.push(action);
+        continue;
+      }
+      const check = checkUploadPaths(action.input?.paths, uploadPolicy);
+      if (!check.ok) return textResult(`Error: Action ${i + 1} (file_upload): ${check.error}`);
+      actions.push({ ...action, input: { ...action.input, paths: check.resolved } });
+    }
+    return callTool("browser_batch", { ...args, actions });
+  }
 );
 
 // 20. file_upload
 server.tool(
   "file_upload",
-  "Upload one or multiple files to a file input element on the page. Do not click on file upload buttons or file inputs — clicking opens a native file picker dialog that you cannot see or interact with. Instead, use read_page or find to locate the file input element, then use this tool with its ref to upload files directly. Only files the user has shared with this session (attachments, the session's outputs/uploads folders, or folders the user has connected) can be uploaded; other paths will be rejected. The combined size of all files in a single call must stay under 10 MB.",
+  "Upload one or multiple files to a file input element on the page. Do not click on file upload buttons or file inputs — clicking opens a native file picker dialog that you cannot see or interact with. Instead, use read_page or find to locate the file input element, then use this tool with its ref to upload files directly. Only files inside the allowed upload folders can be uploaded (by default ~/Downloads and ~/Desktop, configurable with fileUploadAllowedDirs in ~/.config/open-claude-in-chrome/config.json); other paths will be rejected. The combined size of all files in a single call must stay under 10 MB.",
   {
-    paths: z.array(z.string()).describe("Absolute paths to the files to upload. Each must be a file the user has shared with this session."),
+    paths: z.array(z.string()).describe("Absolute paths to the files to upload. Each must be inside an allowed upload folder."),
     ref: z.string().describe('Element reference ID of the file input from read_page/find (e.g. "ref_1").'),
     tabId: z.number().describe("Tab ID where the file input is located."),
   },
-  async (args) => callTool("file_upload", args)
+  async (args) => {
+    const check = checkUploadPaths(args.paths, loadUploadPolicy());
+    if (!check.ok) return textResult(`Error: ${check.error}`);
+    return callTool("file_upload", { ...args, paths: check.resolved });
+  }
 );
 
 // 21. list_connected_browsers
