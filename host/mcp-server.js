@@ -12,6 +12,7 @@ import { z } from "zod";
 import { BridgeClient } from "./bridge-client.js";
 import { bridgePath } from "./bridge-endpoint.js";
 import { checkUploadPaths, loadUploadPolicy } from "./upload-policy.js";
+import { applySaveToDisk } from "./save-to-disk.js";
 
 const bridge = new BridgeClient({
   sockPath: bridgePath(),
@@ -60,7 +61,7 @@ async function callTool(toolName, args) {
   try {
     const result = await sendToExtension(toolName, args);
     if (typeof result === "string") return textResult(result);
-    if (result && result.content) return result;
+    if (result && result.content) return applySaveToDisk(result);
     return textResult(JSON.stringify(result, null, 2));
   } catch (err) {
     return textResult(`Error: ${err.message}`);
