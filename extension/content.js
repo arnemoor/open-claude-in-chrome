@@ -30,6 +30,10 @@
   const docQueryFn = Document.prototype.querySelector;
   const docByIdFn = Document.prototype.getElementById;
   const docElementFromPointFn = Document.prototype.elementFromPoint;
+  // Not part of the public dom object (not in E4b's interface): captured the same way, called
+  // directly at their one call site each (isVisible, getPageText).
+  const cloneNodeFn = Node.prototype.cloneNode;
+  const querySelectorAllFn = Element.prototype.querySelectorAll;
 
   function str(value) {
     return typeof value === "string" ? value : "";
@@ -37,14 +41,16 @@
 
   const dom = {
     tag: (el) => (el ? str(tagNameGet.call(el)).toLowerCase() : ""),
-    attr: (el, name) => (el ? str(getAttributeFn.call(el, name)) : ""),
+    // Raw getAttribute result (string or null) — a native call, so it is always one of those two
+    // types regardless of clobbering. Callers that need a guaranteed string use dom.str(...).
+    attr: (el, name) => (el ? getAttributeFn.call(el, name) : null),
     children: (el) => (el ? childrenGet.call(el) : []),
     text: (el) => (el ? str(textContentGet.call(el)) : ""),
     nodeType: (el) => (el ? nodeTypeGet.call(el) : 0),
     shadowRoot: (el) => (el ? shadowRootGet.call(el) : null),
     closest: (el, sel) => (el ? closestFn.call(el, sel) : null),
     matches: (el, sel) => (el ? matchesFn.call(el, sel) : false),
-    rect: (el) => (el ? rectFn.call(el) : { x: 0, y: 0, width: 0, height: 0, top: 0, left: 0, right: 0, bottom: 0 }),
+    rect: (el) => (el ? rectFn.call(el) : null),
     str,
     docTitle: () => str(docTitleGet.call(document)),
     docBody: () => docBodyGet.call(document),
@@ -190,14 +196,17 @@
     if (role && ["button", "link", "textbox", "checkbox", "radio", "tab", "menuitem", "switch", "combobox", "slider", "spinbutton", "searchbox", "option"].includes(role)) return true;
     if (typeof el.tabIndex === "number" && el.tabIndex >= 0) return true;
     if (typeof el.onclick === "function" || dom.attr(el, "onclick")) return true;
-    const contentEditable = dom.attr(el, "contenteditable");
-    if (contentEditable === "" || contentEditable === "true") return true;
+    // Presence-based, case-insensitive: a bare `contenteditable` or `contenteditable="TRUE"` both count.
+    if (dom.matches(el, '[contenteditable=""], [contenteditable="true" i]')) return true;
     return false;
   }
 
   // --- Visibility check ---
   function isVisible(el) {
-    if (offsetParentGet.call(el) === null && dom.tag(el) !== "body" && getComputedStyle(el).position !== "fixed") return false;
+    // offsetParent is an HTMLElement.prototype getter: calling it on an SVGElement/MathMLElement
+    // throws (illegal invocation). Those elements just never trigger this check, as before.
+    const hiddenByOffset = el instanceof HTMLElement && offsetParentGet.call(el) === null;
+    if (hiddenByOffset && dom.tag(el) !== "body" && getComputedStyle(el).position !== "fixed") return false;
     const style = getComputedStyle(el);
     if (style.display === "none" || style.visibility === "hidden") return false;
     return true;
@@ -257,11 +266,13 @@
         if (name) line += ` "${name.substring(0, 100)}"`;
         line += ` [${ref}]`;
 
-        // Extra info for specific elements
-        if (tag === "a" && el.href) line += ` href="${el.href}"`;
-        if (tag === "img" && el.src) line += ` src="${el.src.substring(0, 100)}"`;
-        if (["input", "textarea"].includes(tag) && el.value) line += ` value="${el.value.substring(0, 100)}"`;
-        if (tag === "input") line += ` type="${el.type || "text"}"`;
+        // Extra info for specific elements. Tag-name equality alone isn't enough: an element inside
+        // <svg>/<math> foreign content can share an HTML tag name (e.g. a "select") without being the
+        // HTML interface that owns these properties, so each read is also guarded by instanceof.
+        if (tag === "a" && el instanceof HTMLAnchorElement && el.href) line += ` href="${el.href}"`;
+        if (tag === "img" && el instanceof HTMLImageElement && el.src) line += ` src="${el.src.substring(0, 100)}"`;
+        if (["input", "textarea"].includes(tag) && (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) && el.value) line += ` value="${el.value.substring(0, 100)}"`;
+        if (tag === "input" && el instanceof HTMLInputElement) line += ` type="${el.type || "text"}"`;
         const expanded = dom.attr(el, "aria-expanded");
         if (expanded) line += ` expanded=${expanded}`;
         const checked = dom.attr(el, "aria-checked");
@@ -271,7 +282,7 @@
         if (dom.matches(el, ":disabled")) line += " disabled";
 
         // Select options
-        if (tag === "select") {
+        if (tag === "select" && el instanceof HTMLSelectElement) {
           const opts = Array.from(el.options).map(
             (o) => `${o.selected ? "*" : " "}${o.value}="${dom.text(o).trim()}"`
           );
@@ -328,9 +339,11 @@
     const url = location.href;
     const tag = dom.tag(source);
 
-    // Clean text: remove script/style content, collapse whitespace
-    const clone = source.cloneNode(true);
-    clone.querySelectorAll("script, style, noscript, template, svg").forEach((el) => el.remove());
+    // Clean text: remove script/style content, collapse whitespace. source can be a <form> matched
+    // by selector (.content, #content, [role="main"]), so cloneNode/querySelectorAll go through the
+    // captured prototype methods rather than direct calls, which a named control can replace.
+    const clone = cloneNodeFn.call(source, true);
+    querySelectorAllFn.call(clone, "script, style, noscript, template, svg").forEach((el) => el.remove());
     const text = dom.text(clone).replace(/\s+/g, " ").trim();
 
     return JSON.stringify({ title, url, sourceTag: tag, text: text.substring(0, 100000) });
@@ -366,10 +379,14 @@
       const role = getRole(el) || "";
       const name = getAccessibleName(el) || "";
       const text = dom.text(el).trim().substring(0, 200);
-      const placeholder = dom.attr(el, "placeholder");
-      const ariaLabel = dom.attr(el, "aria-label");
-      const title = dom.attr(el, "title");
-      const type = dom.attr(el, "type");
+      // dom.attr can return null (attribute absent); dom.str turns that into "" for interpolation
+      // below (a bare null would otherwise stringify as the text "null").
+      const placeholder = dom.str(dom.attr(el, "placeholder"));
+      const ariaLabel = dom.str(dom.attr(el, "aria-label"));
+      const title = dom.str(dom.attr(el, "title"));
+      // The type ATTRIBUTE loses the IDL default (e.g. a plain <button> is type "submit" with no
+      // attribute at all), so read the property for the HTML elements that own it instead.
+      const type = el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement || el instanceof HTMLButtonElement ? el.type : "";
 
       const searchable = `${role} ${name} ${text} ${placeholder} ${ariaLabel} ${title} ${type} ${tag}`.toLowerCase();
 
