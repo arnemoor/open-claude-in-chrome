@@ -47,8 +47,7 @@ export class BridgeHub {
     this._server = null; // the currently-live listening server, or null
     this._standbyTimer = null;
     this._selfCheckTimer = null;
-    this._lastStandbyRetryError = null; // throttle: standby_retry_failed logs once per distinct message
-    this._lastSelfCheckError = null; // throttle: self_check_failed logs once per distinct message
+    this._lastStandbyRetryError = null; // throttle: standby_retry_failed logs once per distinct error code
   }
 
   get state() { return this._state; }
@@ -188,13 +187,11 @@ export class BridgeHub {
   // logs, and arms the follow-up timer (self-check or standby retry).
   _applyAcquireResult(result, servingEvent) {
     if (result.outcome === "aborted") return "stopped";
-    // Any non-throwing resolution (serving or standby) means whatever caused
-    // a prior standby-retry/self-check failure is no longer happening, so a
-    // later identical failure is a new incident and should log again. Reset
-    // here, once, since both call sites (a standby retry and a self-check)
-    // funnel their success through this function.
+    const enteringStandby = result.outcome !== "serving" && this._state !== "standby";
+    // A non-throwing resolution (serving or standby) means whatever caused a
+    // prior standby-retry failure is no longer happening, so a later
+    // identical failure is a new incident and should log again.
     this._lastStandbyRetryError = null;
-    this._lastSelfCheckError = null;
     if (result.outcome === "serving") {
       this._server = result.server;
       this._ino = result.ino;
@@ -204,7 +201,12 @@ export class BridgeHub {
       return "serving";
     }
     this._state = "standby";
-    this.log("standby", { sockPath: this.sockPath });
+    // Every standby retry against a live peer resolves "standby" again; log
+    // only the transition into standby. Otherwise a hub parked in standby
+    // (e.g. behind a browser that owns the socket) writes a "standby" line
+    // every standbyRetryMs forever — about 43,200 lines a day at the 2s
+    // default, which rotates the real history away within hours.
+    if (enteringStandby) this.log("standby", { sockPath: this.sockPath });
     this._scheduleStandbyRetry();
     return "standby";
   }
@@ -217,10 +219,15 @@ export class BridgeHub {
         (err) => {
           // A background retry has no caller to report a failure to. Stay in
           // standby and keep trying rather than take the host process down.
-          // Log it, throttled: a persistent failure (e.g. a non-socket file
-          // left at sockPath) would otherwise log every standbyRetryMs.
-          if (err.message !== this._lastStandbyRetryError) {
-            this._lastStandbyRetryError = err.message;
+          // Log it, throttled by error code where there is one (falling back
+          // to the message for errors that lack a code, e.g.
+          // BridgeSecurityError): the message alone can embed the random
+          // per-attempt temp file name (listen/chmod/link failures), so
+          // comparing on it would log every retry even for one persistent
+          // cause. The logged line still carries the full message.
+          const key = err.code ?? err.message;
+          if (key !== this._lastStandbyRetryError) {
+            this._lastStandbyRetryError = key;
             this.log("standby_retry_failed", { message: err.message });
           }
           if (this._state !== "stopped") {
@@ -265,11 +272,12 @@ export class BridgeHub {
       const result = await this._tryBecomeServer();
       this._applyAcquireResult(result, "takeover");
     } catch (err) {
-      // Throttled for the same reason as the standby-retry failure below.
-      if (err.message !== this._lastSelfCheckError) {
-        this._lastSelfCheckError = err.message;
-        this.log("self_check_failed", { message: err.message });
-      }
+      // Not throttled: after this the hub falls into standby, where the
+      // next self-check only runs again once a later attempt reaches
+      // "serving" — so this call site gets at most one failure per
+      // displacement anyway, and the standby retries that follow have their
+      // own throttle above.
+      this.log("self_check_failed", { message: err.message });
       if (this._state !== "stopped") {
         this._state = "standby";
         this._scheduleStandbyRetry();
@@ -382,7 +390,7 @@ export class BridgeHub {
       conn.pid = msg.pid;
       conn.cwd = msg.cwd;
       this._writeLine(conn.socket, { type: "welcome", protocol: PROTOCOL_VERSION, session: conn.session });
-      this.log("client_connected", { session: conn.session, pid: conn.pid, label: conn.label, clients: this.clientCount });
+      this.log("client_connected", { session: conn.session, clientPid: conn.pid, label: conn.label, clients: this.clientCount });
       return;
     }
 
@@ -443,7 +451,7 @@ export class BridgeHub {
     for (const [hubId, pending] of this._pending) {
       if (pending.conn === conn) this._pending.delete(hubId);
     }
-    this.log("client_disconnected", { session: conn.session, pid: conn.pid, label: conn.label, clients: this.clientCount });
+    this.log("client_disconnected", { session: conn.session, clientPid: conn.pid, label: conn.label, clients: this.clientCount });
   }
 
   _writeLine(socket, obj) {

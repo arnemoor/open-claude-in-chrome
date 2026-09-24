@@ -41,7 +41,14 @@ const log = (event, data = {}) => {
 };
 const hub = new BridgeHub({ sockPath: bridgePath(), sendToExtension: writeNativeMessage, log });
 
-const { version } = JSON.parse(fs.readFileSync(new URL("./package.json", import.meta.url), "utf-8"));
+// A missing or corrupt package.json must not crash the host before the exit
+// handlers below even exist to record why.
+let version = "unknown";
+try {
+  ({ version } = JSON.parse(fs.readFileSync(new URL("./package.json", import.meta.url), "utf-8")));
+} catch {
+  // fall back to "unknown"
+}
 log("start", { version, node: process.version });
 
 let stdinBuffer = Buffer.alloc(0);
@@ -65,15 +72,24 @@ async function exit(code, reason) {
 process.stdin.on("end", () => exit(0, "stdin closed"));
 process.on("SIGTERM", () => exit(0, "SIGTERM"));
 process.on("SIGINT", () => exit(0, "SIGINT"));
-process.on("uncaughtException", (err) => exit(1, `uncaught: ${err.stack || err.message}`));
+// `throw undefined` / `throw null` is legal JS; err.stack would then throw
+// inside this handler itself, so Node's crash exits with no exit line at all.
+process.on("uncaughtException", (err) => exit(1, `uncaught: ${String(err?.stack ?? err)}`));
 
 // An unsafe bridge directory must not crash-loop us: the extension would respawn this
 // process every 2 s. Stay alive and retry, so the problem shows up in the log.
+let lastStartFailedKey = null;
 async function startHub() {
   try {
     await hub.start();
   } catch (err) {
-    log("start_failed", { message: err.message });
+    // Throttled the same way as the hub's own standby-retry failures: the
+    // message can vary between attempts even for one persistent cause.
+    const key = err.code ?? err.message;
+    if (key !== lastStartFailedKey) {
+      lastStartFailedKey = key;
+      log("start_failed", { message: err.message });
+    }
     if (err instanceof BridgeSecurityError) setTimeout(startHub, 30000);
     else exit(1, `start failed: ${err.message}`);
   }

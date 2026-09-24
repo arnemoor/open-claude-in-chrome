@@ -56,8 +56,10 @@ setInterval(() => {
 // The MCP SDK runs tool handlers inside its own request loop; a bug there
 // would otherwise crash us with no record of why. Log it and exit non-zero
 // rather than let Node print to a stderr nobody is watching.
+// `throw undefined` / `throw null` is legal JS; err.stack would then throw
+// inside this handler itself, so Node's crash exits with no exit line at all.
 process.on("uncaughtException", (err) => {
-  const reason = `uncaught: ${err.stack || err.message}`;
+  const reason = `uncaught: ${String(err?.stack ?? err)}`;
   process.stderr.write(`[mcp-server] exit ${JSON.stringify({ reason })}\n`);
   logger.error("exit", { reason });
   process.exit(1);

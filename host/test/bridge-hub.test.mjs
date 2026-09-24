@@ -445,7 +445,7 @@ test("a persistent standby-retry failure logs standby_retry_failed once, not eve
   assert.match(failures[0].data.message, /non-socket/);
 });
 
-test("self_check_failed and its trailing standby retries throttle by message, and reset after recovery", { timeout: 15000 }, async (t) => {
+test("self_check_failed logs on every failure (unthrottled); the standby retries that follow still throttle and reset after recovery", { timeout: 15000 }, async (t) => {
   const home = tmpHome();
   const sock = bridgePath(home);
   const events = [];
@@ -456,13 +456,80 @@ test("self_check_failed and its trailing standby retries throttle by message, an
   fs.writeFileSync(sock, "not a socket");
   await waitFor(() => events.some((e) => e.event === "self_check_failed"), 2000);
   await sleep(250); // several more 50ms standby-retry cycles against the same failure
-  assert.equal(events.filter((e) => e.event === "self_check_failed").length, 1, "the self-check's own reacquire attempt logs once");
-  assert.equal(events.filter((e) => e.event === "standby_retry_failed").length, 1, "the standby retries that follow must also throttle to one log");
+  // self_check_failed is not throttled, but a self-check only gets one shot
+  // per displacement before the hub falls into standby, so it still lands on
+  // exactly one here regardless.
+  assert.equal(events.filter((e) => e.event === "self_check_failed").length, 1, "one self-check reacquire attempt happens per displacement");
+  assert.equal(events.filter((e) => e.event === "standby_retry_failed").length, 1, "the standby retries that follow throttle to one log");
 
-  // Recovery clears both throttles: an identical later failure must log again.
+  // Recovery clears the standby-retry throttle: an identical later failure
+  // must log again, both for the (unthrottled) self-check and the retries.
   fs.unlinkSync(sock);
   await waitFor(() => hub.state === "serving", 2000);
   fs.unlinkSync(sock);
   fs.writeFileSync(sock, "not a socket");
   await waitFor(() => events.filter((e) => e.event === "self_check_failed").length === 2, 2000);
+  await sleep(250);
+  assert.equal(events.filter((e) => e.event === "standby_retry_failed").length, 2, "the standby-retry throttle reset after recovery, so the second incident logs once more");
+});
+
+// --- Task 5 (H5) fix round 1 -------------------------------------------------
+
+test("a standby hub logs \"standby\" only once on entry, not on every retry", { timeout: 10000 }, async (t) => {
+  const home = tmpHome();
+  const first = await startHub(home);
+  t.after(() => first.hub.stop("cleanup").catch(() => {}));
+  const events = [];
+  const second = new BridgeHub({ sockPath: bridgePath(home), sendToExtension: () => {}, standbyRetryMs: 50, log: (event) => events.push(event) });
+  t.after(() => second.stop("cleanup").catch(() => {}));
+  assert.equal(await second.start(), "standby");
+  await sleep(300); // several 50ms retry cycles; A keeps serving, so every one resolves "standby" again
+  assert.equal(events.filter((e) => e === "standby").length, 1, "entering standby logs once; re-confirming it on every retry must not log again");
+});
+
+test("the standby-retry throttle compares by error code, not the full message (which can embed a random per-attempt name)", { timeout: 10000 }, async (t) => {
+  const home = tmpHome();
+  const events = [];
+  const hub = new BridgeHub({ sockPath: bridgePath(home), sendToExtension: () => {}, standbyRetryMs: 50, log: (event, data) => events.push({ event, data }) });
+  t.after(() => hub.stop("cleanup").catch(() => {}));
+  // Two distinct errors that share a code but differ in message, the way a
+  // real listen/chmod/link failure against one persistently broken directory
+  // would (the random ".t" + 8 hex temp name changes every attempt).
+  let call = 0;
+  hub._state = "standby"; // as if a previous acquire attempt already went to standby
+  hub._tryBecomeServer = () => {
+    call++;
+    const err = new Error(`EACCES: permission denied, listen '/tmp/ocic-x/.t${call === 1 ? "aaaaaaaa" : "bbbbbbbb"}'`);
+    err.code = "EACCES";
+    return Promise.reject(err);
+  };
+  hub._scheduleStandbyRetry();
+  await waitFor(() => call >= 2, 2000);
+  await sleep(50);
+  const failures = events.filter((e) => e.event === "standby_retry_failed");
+  assert.equal(failures.length, 1, "two errors sharing a code but differing only in message must throttle to one log");
+  assert.match(failures[0].data.message, /aaaaaaaa/, "the logged line still carries the full first message");
+});
+
+test("client_connected and client_disconnected carry session, clientPid, label and the post-event client count", { timeout: 10000 }, async (t) => {
+  const home = tmpHome();
+  const events = [];
+  const { hub } = await startHub(home, { log: (event, data) => events.push({ event, data }) });
+  t.after(() => hub.stop("cleanup").catch(() => {}));
+  const a = await helloClient(bridgePath(home), "app-a");
+  t.after(() => a.sock.destroy());
+  await waitFor(() => events.some((e) => e.event === "client_connected"));
+  const connectedA = events.find((e) => e.event === "client_connected").data;
+  assert.deepEqual(connectedA, { session: "s1", clientPid: 1, label: "app-a", clients: 1 });
+
+  const b = await helloClient(bridgePath(home), "app-b");
+  t.after(() => b.sock.destroy());
+  await waitFor(() => events.filter((e) => e.event === "client_connected").length === 2);
+  const connectedB = events.filter((e) => e.event === "client_connected")[1].data;
+  assert.deepEqual(connectedB, { session: "s2", clientPid: 1, label: "app-b", clients: 2 });
+
+  a.sock.destroy();
+  await waitFor(() => events.some((e) => e.event === "client_disconnected"));
+  const disconnectedA = events.find((e) => e.event === "client_disconnected").data;
+  assert.deepEqual(disconnectedA, { session: "s1", clientPid: 1, label: "app-a", clients: 1 }, "clients is the post-disconnect count");
 });
