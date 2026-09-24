@@ -270,7 +270,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     const reqs = networkRequests.get(tabId) || [];
     // Fill in the response on the request we already logged (matched by
     // requestId) instead of appending a second entry with a guessed method.
-    const entry = reqs.find((r) => r.requestId === params.requestId);
+    const entry = reqs.findLast((r) => r.requestId === params.requestId);
     if (entry) {
       entry.status = params.response.status;
       entry.statusText = params.response.statusText;
@@ -293,6 +293,18 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
 
   if (method === "Network.requestWillBeSent" && params.request) {
     const reqs = networkRequests.get(tabId) || [];
+    if (params.redirectResponse) {
+      // This requestId is following a redirect: retire the hop that just redirected
+      // (so it stops matching future updates for this requestId) and record the
+      // redirect's own status on it, then fall through to log the new hop below.
+      const redirected = reqs.findLast((r) => r.requestId === params.requestId);
+      if (redirected) {
+        redirected.status = params.redirectResponse.status;
+        redirected.statusText = params.redirectResponse.statusText;
+        redirected.mimeType = params.redirectResponse.mimeType;
+        redirected.requestId = null;
+      }
+    }
     reqs.push({
       requestId: params.requestId,
       url: params.request.url,
