@@ -28,7 +28,7 @@ Kept exactly as given: `http`, `https`, `file`, `data`, `about`, `chrome`, `brav
 
 ## Audit mode
 
-The browser profile may have its own opt-in audit log and DOM replay (rrweb), switched on only from the extension's options page. No MCP tool can read or change it, and it never changes a tool's result. `type` and `form_input` string values are kept only as a character count, never the value, and a number or boolean becomes `[number]`/`checked=...`. A navigated URL has its query and fragment blanked. `javascript_tool` code (up to 500 characters), `find` queries and `file_upload` paths are kept as given, so enter secrets with `type`/`form_input` into a real field, never through `javascript_tool`.
+The browser profile may have its own opt-in audit log and DOM replay (rrweb), switched on only from the extension's options page. No MCP tool can read or change it, and it never changes a tool's result. `type`/`form_input` string values and runs of plain `key` presses are kept only as a count, never the value (named keys like `Enter`/`ctrl+a` are kept as given). Stored URLs, including inside error text, have their query and fragment removed. `javascript_tool` code (up to 500 characters) is kept, but string literals inside it become `[N chars]`. `find` queries and file paths are kept as given, so enter secrets with `type`/`form_input` into a real field, never through `javascript_tool`. The replay masks every input, textarea, select, password and contenteditable value on screen.
 
 ## Honest stubs
 
