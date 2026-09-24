@@ -80,20 +80,25 @@ export class BridgeClient {
       }
 
       this._connectNow();
+      const waiter = () => {
+        clearTimeout(graceTimer);
+        doWrite();
+      };
       const graceTimer = setTimeout(() => {
         if (this._pending.get(id) !== entry) return;
         this._pending.delete(id);
         clearTimeout(entry.timer);
+        // Drop this request's own waiter instead of leaving it (and its args)
+        // queued in _connectWaiters until the next welcome (M6).
+        const idx = this._connectWaiters.indexOf(waiter);
+        if (idx !== -1) this._connectWaiters.splice(idx, 1);
         let message = NOT_CONNECTED;
         if (this._lastSecurityError) message += ` Refusing to connect: ${this._lastSecurityError}`;
         reject(new Error(message));
       }, this.graceMs);
       graceTimer.unref();
 
-      this._connectWaiters.push(() => {
-        clearTimeout(graceTimer);
-        doWrite();
-      });
+      this._connectWaiters.push(waiter);
     });
   }
 

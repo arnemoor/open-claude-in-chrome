@@ -106,3 +106,13 @@ test("per-request timeout", { timeout: 10000 }, async (t) => {
   await assert.rejects(c.request("find", {}), (e) => e.message === "Tool request timed out after 0.3s");
   c.close(); await hub.stop("test");
 });
+
+// --- Fix round: M6 -----------------------------------------------------------
+
+test("a grace-timeout rejection drops its waiter instead of leaking it until the next welcome", { timeout: 10000 }, async (t) => {
+  const home = tmpHome();
+  const c = client(home, { graceMs: 100 });
+  t.after(() => c.close());
+  await assert.rejects(c.request("javascript_tool", { text: "x".repeat(1000) }), (e) => e.message === NOT_CONNECTED);
+  assert.equal(c._connectWaiters.length, 0, "the timed-out request's waiter must not remain queued");
+});
