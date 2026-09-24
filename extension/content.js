@@ -30,6 +30,11 @@
   const docQueryFn = Document.prototype.querySelector;
   const docByIdFn = Document.prototype.getElementById;
   const docElementFromPointFn = Document.prototype.elementFromPoint;
+  const containsFn = Node.prototype.contains;
+  const scrollIntoViewFn = Element.prototype.scrollIntoView;
+  // Tag-owned getter (HTMLLabelElement only): guarded by `instanceof` at its one call site
+  // (labelNotes), the same rule as offsetParentGet above, so it's not part of the dom object.
+  const labelControlGet = Object.getOwnPropertyDescriptor(HTMLLabelElement.prototype, "control").get;
   // Not part of the public dom object (not in E4b's interface): captured the same way, called
   // directly at their one call site each (both in getPageText).
   const cloneNodeFn = Node.prototype.cloneNode;
@@ -51,6 +56,8 @@
     closest: (el, sel) => (el ? closestFn.call(el, sel) : null),
     matches: (el, sel) => (el ? matchesFn.call(el, sel) : false),
     rect: (el) => (el ? rectFn.call(el) : null),
+    contains: (el, other) => (el ? containsFn.call(el, other) : false),
+    scrollIntoView: (el, opts) => { if (el) scrollIntoViewFn.call(el, opts); },
     str,
     docTitle: () => str(docTitleGet.call(document)),
     docBody: () => docBodyGet.call(document),
@@ -393,11 +400,14 @@
       if (searchable.includes(q)) {
         const ref = getOrAssignRef(el);
         const rect = dom.rect(el);
+        const cx = rect.x + rect.width / 2;
+        const cy = rect.y + rect.height / 2;
         results.push({
           ref,
           role: role || tag,
           name: name || text.substring(0, 80),
-          coordinates: [Math.round(rect.x + rect.width / 2), Math.round(rect.y + rect.height / 2)],
+          coordinates: [Math.round(cx), Math.round(cy)],
+          inViewport: cx >= 0 && cx < innerWidth && cy >= 0 && cy < innerHeight,
         });
       }
     }
@@ -547,15 +557,107 @@
     return { success: true, value: target.value };
   }
 
-  // --- Get element coordinates for ref ---
-  function getRefCoordinates(refId) {
+  // --- Click targeting: describe what's at a point, scroll refs into view, hit-test ---
+
+  // tag + #id + .firstClass + ' "name"' (accessible name, clipped to 40 chars), the whole
+  // string capped at 80 chars. E.g. `button#go.primary "Sign in"`.
+  function describeElement(el) {
+    if (!el) return "(nothing)";
+    const tag = dom.tag(el);
+    const id = dom.str(dom.attr(el, "id"));
+    const firstClass = dom.str(dom.attr(el, "class")).trim().split(/\s+/)[0] || "";
+    const name = getAccessibleName(el);
+    let desc = tag;
+    if (id) desc += `#${id}`;
+    if (firstClass) desc += `.${firstClass}`;
+    if (name) desc += ` "${name.slice(0, 40)}"`;
+    return desc.slice(0, 80);
+  }
+
+  // document.elementFromPoint always returns the shadow host, never a node inside an open
+  // shadow tree, so descend by re-querying each open shadow root at the same point until it
+  // stops finding something new.
+  function deepElementFromPoint(x, y) {
+    let el = dom.docElementFromPoint(x, y);
+    while (el) {
+      const root = dom.shadowRoot(el);
+      if (!root) break;
+      const inner = root.elementFromPoint(x, y);
+      if (!inner || inner === el) break;
+      el = inner;
+    }
+    return el;
+  }
+
+  // Shared by getRefTarget and probePoint: warn when the hit point is inside a <label> whose
+  // control is missing or disabled, since a click there won't do what it looks like it will.
+  function labelNotes(hit) {
+    const notes = [];
+    const label = dom.closest(hit, "label");
+    if (label) {
+      const control = label instanceof HTMLLabelElement ? labelControlGet.call(label) : null;
+      if (!control) notes.push("This label has no associated control, so the click may do nothing.");
+      else if (dom.matches(control, ":disabled")) notes.push("This label's control is disabled.");
+    }
+    return notes;
+  }
+
+  function getRefTarget(refId) {
     const el = resolveRef(refId);
-    if (!el) return null;
-    const rect = el.getBoundingClientRect();
+    if (!el) return { error: `Element ${refId} not found. Take a new read_page or find.` };
+
+    let rect = dom.rect(el);
+    if (rect.width === 0 || rect.height === 0) {
+      return { error: `Element ${refId} has no size (hidden?).` };
+    }
+
+    let cx = rect.x + rect.width / 2;
+    let cy = rect.y + rect.height / 2;
+    const outOfView = () => cx < 0 || cx >= innerWidth || cy < 0 || cy >= innerHeight;
+
+    let scrolled = false;
+    if (outOfView()) {
+      dom.scrollIntoView(el, { block: "center", inline: "center", behavior: "instant" });
+      scrolled = true;
+      rect = dom.rect(el);
+      cx = rect.x + rect.width / 2;
+      cy = rect.y + rect.height / 2;
+      if (outOfView()) {
+        return { error: `Element ${refId} is outside the viewport and could not be scrolled into view.` };
+      }
+    }
+
+    const x = Math.round(cx);
+    const y = Math.round(cy);
+    const hit = deepElementFromPoint(x, y);
+    const shadow = dom.shadowRoot(el);
+    const covered = hit !== el && !dom.contains(el, hit) && !dom.contains(shadow, hit);
+
+    const notes = [];
+    if (covered) notes.push(`The click point is covered by ${describeElement(hit)}.`);
+    notes.push(...labelNotes(hit));
+
+    return { x, y, scrolled, hit: describeElement(hit), covered, notes };
+  }
+
+  function probePoint(x, y) {
+    const hit = deepElementFromPoint(x, y);
     return {
-      x: Math.round(rect.x + rect.width / 2),
-      y: Math.round(rect.y + rect.height / 2),
+      inViewport: x >= 0 && x < innerWidth && y >= 0 && y < innerHeight,
+      viewport: `${innerWidth}x${innerHeight}`,
+      hit: describeElement(hit),
+      notes: labelNotes(hit),
     };
+  }
+
+  function scrollToRef(refId) {
+    const el = resolveRef(refId);
+    if (!el) return { error: `Element ${refId} not found. Take a new read_page or find.` };
+    dom.scrollIntoView(el, { block: "center", inline: "center", behavior: "instant" });
+    const rect = dom.rect(el);
+    const x = Math.round(rect.x + rect.width / 2);
+    const y = Math.round(rect.y + rect.height / 2);
+    return { x, y, inViewport: x >= 0 && x < innerWidth && y >= 0 && y < innerHeight };
   }
 
   // --- Message handler ---
@@ -584,9 +686,18 @@
       return true;
     }
 
-    if (msg.type === "getRefCoordinates") {
-      const result = getRefCoordinates(msg.ref);
-      sendResponse({ result });
+    if (msg.type === "getRefTarget") {
+      sendResponse({ result: getRefTarget(msg.ref) });
+      return true;
+    }
+
+    if (msg.type === "probePoint") {
+      sendResponse({ result: probePoint(msg.x, msg.y) });
+      return true;
+    }
+
+    if (msg.type === "scrollToRef") {
+      sendResponse({ result: scrollToRef(msg.ref) });
       return true;
     }
 
@@ -614,7 +725,9 @@
     getPageText,
     findElements,
     setFormValue,
-    getRefCoordinates,
+    getRefTarget,
+    probePoint,
+    scrollToRef,
     findFileInput,
     markFileInput,
     unmarkFileInput,

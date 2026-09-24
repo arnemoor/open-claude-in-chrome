@@ -478,13 +478,6 @@ async function sendContentMessage(tabId, message) {
   }
 }
 
-// --- Resolve ref to coordinates ---
-async function resolveRefToCoordinates(tabId, ref) {
-  const resp = await sendContentMessage(tabId, { type: "getRefCoordinates", ref });
-  if (resp?.result) return [resp.result.x, resp.result.y];
-  return null;
-}
-
 // --- Screenshot helper ---
 // Cap viewport to 1280x800 for screenshots to keep size manageable.
 // Retina displays produce 2x+ resolution PNGs that blow up base64 size.
@@ -578,6 +571,18 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// Formats a click/hover reply: the verb, where it landed, what it hit, whether a ref click had
+// to scroll first, and any warnings (a covered target, an inert label) from getRefTarget or
+// probePoint.
+function pointerReply(verb, coordinate, hit, scrolled, notes) {
+  let text = `${verb} at (${coordinate[0]}, ${coordinate[1]})`;
+  if (hit) text += ` on ${hit}`;
+  if (scrolled) text += " after scrolling it into view (take a new screenshot)";
+  text += ".";
+  if (notes.length) text += ` Warning: ${notes.join(" ")}`;
+  return text;
+}
+
 // --- Tool handlers ---
 const toolHandlers = {
   async tabs_context_mcp(args) {
@@ -667,11 +672,31 @@ const toolHandlers = {
     if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
 
     let coordinate = args.coordinate;
-    // Resolve ref to coordinates if provided
-    if (args.ref && !coordinate) {
-      const coords = await resolveRefToCoordinates(tabId, args.ref);
-      if (!coords) return { content: [{ type: "text", text: `Could not resolve ref "${args.ref}" to coordinates.` }] };
-      coordinate = coords;
+    // Click actions and hover accept either a ref or a coordinate: a ref is resolved (and
+    // scrolled into view if needed) by getRefTarget; a bare coordinate is only hit-tested by
+    // probePoint, to name what it hits and to refuse one that's outside the viewport. Neither
+    // applies to scroll_to (handled in its own case below) or to scroll/left_click_drag, which
+    // only ever take a plain coordinate.
+    const isPointerAction = ["left_click", "right_click", "double_click", "triple_click", "hover"].includes(action);
+    let scrolled = false;
+    let hit = "";
+    let notes = [];
+    if (isPointerAction && args.ref && !coordinate) {
+      const resp = await sendContentMessage(tabId, { type: "getRefTarget", ref: args.ref });
+      const target = resp?.result;
+      if (!target || target.error) return { content: [{ type: "text", text: target?.error || `Could not resolve ref "${args.ref}".` }] };
+      coordinate = [target.x, target.y];
+      scrolled = target.scrolled;
+      hit = target.hit;
+      notes = target.notes;
+    } else if (isPointerAction && coordinate) {
+      const resp = await sendContentMessage(tabId, { type: "probePoint", x: coordinate[0], y: coordinate[1] });
+      const probe = resp?.result;
+      if (!probe || !probe.inViewport) {
+        return { content: [{ type: "text", text: `Coordinate (${coordinate[0]}, ${coordinate[1]}) is outside the viewport (${probe?.viewport || ""}). Scroll first or use a ref.` }] };
+      }
+      hit = probe.hit;
+      notes = probe.notes;
     }
 
     const modifiers = parseModifierString(args.modifiers);
@@ -697,32 +722,32 @@ const toolHandlers = {
       case "left_click": {
         if (!coordinate) return { content: [{ type: "text", text: "coordinate is required for left_click" }] };
         await mouseClick(tabId, coordinate[0], coordinate[1], { modifiers });
-        return { content: [{ type: "text", text: `Clicked at (${coordinate[0]}, ${coordinate[1]})` }] };
+        return { content: [{ type: "text", text: pointerReply("Clicked", coordinate, hit, scrolled, notes) }] };
       }
 
       case "right_click": {
         if (!coordinate) return { content: [{ type: "text", text: "coordinate is required for right_click" }] };
         await mouseClick(tabId, coordinate[0], coordinate[1], { button: "right", modifiers });
-        return { content: [{ type: "text", text: `Right-clicked at (${coordinate[0]}, ${coordinate[1]})` }] };
+        return { content: [{ type: "text", text: pointerReply("Right-clicked", coordinate, hit, scrolled, notes) }] };
       }
 
       case "double_click": {
         if (!coordinate) return { content: [{ type: "text", text: "coordinate is required for double_click" }] };
         await mouseClick(tabId, coordinate[0], coordinate[1], { clickCount: 2, modifiers });
-        return { content: [{ type: "text", text: `Double-clicked at (${coordinate[0]}, ${coordinate[1]})` }] };
+        return { content: [{ type: "text", text: pointerReply("Double-clicked", coordinate, hit, scrolled, notes) }] };
       }
 
       case "triple_click": {
         if (!coordinate) return { content: [{ type: "text", text: "coordinate is required for triple_click" }] };
         await mouseClick(tabId, coordinate[0], coordinate[1], { clickCount: 3, modifiers });
-        return { content: [{ type: "text", text: `Triple-clicked at (${coordinate[0]}, ${coordinate[1]})` }] };
+        return { content: [{ type: "text", text: pointerReply("Triple-clicked", coordinate, hit, scrolled, notes) }] };
       }
 
       case "hover": {
         if (!coordinate) return { content: [{ type: "text", text: "coordinate is required for hover" }] };
         await dispatchMouse(tabId, "mouseMoved", coordinate[0], coordinate[1], { modifiers });
         await sleep(200);
-        return { content: [{ type: "text", text: `Hovered at (${coordinate[0]}, ${coordinate[1]})` }] };
+        return { content: [{ type: "text", text: pointerReply("Hovered", coordinate, hit, scrolled, notes) }] };
       }
 
       case "type": {
@@ -806,19 +831,14 @@ const toolHandlers = {
       case "scroll_to": {
         if (!coordinate && !args.ref) return { content: [{ type: "text", text: "coordinate or ref is required for scroll_to" }] };
         if (args.ref) {
-          await sendContentMessage(tabId, {
-            type: "scrollToRef",
-            ref: args.ref,
-          });
+          const resp = await sendContentMessage(tabId, { type: "scrollToRef", ref: args.ref });
+          const target = resp?.result;
+          if (!target || target.error) return { content: [{ type: "text", text: target?.error || `Could not resolve ref "${args.ref}".` }] };
+          return { content: [{ type: "text", text: `Scrolled ${args.ref} into view at (${target.x}, ${target.y}).` }] };
         }
-        // Scroll target element into view via JS
-        if (coordinate) {
-          await cdp(tabId, "Runtime.evaluate", {
-            expression: `window.scrollTo(${coordinate[0]}, ${coordinate[1]})`,
-          });
-        }
+        await cdp(tabId, "Runtime.evaluate", { expression: `window.scrollTo(${coordinate[0]}, ${coordinate[1]})` });
         await sleep(300);
-        return { content: [{ type: "text", text: `Scrolled to target` }] };
+        return { content: [{ type: "text", text: `Scrolled the page to (${coordinate[0]}, ${coordinate[1]}).` }] };
       }
 
       case "wait": {
@@ -930,7 +950,9 @@ const toolHandlers = {
 
     let text = `Found ${results.length} element(s) matching "${query}":\n\n`;
     for (const r of results) {
-      text += `[${r.ref}] ${r.role} "${r.name}" at (${r.coordinates[0]}, ${r.coordinates[1]})\n`;
+      text += `[${r.ref}] ${r.role} "${r.name}" at (${r.coordinates[0]}, ${r.coordinates[1]})`;
+      if (r.inViewport === false) text += " [off-screen, click by ref to scroll it into view]";
+      text += "\n";
     }
 
     return { content: [{ type: "text", text }] };
