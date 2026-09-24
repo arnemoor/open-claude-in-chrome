@@ -122,7 +122,10 @@ esac
 
 # Link the packaged skill into ~/.claude/skills so agents are told the upload
 # allowlist, save_to_disk location, audit mode limits and other tool quirks
-# without being asked. Only touches a symlink this installer made itself.
+# without being asked. Only replaces a symlink that already points at a copy
+# of this repo's skill (any worktree); any other file or link there is left
+# alone. A failure here is reported, not fatal, so it can't stop the native
+# messaging setup above from taking effect.
 echo ""
 echo "Linking the agent skill (if you use personal Claude Code skills):"
 CLAUDE_SKILLS_DIR="$HOME/.claude/skills"
@@ -130,14 +133,23 @@ SKILL_SRC="$SCRIPT_DIR/skills/open-claude-in-chrome"
 if [ -d "$CLAUDE_SKILLS_DIR" ]; then
   SKILL_LINK="$CLAUDE_SKILLS_DIR/open-claude-in-chrome"
   if [ -L "$SKILL_LINK" ]; then
-    rm "$SKILL_LINK"
-    ln -s "$SKILL_SRC" "$SKILL_LINK"
-    echo "  Relinked skill: $SKILL_LINK -> $SKILL_SRC"
+    OLD_TARGET=$(readlink "$SKILL_LINK")
+    case "$OLD_TARGET" in
+      */skills/open-claude-in-chrome)
+        ln -sfn "$SKILL_SRC" "$SKILL_LINK" \
+          && echo "  Relinked skill: $SKILL_LINK (was -> $OLD_TARGET) -> $SKILL_SRC" \
+          || echo "  Could not relink skill at $SKILL_LINK: check permissions on $CLAUDE_SKILLS_DIR."
+        ;;
+      *)
+        echo "  Skipping skill link: $SKILL_LINK already points elsewhere (-> $OLD_TARGET), leaving it alone."
+        ;;
+    esac
   elif [ -e "$SKILL_LINK" ]; then
     echo "  Skipping skill link: $SKILL_LINK already exists and was not made by this installer."
   else
-    ln -s "$SKILL_SRC" "$SKILL_LINK"
-    echo "  Linked skill: $SKILL_LINK -> $SKILL_SRC"
+    ln -s "$SKILL_SRC" "$SKILL_LINK" \
+      && echo "  Linked skill: $SKILL_LINK -> $SKILL_SRC" \
+      || echo "  Could not link skill at $SKILL_LINK: check permissions on $CLAUDE_SKILLS_DIR."
   fi
 else
   echo "  No $CLAUDE_SKILLS_DIR found, skipping the agent skill link."
