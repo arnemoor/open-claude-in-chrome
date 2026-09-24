@@ -143,33 +143,51 @@ async function isInGroup(tabId) {
 }
 
 // --- CDP helpers ---
+const CDP_TIMEOUT_MS = 30000;
+const attaching = new Map(); // tabId -> in-flight attach promise, shared by parallel callers
+
+function rawCdp(tabId, method, params = {}, timeoutMs = CDP_TIMEOUT_MS) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`CDP ${method} timed out after ${timeoutMs / 1000}s`)), timeoutMs);
+  });
+  return Promise.race([chrome.debugger.sendCommand({ tabId }, method, params), timeout]).finally(() => clearTimeout(timer));
+}
+
 async function ensureAttached(tabId) {
   if (attachedTabs.has(tabId)) return;
-  await chrome.debugger.attach({ tabId }, "1.3");
-  attachedTabs.set(tabId, { enabledDomains: new Set() });
-  // Force devicePixelRatio to 1 so screenshots match CSS coordinate space.
-  // Without this, Retina displays produce 2x screenshots and all coordinates are wrong.
-  const tab = await chrome.tabs.get(tabId);
-  const win = await chrome.windows.get(tab.windowId);
-  await chrome.debugger.sendCommand({ tabId }, "Emulation.setDeviceMetricsOverride", {
-    width: win.width,
-    height: win.height,
-    deviceScaleFactor: 1,
-    mobile: false,
-  });
+  let pending = attaching.get(tabId);
+  if (!pending) {
+    pending = (async () => {
+      await chrome.debugger.attach({ tabId }, "1.3");
+      attachedTabs.set(tabId, { enabledDomains: new Set() });
+      try {
+        // Pin devicePixelRatio to 1 so screenshots use CSS pixels, the coordinate space of
+        // Input.dispatchMouseEvent. Width and height 0 leave the viewport size alone, so the
+        // page keeps following the real window (resize_window, window chrome).
+        await rawCdp(tabId, "Emulation.setDeviceMetricsOverride", { width: 0, height: 0, deviceScaleFactor: 1, mobile: false });
+      } catch (err) {
+        attachedTabs.delete(tabId);
+        try { await chrome.debugger.detach({ tabId }); } catch {}
+        throw err;
+      }
+    })().finally(() => attaching.delete(tabId));
+    attaching.set(tabId, pending);
+  }
+  return pending;
 }
 
 async function ensureDomain(tabId, domain) {
   const state = attachedTabs.get(tabId);
   if (!state) throw new Error("Not attached to tab");
   if (state.enabledDomains.has(domain)) return;
-  await chrome.debugger.sendCommand({ tabId }, `${domain}.enable`, {});
+  await rawCdp(tabId, `${domain}.enable`, {});
   state.enabledDomains.add(domain);
 }
 
-async function cdp(tabId, method, params = {}) {
+async function cdp(tabId, method, params = {}, timeoutMs) {
   await ensureAttached(tabId);
-  return chrome.debugger.sendCommand({ tabId }, method, params);
+  return rawCdp(tabId, method, params, timeoutMs);
 }
 
 // Clean up when tab is closed
@@ -179,6 +197,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     try { chrome.debugger.detach({ tabId }); } catch {}
     attachedTabs.delete(tabId);
   }
+  attaching.delete(tabId);
   consoleMessages.delete(tabId);
   networkRequests.delete(tabId);
 });
@@ -186,6 +205,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 // Handle user dismissing debugger bar
 chrome.debugger.onDetach.addListener((source, reason) => {
   attachedTabs.delete(source.tabId);
+  attaching.delete(source.tabId);
 });
 
 // --- CDP event listeners for console and network ---
