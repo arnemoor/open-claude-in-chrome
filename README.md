@@ -74,7 +74,27 @@ Three components:
 2. **MCP Server** — Node.js process started by Claude Code, exposes tools via MCP
 3. **Native Messaging Host** — owns the bridge and relays between MCP servers and the extension
 
-The native host is spawned by the browser and owns the bridge: it listens on a Unix domain socket at `~/.config/open-claude-in-chrome/run/bridge.sock`, inside a directory it creates with mode `0700`. Every MCP server — any number of them, across any number of Claude Code sessions — connects to that socket as a client. Ownership of the directory (yours, not a symlink, not open to other users) replaces the old shared token: any local process able to open the socket is already running as you.
+The native host is spawned by the browser and owns the bridge, called the hub. It listens on a Unix domain socket at `~/.config/open-claude-in-chrome/run/bridge.sock`, inside a directory it creates with mode `0700` and tightens back to `0700` on every start. Any number of MCP servers, across any number of Claude Code sessions, connect to that socket as clients. Ownership of the directory (yours, not a symlink, not open to other users) is what makes a connecting client trustworthy: any local process able to open the socket is already running as you, so nothing further needs to be proven.
+
+If more than one native host tries to serve that socket at the same time (for example Chrome and Brave both running with the extension loaded), only one of them becomes the hub. The others wait and take over automatically if it exits, but only the current hub's browser is reachable by the tools at any moment.
+
+## Upgrading from the old TCP version
+
+Earlier releases of Open Claude in Chrome connected the MCP server to the native host over a fixed loopback TCP port, authenticated with a shared secret file created on first run. The first MCP server to start owned that port, later sessions connected to it as clients, and one of them would take over if it exited. None of that exists anymore. The native host now owns a per-user Unix socket directly (see Architecture above), so there is no port to pick, no secret file to protect, and no session to promote.
+
+To move an existing install to this version:
+
+1. Pull the latest code.
+2. Reinstall host dependencies: `cd host && npm install && cd ..`.
+3. Fully quit the browser (all windows), then reopen it. An old native host and a new MCP server (or the other way around) cannot talk to each other, so both sides need to restart together.
+4. Reload the extension in `chrome://extensions` so it picks up the new `background.js` and `content.js`.
+5. Clear out stale MCP server processes and reconnect each Claude Code session:
+   ```bash
+   pkill -f "node.*open-claude-in-chrome/host/mcp-server"
+   ```
+   then run `/mcp` in each session.
+
+No manual cleanup is needed beyond that. A leftover `port` key in `~/.config/open-claude-in-chrome/config.json` is simply ignored now (that file's only remaining job is `fileUploadAllowedDirs`, see below), and the shared-secret file earlier versions created is no longer read. Either can stay or be deleted, whichever you prefer.
 
 ## Installation
 
@@ -147,7 +167,7 @@ The full 22-tool surface of the official Claude in Chrome. Most are fully implem
 | `tabs_create_mcp` | Create new tab |
 | `tabs_close_mcp` | Close a tab in the group |
 | `navigate` | Navigate to URL, back, forward |
-| `computer` | Mouse, keyboard, screenshots (13 actions; `save_to_disk` writes to Downloads) |
+| `computer` | Mouse, keyboard, screenshots (13 actions, `save_to_disk` on `screenshot`/`zoom` saves to disk, see below) |
 | `browser_batch` | Run a sequence of tool calls in one round trip |
 | `read_page` | Accessibility tree with element refs |
 | `get_page_text` | Extract article/main text |
@@ -157,7 +177,7 @@ The full 22-tool surface of the official Claude in Chrome. Most are fully implem
 | `read_console_messages` | Console output (filtered) |
 | `read_network_requests` | Network activity |
 | `resize_window` | Resize browser window |
-| `file_upload` | Upload local files to a file input by ref |
+| `file_upload` | Upload local files to a file input by ref (allowed folders only, see below) |
 | `upload_image` | Upload a captured screenshot to a file input (best-effort) |
 | `gif_creator` | GIF recording (stub) |
 | `shortcuts_list` | List shortcuts (stub) |
@@ -165,6 +185,42 @@ The full 22-tool surface of the official Claude in Chrome. Most are fully implem
 | `switch_browser` | Switch browser (stub) |
 | `list_connected_browsers` | List connected browsers (stub) |
 | `select_browser` | Select browser by deviceId (stub) |
+
+## Uploading and saving files
+
+`file_upload`, including a `file_upload` action nested inside `browser_batch`, only accepts absolute paths inside an allowed upload folder. By default that's `~/Downloads` and `~/Desktop`. Set your own list with `fileUploadAllowedDirs` in `~/.config/open-claude-in-chrome/config.json`:
+
+```json
+{ "fileUploadAllowedDirs": ["~/Downloads", "~/Projects/shared-uploads"] }
+```
+
+`~` expands to your home directory. A path outside the allowed folders, or a symlink that resolves outside them, is refused. If the config file exists but is invalid (bad JSON, or `fileUploadAllowedDirs` set to something other than an array), every upload is refused until it's fixed, and the error message says what to fix. The combined size of the files in a single call is limited to 10 MB.
+
+`computer`'s `screenshot` and `zoom` actions take a `save_to_disk: true` argument. The MCP server, not the extension, writes the image to `~/Downloads/open-claude-in-chrome/` (folder mode `0700`, files mode `0600`) and reports the saved path in the reply. The extension no longer needs, or requests, Chrome's `downloads` permission.
+
+## Tool behavior notes
+
+A few things about `computer` and `navigate` that aren't obvious from the tool descriptions alone.
+
+**navigate.** A bare host like `example.com` gets `https://` added automatically. An explicit scheme (`http:`, `https:`, `file:`, `data:`, `about:`, `chrome:`, `view-source:`, and others) is kept as given. `javascript:` URLs are refused (use `javascript_tool` instead), and so is navigating to this extension's own pages. Opening a `file://` URL needs "Allow access to file URLs" enabled for this extension in `chrome://extensions`. If it's off, the reply says so.
+
+**Typing and keys.** `type` sends real per-character key events, including umlauts, emoji and CJK, not a pasted string. A line break in the typed text becomes a real line break only when a `textarea` or a contenteditable element is focused. In a single-line `<input>` it's dropped, and the reply notes that. Use the `key` action with `text: "Enter"` to submit a form. Some shifted punctuation can't be built as a `key` combination (for example `shift+1` presses Shift and 1, not `!`). Type that character directly instead.
+
+**Clicking.** A click reply names what it actually hit, for example `Clicked at (120, 40) on button#submit "Sign in".` A note like `Warning: The click point is covered by …` means something else is stacked on top of the target. Take a screenshot before trying again. A coordinate outside the current viewport is refused outright (`Scroll first or use a ref`). Clicking by element `ref` (from `read_page` or `find`) scrolls it into view instead and says so in the reply, since any coordinate read from an earlier screenshot is now stale.
+
+## Audit mode
+
+The extension can keep a local, opt-in audit log of what an agent does in the browser, for the user's own oversight. It's off by default. Only the extension's own options page (open it from `chrome://extensions`, or right-click the extension's toolbar icon and choose Options) can turn it on or change its retention period (1, 7 or 30 days). No MCP tool can read or change this setting.
+
+When it's on, each session's tool calls are recorded as a redacted summary (a `type` action records how many characters were typed, never the text itself, and a URL has its query string and fragment blanked out) alongside a masked screen recording of the tabs it touched, with every input value masked, including passwords. Everything lives in the browser profile's own IndexedDB and never leaves the machine. Entries older than the retention period are pruned automatically, and at most 200 sessions are kept regardless of age.
+
+The options page lists sessions by label, working directory, pid, first and last seen, action count and tab count. Clicking one shows its action list and a replay player for each recorded tab, plus buttons to export that session as JSON or delete it.
+
+This is meant for oversight, not as tamper-proof forensic evidence. It's ordinary browser-profile storage, not a signed or write-once log.
+
+## Logs
+
+The native host and each MCP server keep their own JSON-lines log under `~/.config/open-claude-in-chrome/logs/` (`native-host.log` and `mcp-server.log`, folder mode `0700`, files mode `0600`). Entries are lifecycle events only, things like a hub starting, a client connecting, or a process exiting and why. Tool arguments and results are never written there. Each file is capped at about 1 MB and rotates to a single `.log.1` generation (for example `native-host.log.1`), so at most roughly 2 MB of history is kept per file. These logs are the only durable record of what the native host or an MCP server did between restarts, worth checking when something in Troubleshooting below doesn't explain itself.
 
 ## Updating After Code Changes
 
@@ -176,7 +232,7 @@ No build step. All files are plain JavaScript. After pulling or editing code:
 | `host/*.js` (`native-host.js`, `mcp-server.js`, `bridge-hub.js`, `bridge-client.js`, `bridge-endpoint.js`) | Restart the browser (new native host), then `pkill -f "node.*open-claude-in-chrome/host/mcp-server"` and `/mcp` in each Claude Code session |
 | `install.sh` or native host name changed | Re-run `./install.sh <extension-id>`, restart browser, re-add MCP |
 
-> Old and new versions of the bridge cannot talk to each other, so after changing anything under `host/`, refresh **both** sides: restart the browser (spawns a fresh native host) **and** `pkill` + `/mcp` in every session (spawns fresh MCP servers). Reloading the extension also picks up any new manifest permission (for example `downloads`, used by `save_to_disk`).
+> Old and new versions of the bridge cannot talk to each other, so after changing anything under `host/`, refresh **both** sides: restart the browser (spawns a fresh native host) **and** `pkill` + `/mcp` in every session (spawns fresh MCP servers). Reloading the extension also applies any manifest change (a dropped or added permission, a new options page, and so on).
 
 ### Quick reset (nuclear option)
 
@@ -199,7 +255,7 @@ pkill -f "node.*open-claude-in-chrome/host/mcp-server"
 
 ## Multiple Sessions
 
-Any number of Claude Code sessions can share the same browser. Each session's MCP server connects to the native host's bridge as an equal client, none of them owns the link, so one session ending never disconnects the others, and there is no "primary" to promote or lose.
+Any number of Claude Code sessions can share the same browser. Each session's MCP server connects to the native host's hub as an equal client. No client owns the link, so one session ending never disconnects the others, and none needs to be promoted when another exits.
 
 ## Troubleshooting
 
@@ -231,7 +287,7 @@ The MCP server is running but no native host is attached. Check, in order:
 
 ### Socket permission error
 
-The native host refuses to serve the bridge, and logs the reason, when the directory `~/.config/open-claude-in-chrome/run` is a symlink, not owned by you, or open to other users (anything but mode `0700`). Remove or fix the directory so the native host can recreate it correctly, then restart the browser.
+The native host creates `~/.config/open-claude-in-chrome/run` with mode `0700` each time it starts, and tightens it back to `0700` automatically if it finds looser permissions there, as long as the directory is a real directory you own. It refuses to serve the bridge instead, and logs why, only when the path genuinely isn't usable: a symlink, a plain file, a directory owned by someone else, or a parent directory it cannot create or reach at all. Remove or fix whatever is at that path (or its parent), then restart the browser.
 
 ## License
 
