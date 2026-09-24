@@ -1,0 +1,52 @@
+[
+  {
+    "type": 4,
+    "timestamp": 1000,
+    "data": { "href": "https://example.test/fixture", "width": 1024, "height": 768 }
+  },
+  {
+    "type": 2,
+    "timestamp": 1000,
+    "data": {
+      "initialOffset": { "left": 0, "top": 0 },
+      "node": {
+        "type": 0,
+        "id": 1,
+        "childNodes": [
+          { "type": 1, "id": 2, "name": "html", "publicId": "", "systemId": "" },
+          {
+            "type": 2,
+            "id": 3,
+            "tagName": "html",
+            "attributes": {},
+            "childNodes": [
+              { "type": 2, "id": 4, "tagName": "head", "attributes": {}, "childNodes": [] },
+              {
+                "type": 2,
+                "id": 5,
+                "tagName": "body",
+                "attributes": {},
+                "childNodes": [
+                  {
+                    "type": 2,
+                    "id": 6,
+                    "tagName": "div",
+                    "attributes": { "id": "app" },
+                    "childNodes": [
+                      { "type": 3, "id": 7, "textContent": "hand-made fixture" }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": 3,
+    "timestamp": 2000,
+    "data": { "source": 3, "id": 5, "x": 0, "y": 10 }
+  }
+]
