@@ -15,11 +15,18 @@ test("parallel first calls on a cold tab attach once and both succeed", async ()
 });
 
 test("a second caller joins the pending attach and does not resolve before the override settles", async () => {
+  let releaseOverride;
+  const overrideGate = new Promise((resolve) => { releaseOverride = resolve; });
+  let signalEnteredOverride;
+  const enteredOverride = new Promise((resolve) => { signalEnteredOverride = resolve; });
   const bg = await loadBackground({
     overrides: {
       debugger: {
         sendCommand: async (t, method) => {
-          if (method === "Emulation.setDeviceMetricsOverride") await new Promise((r) => setTimeout(r, 100));
+          if (method === "Emulation.setDeviceMetricsOverride") {
+            signalEnteredOverride();
+            await overrideGate;
+          }
           return {};
         },
       },
@@ -27,11 +34,11 @@ test("a second caller joins the pending attach and does not resolve before the o
   });
   const ensureAttached = bg.get("ensureAttached");
   const first = ensureAttached(bg.tabId);
-  await new Promise((r) => setTimeout(r, 50));
+  await enteredOverride; // attach() has resolved; we're now blocked inside the override
   let secondResolved = false;
   const second = ensureAttached(bg.tabId).then(() => { secondResolved = true; });
-  await new Promise((r) => setTimeout(r, 30));
   assert.equal(secondResolved, false);
+  releaseOverride();
   await first;
   await second;
   assert.equal(secondResolved, true);
@@ -102,6 +109,8 @@ test("real Chrome: the viewport follows a window resize and screenshots stay 1x 
 test("real Chrome: close() removes the profile directory", { skip: !chromeAvailable }, async () => {
   const browser = await launchChrome();
   const { profile } = browser;
+  assert.equal(typeof profile, "string");
+  assert.equal(fs.existsSync(profile), true);
   await browser.close();
   assert.equal(fs.existsSync(profile), false);
   await browser.close(); // idempotent, must not throw or re-run the teardown
