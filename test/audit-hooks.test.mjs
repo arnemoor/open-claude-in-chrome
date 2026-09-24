@@ -180,13 +180,77 @@ test("recorder events go to the tab's owning session and are dropped for an unow
   bg.deliver({ type: "tool_request", id: "1.s1.1", tool: "gif_creator", args: { tabId: 42 }, session: SESSION });
   await flush();
 
-  bg.chrome.runtime.onMessage.fire({ type: "auditRecorderEvents", events: [{ type: 2 }] }, { tab: { id: 42 } }, () => {});
-  bg.chrome.runtime.onMessage.fire({ type: "auditRecorderEvents", events: [{ type: 2 }] }, { tab: { id: 999 } }, () => {}); // no owner
+  bg.chrome.runtime.onMessage.fire({ type: "ocic_audit_events", events: [{ type: 2 }] }, { id: bg.chrome.runtime.id, tab: { id: 42 } }, () => {});
+  bg.chrome.runtime.onMessage.fire({ type: "ocic_audit_events", events: [{ type: 2 }] }, { id: bg.chrome.runtime.id, tab: { id: 999 } }, () => {}); // no owner
   await flush();
 
   const addEventsCalls = fakeStore.calls.filter((c) => c[0] === "addEvents");
   assert.equal(addEventsCalls.length, 1);
   assert.deepEqual(addEventsCalls[0], ["addEvents", "s1", 42, [{ type: 2 }]]);
+});
+
+test("recorder events are ignored unless sender.id matches the extension and sender.tab is set", async () => {
+  const fakeStore = makeFakeStore();
+  const bg = await loadBackground({ beforeRun: injectFakeStore(fakeStore) });
+  await flush();
+  await bg.chrome.storage.local.set({ audit: { enabled: true, retentionDays: 7 } });
+
+  bg.deliver({ type: "tool_request", id: "1.s1.1", tool: "gif_creator", args: { tabId: 42 }, session: SESSION });
+  await flush();
+
+  bg.chrome.runtime.onMessage.fire({ type: "ocic_audit_events", events: [{ type: 2 }] }, { id: "some-other-extension", tab: { id: 42 } }, () => {});
+  bg.chrome.runtime.onMessage.fire({ type: "ocic_audit_events", events: [{ type: 2 }] }, { id: bg.chrome.runtime.id }, () => {}); // no sender.tab
+  await flush();
+
+  assert.deepEqual(fakeStore.calls.filter((c) => c[0] === "addEvents"), []);
+});
+
+test("ensureRecorder checks then injects the recorder before and after an audited action with a tabId, only while enabled", async () => {
+  const fakeStore = makeFakeStore();
+  const bg = await loadBackground({ beforeRun: injectFakeStore(fakeStore) });
+  await flush();
+
+  // Disabled: no injection attempts at all.
+  bg.deliver({ type: "tool_request", id: "1.s1.1", tool: "gif_creator", args: { tabId: bg.tabId }, session: SESSION });
+  await flush();
+  assert.deepEqual(bg.calls.filter((c) => c[0] === "scripting.executeScript"), []);
+
+  await bg.chrome.storage.local.set({ audit: { enabled: true, retentionDays: 7 } });
+  bg.deliver({ type: "tool_request", id: "1.s1.2", tool: "gif_creator", args: { tabId: bg.tabId }, session: SESSION });
+  await flush();
+
+  // Before and after the action: a presence check, then — since the fake always
+  // reports "not present" (scripting.executeScript resolves to []) — an injection of
+  // the vendor bundle and recorder.js, each into the same tab's ISOLATED world.
+  const injections = bg.calls.filter((c) => c[0] === "scripting.executeScript").map((c) => c[1]);
+  assert.equal(injections.length, 4);
+  const [check1, inject1, check2, inject2] = injections;
+  for (const call of injections) {
+    assert.equal(call.target.tabId, bg.tabId);
+    assert.equal(call.world, "ISOLATED");
+  }
+  // Spread into a plain array first: inject*.files was built inside the vm context, so
+  // deepEqual against an array literal here would fail on realm identity, not content.
+  assert.equal(typeof check1.func, "function");
+  assert.deepEqual([...inject1.files], ["vendor/rrweb-record.min.js", "audit/recorder.js"]);
+  assert.equal(typeof check2.func, "function");
+  assert.deepEqual([...inject2.files], ["vendor/rrweb-record.min.js", "audit/recorder.js"]);
+});
+
+test("ensureRecorder swallows a scripting error instead of failing the tool call", async () => {
+  const fakeStore = makeFakeStore();
+  const bg = await loadBackground({
+    beforeRun: injectFakeStore(fakeStore),
+    overrides: { scripting: { executeScript: async () => { throw new Error("Cannot access a chrome:// URL"); } } },
+  });
+  await flush();
+  await bg.chrome.storage.local.set({ audit: { enabled: true, retentionDays: 7 } });
+
+  bg.deliver({ type: "tool_request", id: "1.s1.1", tool: "gif_creator", args: { tabId: bg.tabId }, session: SESSION });
+  await flush();
+
+  assert.equal(bg.posted.length, 1);
+  assert.equal(bg.posted[0].type, "tool_response");
 });
 
 test("the audit-prune alarm prunes with current settings only while enabled", async () => {

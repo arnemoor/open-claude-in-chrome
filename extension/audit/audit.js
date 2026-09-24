@@ -62,18 +62,46 @@ async function safeRecord(tool, args, ctx, outcome, ms) {
   }
 }
 
+// Makes sure the tab has a running rrweb recorder (Task 16), injecting
+// vendor/rrweb-record.min.js and audit/recorder.js only when one isn't already there.
+// No-op while audit is off. Errors (a chrome:// tab, a tab that just closed) are
+// swallowed: recording is best-effort and must never break the action it wraps.
+async function ensureRecorder(tabId) {
+  try {
+    const { enabled } = await settings();
+    if (!enabled) return;
+    const [check] = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "ISOLATED",
+      func: () => !!globalThis[Symbol.for("ocic.audit.recorder")],
+    });
+    if (check?.result) return;
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "ISOLATED",
+      files: ["vendor/rrweb-record.min.js", "audit/recorder.js"],
+    });
+  } catch {
+    // Best-effort only; see comment above.
+  }
+}
+
 function wrapHandlers(handlers) {
   for (const name of Object.keys(handlers)) {
     const original = handlers[name];
     handlers[name] = async function auditWrapped(args, ctx) {
+      const tabId = args && args.tabId != null ? args.tabId : null;
+      if (tabId != null) await ensureRecorder(tabId);
       const started = Date.now();
       let result;
       try {
         result = await original(args, ctx);
       } catch (err) {
+        if (tabId != null) await ensureRecorder(tabId);
         await safeRecord(name, args, ctx, `error: ${err.message}`, Date.now() - started);
         throw err;
       }
+      if (tabId != null) await ensureRecorder(tabId);
       await safeRecord(name, args, ctx, "ok", Date.now() - started);
       return result;
     };

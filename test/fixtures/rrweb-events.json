@@ -1,0 +1,151 @@
+[
+  {
+    "type": "ocic_audit_events",
+    "events": [
+      {
+        "type": 4,
+        "data": {
+          "href": "http://127.0.0.1:59707/",
+          "width": 1200,
+          "height": 713
+        },
+        "timestamp": 1790283493758
+      },
+      {
+        "type": 2,
+        "data": {
+          "node": {
+            "type": 0,
+            "childNodes": [
+              {
+                "type": 1,
+                "name": "html",
+                "publicId": "",
+                "systemId": "",
+                "id": 2
+              },
+              {
+                "type": 2,
+                "tagName": "html",
+                "attributes": {},
+                "childNodes": [
+                  {
+                    "type": 2,
+                    "tagName": "head",
+                    "attributes": {},
+                    "childNodes": [
+                      {
+                        "type": 2,
+                        "tagName": "title",
+                        "attributes": {},
+                        "childNodes": [
+                          {
+                            "type": 3,
+                            "textContent": "audit-recorder fixture",
+                            "id": 6
+                          }
+                        ],
+                        "id": 5
+                      }
+                    ],
+                    "id": 4
+                  },
+                  {
+                    "type": 2,
+                    "tagName": "body",
+                    "attributes": {},
+                    "childNodes": [
+                      {
+                        "type": 2,
+                        "tagName": "input",
+                        "attributes": {
+                          "id": "t"
+                        },
+                        "childNodes": [],
+                        "id": 8
+                      },
+                      {
+                        "type": 2,
+                        "tagName": "input",
+                        "attributes": {
+                          "id": "p",
+                          "type": "password"
+                        },
+                        "childNodes": [],
+                        "id": 9
+                      }
+                    ],
+                    "id": 7
+                  }
+                ],
+                "id": 3
+              }
+            ],
+            "id": 1
+          },
+          "initialOffset": {
+            "left": 0,
+            "top": 0
+          }
+        },
+        "timestamp": 1790283493761
+      },
+      {
+        "type": 3,
+        "data": {
+          "source": 2,
+          "type": 5,
+          "id": 8
+        },
+        "timestamp": 1790283493763
+      },
+      {
+        "type": 3,
+        "data": {
+          "source": 5,
+          "text": "***********",
+          "isChecked": false,
+          "id": 8
+        },
+        "timestamp": 1790283493765
+      },
+      {
+        "type": 3,
+        "data": {
+          "source": 2,
+          "type": 6,
+          "id": 8
+        },
+        "timestamp": 1790283493765
+      },
+      {
+        "type": 3,
+        "data": {
+          "source": 2,
+          "type": 5,
+          "id": 9
+        },
+        "timestamp": 1790283493765
+      },
+      {
+        "type": 3,
+        "data": {
+          "source": 5,
+          "text": "***********",
+          "isChecked": false,
+          "id": 9
+        },
+        "timestamp": 1790283493767
+      },
+      {
+        "type": 3,
+        "data": {
+          "source": 2,
+          "type": 6,
+          "id": 9
+        },
+        "timestamp": 1790283493767
+      }
+    ]
+  }
+]
