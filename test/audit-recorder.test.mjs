@@ -27,7 +27,7 @@ after(() => browser?.close());
 // actually relaying it to a background page.
 async function withRecorderPage(fn) {
   const server = http.createServer((req, res) => {
-    res.end(`<!doctype html><title>audit-recorder test</title><input id="t"><input id="p" type="password">`);
+    res.end(`<!doctype html><title>audit-recorder test</title><input id="t"><input id="p" type="password"><div id="ce" contenteditable="true"><p id="ce-p">existing</p></div>`);
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = server.address().port;
@@ -72,6 +72,38 @@ test("masks typed input and a password field, but still emits a full snapshot", 
     const sent = JSON.parse(sentJson);
     assert.ok(sent.length > 0, "expected at least one flushed batch");
     assert.ok(sent.every((m) => m.type === "ocic_audit_events"), "expected every message to carry the ocic_audit_events type");
+    const events = sent.flatMap((m) => m.events);
+    assert.ok(events.some((e) => e.type === 2), `expected a full snapshot (type 2) event among: ${events.map((e) => e.type)}`);
+  });
+});
+
+// CE (Review Focus 5 gap from Task 16): a contenteditable region is a real text
+// input just as much as <input>/<textarea> — maskAllInputs only covers form
+// controls, so anything typed into a contenteditable div (a rich-text editor, a
+// chat box) went out unmasked. #ce-p is nested one level inside #ce itself, to
+// prove the mask reaches nested text, not just the contenteditable host element.
+test("masks text typed into a contenteditable region, including nested elements", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  await withRecorderPage(async (page, world) => {
+    // <p> itself isn't focusable; focus the contenteditable host, then move the
+    // caret into the nested <p> via Selection/Range so Input.insertText lands there.
+    await page.evaluate(`
+      document.getElementById("ce").focus();
+      const range = document.createRange();
+      range.selectNodeContents(document.getElementById("ce-p"));
+      range.collapse(false);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+    `);
+    await page.send("Input.insertText", { text: "hunter2" });
+    await sleep(1500);
+
+    const sentJson = await world("JSON.stringify(globalThis.sent)");
+    assert.doesNotMatch(sentJson, /hunter2/);
+
+    // Still a real recording, not a blank/blocked element: a full snapshot must
+    // have gone out, same shape as the masked-input test above.
+    const sent = JSON.parse(sentJson);
     const events = sent.flatMap((m) => m.events);
     assert.ok(events.some((e) => e.type === 2), `expected a full snapshot (type 2) event among: ${events.map((e) => e.type)}`);
   });

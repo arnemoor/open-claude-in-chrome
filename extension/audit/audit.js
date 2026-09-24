@@ -4,122 +4,178 @@
 // store call is caught and logged, never rethrown to the caller.
 //
 // Settings are re-read on every call rather than cached, so a toggle from the
-// options page takes effect immediately without a service worker restart. And
-// as long as audit is disabled, nothing here ever calls into AuditStore — so the
-// "ocic-audit" IndexedDB database is not even created until the user opts in.
+// options page takes effect immediately without a service worker restart.
+// Classic script, loaded via importScripts; defines only globalThis.Audit
+// (wrapped in an IIFE so its many helpers can't collide with anything else in
+// the shared worker scope — see store.js for the same reasoning).
 
-const AUDIT_PRUNE_ALARM = "audit-prune";
-const AUDIT_MAX_SESSIONS = 200;
+(() => {
+  const AUDIT_PRUNE_ALARM = "audit-prune";
+  const AUDIT_MAX_SESSIONS = 200;
+  const AUDIT_ERROR_CLIP = 200;
 
-let store = null;
-const tabOwners = new Map(); // tabId -> sessionId, the last session to act on that tab
+  let store = null;
+  const tabOwners = new Map(); // tabId -> "<runId>.<session.id>", the last session to act on that tab
 
-async function settings() {
-  const { audit } = await chrome.storage.local.get("audit");
-  return { enabled: false, retentionDays: 7, ...audit };
-}
-
-async function runPrune() {
-  try {
-    const { enabled, retentionDays } = await settings();
-    if (!enabled) return;
-    await store.open();
-    await store.prune({ retentionDays, maxSessions: AUDIT_MAX_SESSIONS, now: Date.now() });
-  } catch (err) {
-    console.error("[audit] prune failed:", err);
+  async function settings() {
+    const { audit } = await chrome.storage.local.get("audit");
+    const enabled = !!(audit && audit.enabled);
+    // M7: a raw <select> value ("7") or a cleared field (undefined) must not
+    // silently disable age pruning — fall back to the 7-day default instead.
+    const rd = Number(audit && audit.retentionDays);
+    const retentionDays = Number.isFinite(rd) && rd > 0 ? rd : 7;
+    return { enabled, retentionDays };
   }
-}
 
-function init({ store: injected = AuditStore } = {}) {
-  store = injected;
-  runPrune();
-  chrome.alarms.create(AUDIT_PRUNE_ALARM, { periodInMinutes: 60 });
-  chrome.alarms.onAlarm.addListener((alarm) => {
-    if (alarm.name === AUDIT_PRUNE_ALARM) runPrune();
-  });
-}
-
-async function recordAction(tool, args, ctx, outcome, ms) {
-  const { enabled } = await settings();
-  if (!enabled) return;
-  const session = ctx && ctx.session;
-  if (!session) return; // unattributed request: record nothing
-
-  const tabId = args && args.tabId != null ? args.tabId : null;
-  if (tabId != null) tabOwners.set(tabId, session.id);
-
-  const ts = Date.now();
-  await store.open();
-  await store.upsertSession(session, ts);
-  await store.addAction({ sessionId: session.id, ts, tool, tabId, summary: auditSummary(tool, args), outcome, ms });
-}
-
-async function safeRecord(tool, args, ctx, outcome, ms) {
-  try {
-    await recordAction(tool, args, ctx, outcome, ms);
-  } catch (err) {
-    console.error("[audit] failed to record action:", err);
+  // I2: the hub numbers sessions from s1 again in every process (bridge-hub.js's
+  // counter resets on restart), so session.id alone is not a stable identity.
+  // ctx.requestId is "<runId>.<session>.<clientId>" and runId is 8 random hex
+  // characters per hub process, so "<runId>.<session.id>" never collides
+  // across a restart the way session.id alone does.
+  function sessionKey(ctx) {
+    const session = ctx && ctx.session;
+    if (!session || !session.id) return null;
+    const runId = String(ctx.requestId).split(".")[0];
+    return `${runId}.${session.id}`;
   }
-}
 
-// Makes sure the tab has a running rrweb recorder (Task 16), injecting
-// vendor/rrweb-record.min.js and audit/recorder.js only when one isn't already there.
-// No-op while audit is off. Errors (a chrome:// tab, a tab that just closed) are
-// swallowed: recording is best-effort and must never break the action it wraps.
-async function ensureRecorder(tabId) {
-  try {
+  // I3: prune whenever the "audit" key exists at all (enabled or not), so data
+  // recorded while it was on still gets cleaned up after the user switches it
+  // off. Only skip when the key is absent entirely — no opt-in yet means no
+  // database, and it keeps the vm tests (no storage at all) quiet.
+  async function runPrune() {
+    try {
+      const { audit } = await chrome.storage.local.get("audit");
+      if (!audit) return;
+      const { retentionDays } = await settings();
+      await store.open();
+      await store.prune({ retentionDays, maxSessions: AUDIT_MAX_SESSIONS, now: Date.now() });
+    } catch (err) {
+      console.error("[audit] prune failed:", err);
+    }
+  }
+
+  function init({ store: injected = AuditStore } = {}) {
+    store = injected;
+    runPrune();
+    chrome.alarms.create(AUDIT_PRUNE_ALARM, { periodInMinutes: 60 });
+    chrome.alarms.onAlarm.addListener((alarm) => {
+      if (alarm.name === AUDIT_PRUNE_ALARM) runPrune();
+    });
+  }
+
+  async function recordAction(tool, args, ctx, outcome, ms) {
     const { enabled } = await settings();
     if (!enabled) return;
-    const [check] = await chrome.scripting.executeScript({
-      target: { tabId },
-      world: "ISOLATED",
-      func: () => !!globalThis[Symbol.for("ocic.audit.recorder")],
-    });
-    if (check?.result) return;
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      world: "ISOLATED",
-      files: ["vendor/rrweb-record.min.js", "audit/recorder.js"],
-    });
-  } catch {
-    // Best-effort only; see comment above.
-  }
-}
+    const key = sessionKey(ctx);
+    if (!key) return; // unattributed request: record nothing
+    const session = ctx.session;
+    const tabId = args && args.tabId != null ? args.tabId : null;
 
-function wrapHandlers(handlers) {
-  for (const name of Object.keys(handlers)) {
-    const original = handlers[name];
-    handlers[name] = async function auditWrapped(args, ctx) {
-      const tabId = args && args.tabId != null ? args.tabId : null;
-      if (tabId != null) await ensureRecorder(tabId);
-      const started = Date.now();
-      let result;
-      try {
-        result = await original(args, ctx);
-      } catch (err) {
+    const ts = Date.now();
+    await store.open();
+    await store.upsertSession({ id: key, label: session.label, cwd: session.cwd, pid: session.pid }, ts);
+    await store.addAction({ sessionId: key, ts, tool, tabId, summary: auditSummary(tool, args), outcome, ms });
+  }
+
+  async function safeRecord(tool, args, ctx, outcome, ms) {
+    try {
+      await recordAction(tool, args, ctx, outcome, ms);
+    } catch (err) {
+      console.error("[audit] failed to record action:", err);
+    }
+  }
+
+  // Upserts the session row as soon as a call starts (not just when it finishes
+  // recording, in recordAction) so that a session's very first-ever action has
+  // a row to find almost immediately — closing most of the window in which
+  // onRecorderEvents' hasSession check (I4) could otherwise mistake "not
+  // created yet" for "deleted". Fire-and-forget, same reasoning as M2.
+  async function touchSession(key, session) {
+    try {
+      const { enabled } = await settings();
+      if (!enabled) return;
+      await store.open();
+      await store.upsertSession({ id: key, label: session.label, cwd: session.cwd, pid: session.pid }, Date.now());
+    } catch (err) {
+      console.error("[audit] failed to record session:", err);
+    }
+  }
+
+  // Makes sure the tab has a running rrweb recorder (Task 16), injecting
+  // vendor/rrweb-record.min.js and audit/recorder.js only when one isn't already there.
+  // No-op while audit is off. Errors (a chrome:// tab, a tab that just closed) are
+  // swallowed: recording is best-effort and must never break the action it wraps.
+  async function ensureRecorder(tabId) {
+    try {
+      const { enabled } = await settings();
+      if (!enabled) return;
+      const [check] = await chrome.scripting.executeScript({
+        target: { tabId },
+        world: "ISOLATED",
+        func: () => !!globalThis[Symbol.for("ocic.audit.recorder")],
+      });
+      if (check?.result) return;
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        world: "ISOLATED",
+        files: ["vendor/rrweb-record.min.js", "audit/recorder.js"],
+      });
+    } catch {
+      // Best-effort only; see comment above.
+    }
+  }
+
+  function wrapHandlers(handlers) {
+    for (const name of Object.keys(handlers)) {
+      const original = handlers[name];
+      handlers[name] = async function auditWrapped(args, ctx) {
+        const tabId = args && args.tabId != null ? args.tabId : null;
+        const key = sessionKey(ctx);
+        // M1: before the call (not after recordAction, which used to run only
+        // once the whole handler had already returned) — otherwise a recorder
+        // batch that arrives mid-call, or from a different session reusing a
+        // tab another session last owned, finds no owner yet, or the wrong one.
+        if (tabId != null && key) tabOwners.set(tabId, key);
+        if (key) touchSession(key, ctx.session);
         if (tabId != null) await ensureRecorder(tabId);
-        await safeRecord(name, args, ctx, `error: ${err.message}`, Date.now() - started);
-        throw err;
-      }
-      if (tabId != null) await ensureRecorder(tabId);
-      await safeRecord(name, args, ctx, "ok", Date.now() - started);
-      return result;
-    };
+        const started = Date.now();
+        let result;
+        try {
+          result = await original(args, ctx);
+        } catch (err) {
+          if (tabId != null) await ensureRecorder(tabId);
+          // M2: fire-and-forget — safeRecord never rejects (its own try/catch
+          // guarantees that), and a stalled store write must never delay the
+          // tool's actual response to the host.
+          safeRecord(name, args, ctx, `error: ${scrubUrls(String(err.message), AUDIT_ERROR_CLIP)}`, Date.now() - started);
+          throw err;
+        }
+        if (tabId != null) await ensureRecorder(tabId);
+        safeRecord(name, args, ctx, "ok", Date.now() - started);
+        return result;
+      };
+    }
+    return handlers;
   }
-  return handlers;
-}
 
-async function onRecorderEvents(tabId, events) {
-  try {
-    const { enabled } = await settings();
-    if (!enabled) return;
-    const sessionId = tabOwners.get(tabId);
-    if (!sessionId) return; // no owner for this tab: drop
-    await store.open();
-    await store.addEvents(sessionId, tabId, events || []);
-  } catch (err) {
-    console.error("[audit] failed to record recorder events:", err);
+  async function onRecorderEvents(tabId, events) {
+    try {
+      const { enabled } = await settings();
+      if (!enabled) return;
+      const key = tabOwners.get(tabId);
+      if (!key) return; // no owner for this tab: drop
+      await store.open();
+      // I4: the owning session's row may be gone (pruned, or deleted from the
+      // options page) even though the in-memory tab-ownership map still
+      // remembers it — don't resurrect an orphan row, and forget the mapping
+      // so it isn't rechecked on every future batch for this tab.
+      if (!(await store.hasSession(key))) { tabOwners.delete(tabId); return; }
+      await store.addEvents(key, tabId, events || []);
+    } catch (err) {
+      console.error("[audit] failed to record recorder events:", err);
+    }
   }
-}
 
-globalThis.Audit = { init, wrapHandlers, onRecorderEvents, settings };
+  globalThis.Audit = { init, wrapHandlers, onRecorderEvents, settings };
+})();

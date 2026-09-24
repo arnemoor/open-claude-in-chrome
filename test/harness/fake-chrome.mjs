@@ -52,7 +52,7 @@ export async function loadBackground({ page = null, content = null, tab = {}, wi
   const GROUP_ID = 7;
   const attached = new Set();
   const chrome = {
-    alarms: { create() {}, clear: async () => true, onAlarm: event() },
+    alarms: { create: (name, opts) => { calls.push(["alarms.create", name, opts]); }, clear: async () => true, onAlarm: event() },
     runtime: {
       id: "testextensionid",
       lastError: null,
