@@ -616,7 +616,27 @@ function normalizeNavigateUrl(input, ownExtensionId) {
     return { error: `Invalid URL: "${input}". Could not parse as a valid URL.` };
   }
 
-  if (parsed.protocol === "chrome-extension:" && parsed.hostname === ownExtensionId) {
+  // view-source: and blob: can wrap another URL, and Chrome resolves that inner URL in the
+  // wrapper's own context — including the extension's own origin for a wrapped
+  // chrome-extension: URL — so unwrap before the own-id check below. An inner URL that
+  // fails to parse just stops the unwrap; it isn't an error by itself (the outer URL, e.g.
+  // view-source:https://..., is still valid).
+  let inner = parsed;
+  while (inner.protocol === "view-source:" || inner.protocol === "blob:") {
+    let next;
+    try {
+      next = new URL(inner.href.slice(inner.protocol.length));
+    } catch {
+      break;
+    }
+    inner = next;
+  }
+
+  // Node's URL parser leaves a non-special scheme's host case as-is, but Chrome lowercases
+  // it when it canonicalizes a chrome-extension: URL, so compare against the lowercased
+  // host. (Percent-encoded and extra-slash host variants rely on that same browser
+  // canonicalization and aren't covered by this in-process check.)
+  if (inner.protocol === "chrome-extension:" && inner.hostname.toLowerCase() === ownExtensionId) {
     return { error: "This extension's own pages cannot be opened by the agent." };
   }
 
@@ -662,6 +682,7 @@ const toolHandlers = {
     if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
 
     const FILE_URL_HINT = ` To open local files, enable "Allow access to file URLs" for Open Claude in Chrome in chrome://extensions.`;
+    const FILE_URL_RE = /^file:/i;
     let targetUrl = null;
     if (url === "back") {
       await chrome.tabs.goBack(tabId);
@@ -679,7 +700,7 @@ const toolHandlers = {
         let message = err.message;
         if (!message.endsWith(".")) message += ".";
         let text = `Could not navigate to ${targetUrl}: ${message}`;
-        if (targetUrl.startsWith("file:")) text += FILE_URL_HINT;
+        if (FILE_URL_RE.test(targetUrl)) text += FILE_URL_HINT;
         return { content: [{ type: "text", text }] };
       }
     }
@@ -706,7 +727,7 @@ const toolHandlers = {
     const loading = tab.status !== "complete" ? " (still loading)" : "";
     let text = `Navigated to ${tab.url}${loading}.\n## Pages\n` +
       tabs.map((t, i) => `${i + 1}: ${t.url}${t.id === tabId ? " [selected]" : ""}`).join("\n");
-    if (targetUrl && targetUrl.startsWith("file:") && !tab.url.startsWith("file:")) text += FILE_URL_HINT;
+    if (targetUrl && FILE_URL_RE.test(targetUrl) && !tab.url.startsWith("file:")) text += FILE_URL_HINT;
 
     return { content: [{ type: "text", text }] };
   },
