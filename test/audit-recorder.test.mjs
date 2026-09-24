@@ -27,7 +27,7 @@ after(() => browser?.close());
 // actually relaying it to a background page.
 async function withRecorderPage(fn, { skipRecorderEval = false } = {}) {
   const server = http.createServer((req, res) => {
-    res.end(`<!doctype html><title>audit-recorder test</title><input id="t"><input id="p" type="password"><div id="c" contenteditable="true"></div><div id="ce" contenteditable="true"><p id="ce-p">existing</p></div><input type="hidden" id="h1" name="csrf" value="HIDDENLOAD111"><input type="hidden" id="h2" value="">`);
+    res.end(`<!doctype html><title>audit-recorder test</title><input id="t"><input id="p" type="password"><div id="c" contenteditable="true"></div><div id="ce" contenteditable="true"><p id="ce-p">existing</p></div><input type="hidden" id="h1" name="csrf" value="HIDDENLOAD111"><input type="hidden" id="h2" value=""><textarea id="ta">TEXTAREADEFAULT1</textarea>`);
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = server.address().port;
@@ -182,6 +182,23 @@ test("hidden inputs never appear, present at load, set by script, or added later
   });
 });
 
+// Fix round 2, T16 I1 (partial): a textarea's prefilled text, cleared by script
+// before the recorder starts, is serialized as a plain child text node (rrweb
+// writes no `value` attribute when the live value is empty), so the walker's
+// value-attribute masking never sees it. maskTextSelector now also matches
+// `textarea`, so rrweb's own text-node masking (the same mechanism that
+// already covers contenteditable) catches it instead.
+test("a cleared prefilled textarea's original text is masked", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  await withRecorderPage(async (page, world) => {
+    await page.evaluate(`document.getElementById("ta").value = "";`);
+    await world(RECORDER_JS);
+    await sleep(1500);
+
+    const sentJson = await world("JSON.stringify(globalThis.sent)");
+    assert.doesNotMatch(sentJson, /TEXTAREADEFAULT1/);
+  }, { skipRecorderEval: true });
+});
+
 // M3: a back/forward-cache restore resumes the same recorder instance (the
 // page's JS state survives bfcache) with no full snapshot of its own, so the
 // stored stream would otherwise have no base for the replayer to apply later
@@ -203,6 +220,30 @@ test("a persisted pageshow event triggers a fresh full snapshot", { skip: !chrom
     await sleep(1500);
     const persisted = JSON.parse(await world("JSON.stringify(globalThis.sent)")).flatMap((m) => m.events);
     assert.ok(persisted.some((e) => e.type === 2), `expected a fresh full snapshot after a persisted pageshow, got types: ${persisted.map((e) => e.type)}`);
+  });
+});
+
+// New Minor 1 (fix round 2): a second, redundant injection into a document
+// that already records (e.g. two concurrent audited calls each deciding "not
+// present yet" before either's injection lands, now that the after-hook isn't
+// awaited) re-evaluates the vendor bundle and replaces globalThis.rrwebRecord.
+// recorder.js's own idempotence guard makes a second evaluation of ITSELF a
+// no-op, but the vendor bundle has no such guard — so the pageshow handler
+// must not resolve `record`/`record.takeFullSnapshot` through that global at
+// event time, or a later persisted pageshow throws against the fresh,
+// never-started module instance and takes no snapshot.
+test("a second vendor-bundle injection does not break a later persisted pageshow resnapshot", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  await withRecorderPage(async (page, world) => {
+    await sleep(1500);
+    await world("globalThis.sent = [];");
+
+    await world(VENDOR_JS); // a stray re-injection of just the vendor half
+
+    await world(`window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true }))`);
+    await sleep(1500);
+
+    const events = JSON.parse(await world("JSON.stringify(globalThis.sent)")).flatMap((m) => m.events);
+    assert.ok(events.some((e) => e.type === 2), `expected a fresh full snapshot despite the stray vendor re-injection, got types: ${events.map((e) => e.type)}`);
   });
 });
 

@@ -230,7 +230,10 @@ test("recorder events for a tab whose owning session no longer exists are droppe
   fakeStore.sessions.delete("1.s1"); // simulate the session row having been pruned/deleted
 
   bg.chrome.runtime.onMessage.fire({ type: "ocic_audit_events", events: [{ type: 2 }] }, { id: bg.chrome.runtime.id, tab: { id: 42 }, frameId: 0 }, () => {});
-  await flush();
+  // Long enough for the owner-was-set-recently retry (fix round 2, New Minor
+  // 2) to fire and find the row still gone, so this assertion reflects the
+  // settled outcome, not an in-flight retry.
+  await flush(700);
 
   assert.deepEqual(fakeStore.calls.filter((c) => c[0] === "addEvents"), []);
 });
@@ -613,4 +616,97 @@ test("audit.js exposes only globalThis.Audit, not its internal helpers", async (
   const leaked = ["settings", "runPrune", "recordAction", "safeRecord", "wrapHandlers", "onRecorderEvents", "ensureRecorder", "sessionKey", "tabOwners"]
     .filter((name) => bg.get(`typeof ${name}`) !== "undefined");
   assert.deepEqual(leaked, []);
+});
+
+// Fix round 2, T16 I1+I2 (partial): nothing pinned redactEvents' own wiring
+// into onRecorderEvents — a mutation run removing that call left every
+// existing hooks test green. This sends a hand-built batch (a raw hidden-input
+// value, a cleared password's raw value attribute, a Meta href with a query
+// and fragment, and a URL attribute with a query) straight through
+// onMessage.fire, the same path a real recorder's batch takes, and asserts on
+// what the fake store actually received.
+test("recorder events are redacted (hidden value, cleared value, Meta href, URL attribute) before being stored", async () => {
+  const fakeStore = makeFakeStore();
+  const bg = await loadBackground({ beforeRun: injectFakeStore(fakeStore) });
+  await flush();
+  await bg.chrome.storage.local.set({ audit: { enabled: true, retentionDays: 7 } });
+
+  bg.deliver({ type: "tool_request", id: "1.s1.1", tool: "gif_creator", args: { tabId: 42 }, session: SESSION });
+  await flush();
+
+  const rawEvents = [
+    { type: 4, data: { href: "http://x.test/a?token=SECRETQ#access_token=SECRETF" } },
+    {
+      type: 2,
+      data: {
+        node: {
+          type: 0, id: 1, childNodes: [
+            { type: 2, tagName: "input", attributes: { type: "hidden", value: "HIDDENRAW1" }, id: 2, childNodes: [] },
+            { type: 2, tagName: "input", attributes: { type: "password", value: "CLEAREDRAW2" }, id: 3, childNodes: [] },
+            { type: 2, tagName: "a", attributes: { href: "https://x.test/reset?token=abc" }, id: 4, childNodes: [] },
+          ],
+        },
+      },
+    },
+  ];
+  bg.chrome.runtime.onMessage.fire({ type: "ocic_audit_events", events: rawEvents }, { id: bg.chrome.runtime.id, tab: { id: 42 }, frameId: 0 }, () => {});
+  await flush();
+
+  const addEventsCall = fakeStore.calls.find((c) => c[0] === "addEvents");
+  assert.ok(addEventsCall, "expected addEvents to be called");
+  const storedJson = JSON.stringify(addEventsCall[3]);
+  assert.doesNotMatch(storedJson, /HIDDENRAW1/);
+  assert.doesNotMatch(storedJson, /CLEAREDRAW2/);
+  assert.doesNotMatch(storedJson, /SECRETQ|SECRETF/);
+  assert.doesNotMatch(storedJson, /token=abc/);
+});
+
+// New Minor 2 (fix round 2): the owner is set synchronously, but touchSession
+// writes the session row asynchronously — a batch landing in that narrow
+// window used to fail hasSession, get dropped, and delete the tab's owner, so
+// every later batch for that tab (including a new document's full snapshot
+// after a navigate) was dropped too. Retrying once, half a second later,
+// closes that window for any owner set in roughly the last 10s.
+test("a recorder batch that arrives before the session row is written is retried once, not dropped", async () => {
+  const fakeStore = makeFakeStore();
+  let hasSessionCalls = 0;
+  fakeStore.hasSession = async () => {
+    hasSessionCalls++;
+    return hasSessionCalls > 1; // false the first time (row not written yet), true after
+  };
+  const bg = await loadBackground({ beforeRun: injectFakeStore(fakeStore) });
+  await flush();
+  await bg.chrome.storage.local.set({ audit: { enabled: true, retentionDays: 7 } });
+
+  bg.deliver({ type: "tool_request", id: "1.s1.1", tool: "gif_creator", args: { tabId: 42 }, session: SESSION });
+  await flush(); // owner set
+
+  bg.chrome.runtime.onMessage.fire({ type: "ocic_audit_events", events: [{ type: 2 }] }, { id: bg.chrome.runtime.id, tab: { id: 42 }, frameId: 0 }, () => {});
+  await flush(700); // long enough for the ~500ms retry to actually elapse
+
+  assert.ok(hasSessionCalls >= 2, "expected a retry, not just one hasSession check");
+  const addEventsCalls = fakeStore.calls.filter((c) => c[0] === "addEvents");
+  assert.equal(addEventsCalls.length, 1, "expected the batch to be stored once the retry found the row");
+});
+
+// New Minor 3 (fix round 2): tabOwners and the walker's per-tab tag map were
+// never cleared when a tab closed, growing unboundedly (the tag map holds one
+// entry per element — tens of thousands on a large page) for as long as the
+// worker stays alive.
+test("the tab owner is forgotten when the tab closes, so a later batch for it is dropped", async () => {
+  const fakeStore = makeFakeStore();
+  const bg = await loadBackground({ beforeRun: injectFakeStore(fakeStore) });
+  await flush();
+  await bg.chrome.storage.local.set({ audit: { enabled: true, retentionDays: 7 } });
+
+  bg.deliver({ type: "tool_request", id: "1.s1.1", tool: "gif_creator", args: { tabId: 42 }, session: SESSION });
+  await flush();
+
+  bg.chrome.tabs.onRemoved.fire(42);
+  await flush();
+
+  bg.chrome.runtime.onMessage.fire({ type: "ocic_audit_events", events: [{ type: 2 }] }, { id: bg.chrome.runtime.id, tab: { id: 42 }, frameId: 0 }, () => {});
+  await flush();
+
+  assert.deepEqual(fakeStore.calls.filter((c) => c[0] === "addEvents"), []);
 });

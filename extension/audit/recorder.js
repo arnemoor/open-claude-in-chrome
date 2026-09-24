@@ -42,16 +42,29 @@
     else if (timer === null) timer = setTimeout(flush, FLUSH_MS);
   }
 
-  globalThis.rrwebRecord.record({
+  // Captured once, at start, rather than read from globalThis.rrwebRecord at
+  // event time (New Minor 1, fix round 2): a second, redundant injection into a
+  // document that already records (two concurrent audited calls each deciding
+  // "not present yet" before either's injection lands, now that the after-hook
+  // isn't awaited) re-evaluates the vendor bundle and replaces that global with
+  // a fresh, never-started module instance. This closure's own reference keeps
+  // pointing at the module that is actually recording, so the pageshow handler
+  // below still works after such a stray re-injection.
+  const record = globalThis.rrwebRecord.record;
+
+  record({
     emit: onEmit,
     maskAllInputs: true,
     maskInputOptions: { password: true },
     // maskAllInputs covers form controls only. Contenteditable regions (rich-text
-    // editors, chat boxes) hold typed text as DOM text, so mask them too. The selector
-    // matches the host element: rrweb checks the element itself and, for mutations,
-    // every ancestor via closest(), so nested text and text typed straight into an
-    // empty host are both covered.
-    maskTextSelector: '[contenteditable]:not([contenteditable="false"])',
+    // editors, chat boxes) and a textarea's original, cleared-by-script text (which
+    // rrweb serializes as a plain child text node once the live value is empty, not
+    // an attribute — the same gap maskAllInputs itself has for other cleared fields,
+    // closed for those by the walker instead, see I1 below) hold text as DOM text, so
+    // mask them too. Each selector matches the host element itself: rrweb checks the
+    // element and, for mutations, every ancestor via closest(), so nested text and
+    // text typed straight into an empty host are both covered.
+    maskTextSelector: '[contenteditable]:not([contenteditable="false"]), textarea',
     // I1: maskAllInputs only overwrites `value` with the masked live value when
     // that value is non-empty, so a hidden input's raw HTML value attribute
     // (a CSRF token, one set by a script, one present in markup) would
@@ -85,6 +98,6 @@
   // straight from an earlier page's snapshot to this one's increments, with no
   // base for the replayer to apply them onto.
   window.addEventListener("pageshow", (event) => {
-    if (event.persisted) globalThis.rrwebRecord.record.takeFullSnapshot();
+    if (event.persisted) record.takeFullSnapshot();
   });
 })();

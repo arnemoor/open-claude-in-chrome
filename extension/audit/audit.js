@@ -15,6 +15,8 @@
   const AUDIT_ERROR_CLIP = 200;
   const ENSURE_RECORDER_PROBE_TIMEOUT_MS = 300;
   const ENSURE_RECORDER_INJECT_TIMEOUT_MS = 2000;
+  const RECENT_OWNER_WINDOW_MS = 10000;
+  const OWNER_ROW_RETRY_DELAY_MS = 500;
 
   let store = null;
   // I5 (plan-mandated): which tabs may be recorded at all, e.g. background's own
@@ -22,6 +24,7 @@
   // tests, and any future caller) keep today's behaviour.
   let isTabAllowed = async () => true;
   const tabOwners = new Map(); // tabId -> "<runId>.<session.id>", the last session to act on that tab
+  const tabOwnerSetAt = new Map(); // tabId -> Date.now() when tabOwners was last set, for the retry below
   const knownTagsByTab = new Map(); // tabId -> Map(rrweb node id -> lowercase tagName), for redactEvents (I1)
 
   async function settings() {
@@ -69,6 +72,14 @@
     chrome.alarms.create(AUDIT_PRUNE_ALARM, { periodInMinutes: 60 });
     chrome.alarms.onAlarm.addListener((alarm) => {
       if (alarm.name === AUDIT_PRUNE_ALARM) runPrune();
+    });
+    // New Minor 3 (fix round 2): tabOwners, tabOwnerSetAt and knownTagsByTab
+    // otherwise grow for as long as the worker stays alive — knownTagsByTab in
+    // particular holds one entry per element, tens of thousands on a large page.
+    chrome.tabs.onRemoved.addListener((tabId) => {
+      tabOwners.delete(tabId);
+      tabOwnerSetAt.delete(tabId);
+      knownTagsByTab.delete(tabId);
     });
   }
 
@@ -177,7 +188,7 @@
         // once the whole handler had already returned) — otherwise a recorder
         // batch that arrives mid-call, or from a different session reusing a
         // tab another session last owned, finds no owner yet, or the wrong one.
-        if (allowed && key) tabOwners.set(tabId, key);
+        if (allowed && key) { tabOwners.set(tabId, key); tabOwnerSetAt.set(tabId, Date.now()); }
         if (key) touchSession(key, ctx.session);
         if (allowed) await ensureRecorder(tabId);
         const started = Date.now();
@@ -205,6 +216,22 @@
     return handlers;
   }
 
+  // New Minor 2 (fix round 2): the owner is set synchronously in wrapHandlers,
+  // but touchSession's row write is fire-and-forget and can still be in
+  // flight. A batch landing in that narrow window used to fail hasSession, get
+  // dropped, and delete the tab's owner — dropping every later batch for that
+  // tab too (including a new document's full snapshot after a navigate).
+  // Retried once, half a second later, but only when the owner was set
+  // recently: a row that is still missing long after ownership was set really
+  // is gone (pruned, or deleted from the options page), not just delayed.
+  async function hasSessionWithRetry(tabId, key) {
+    if (await store.hasSession(key)) return true;
+    const setAt = tabOwnerSetAt.get(tabId);
+    if (setAt == null || Date.now() - setAt >= RECENT_OWNER_WINDOW_MS) return false;
+    await new Promise((resolve) => setTimeout(resolve, OWNER_ROW_RETRY_DELAY_MS));
+    return store.hasSession(key);
+  }
+
   async function onRecorderEvents(tabId, events) {
     try {
       const { enabled } = await settings();
@@ -216,7 +243,7 @@
       // options page) even though the in-memory tab-ownership map still
       // remembers it — don't resurrect an orphan row, and forget the mapping
       // so it isn't rechecked on every future batch for this tab.
-      if (!(await store.hasSession(key))) { tabOwners.delete(tabId); return; }
+      if (!(await hasSessionWithRetry(tabId, key))) { tabOwners.delete(tabId); return; }
       // I1/I2: redact hidden-input/cleared-value leftovers and URL-bearing
       // attributes before they are ever written to disk, in the worker, so a
       // recorder in any document cannot bypass it. knownTags is kept per tab

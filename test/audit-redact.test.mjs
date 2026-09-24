@@ -206,6 +206,56 @@ test("javascript_tool masks double-quoted and template literal contents, honorin
   assert.doesNotMatch(s3, /secret/);
 });
 
+// Fix round 2, T15 I5 (partial): a quote inside a comment or a regex literal
+// used to desynchronize the scanner, so a later, real string literal was
+// emitted as code instead of masked.
+test("javascript_tool: an apostrophe inside a // comment does not desynchronize the scanner", () => {
+  const { auditSummary } = load();
+  const code = "// fill in the user's password\ndocument.querySelector('#pw').value = 'S3cr3tA';";
+  const s = auditSummary("javascript_tool", { text: code });
+  assert.doesNotMatch(s, /S3cr3tA/);
+  assert.match(s, /^\/\/ fill in the user's password\n/, "the comment itself must survive verbatim");
+});
+
+test("javascript_tool: an apostrophe inside a /* */ block comment does not desynchronize the scanner", () => {
+  const { auditSummary } = load();
+  const code = "/* the user's token */ pw.value = 'S3cr3tB';";
+  const s = auditSummary("javascript_tool", { text: code });
+  assert.doesNotMatch(s, /S3cr3tB/);
+  assert.match(s, /^\/\* the user's token \*\/ /);
+});
+
+test("javascript_tool: a quote inside a regex literal does not desynchronize the scanner", () => {
+  const { auditSummary } = load();
+  const s3 = auditSummary("javascript_tool", { text: `s = s.replace(/"/g, ''); pw.value = "S3cr3tC";` });
+  assert.doesNotMatch(s3, /S3cr3tC/);
+  const s4 = auditSummary("javascript_tool", { text: `t = t.replace(/'/g, ''); pw.value = 'S3cr3tD';` });
+  assert.doesNotMatch(s4, /S3cr3tD/);
+});
+
+test("javascript_tool: division is not mistaken for a regex literal", () => {
+  const { auditSummary } = load();
+  // "a / 2" after an identifier is division; a stray "/2" scanned as a regex
+  // opener would swallow everything up to the next "/" (here, none exists,
+  // which would trip the fail-closed path and hide "b" and "secret").
+  const s = auditSummary("javascript_tool", { text: `let a = width / 2; let b = 'secret';` });
+  assert.doesNotMatch(s, /secret/);
+  assert.match(s, /width \/ 2;/, "division must be left as ordinary code, not treated as a regex");
+});
+
+test("javascript_tool: a template literal nested inside another's ${} does not leak", () => {
+  const { auditSummary } = load();
+  const s = auditSummary("javascript_tool", { text: "const h = `Authorization: ${`Bearer S3cr3tE`}`;" });
+  assert.doesNotMatch(s, /S3cr3tE/);
+});
+
+test("javascript_tool: an unterminated string is masked to the end, not echoed as code", () => {
+  const { auditSummary } = load();
+  const s = auditSummary("javascript_tool", { text: `pw.value = 'never closes and the rest of the file is EOFSECRET` });
+  assert.doesNotMatch(s, /EOFSECRET/);
+  assert.match(s, /^pw\.value = '\[\d+ chars\]$/);
+});
+
 // --- file_upload ---
 
 test("file_upload keeps paths, since they are audit-relevant", () => {
@@ -297,6 +347,28 @@ test("scrubUrls leaves plain text with no URL untouched (aside from clipping)", 
   assert.equal(scrubUrls("Not attached to tab", 200), "Not attached to tab");
 });
 
+// Fix round 2, pulled in from the re-review: scrubUrls used to stop matching a
+// URL at ")" or "'", both of which are valid, unencoded query/fragment
+// characters — so a query like "?code=abc)SECRET" kept "SECRET" verbatim.
+test("scrubUrls consumes ) and ' inside a query or fragment, not just up to them", () => {
+  const { scrubUrls } = load();
+  const s = scrubUrls('Cannot access "https://bank.test/cb?code=abc)PARENSECRET#frag\'more"', 300);
+  assert.doesNotMatch(s, /PARENSECRET/);
+});
+
+test("scrubUrls still stops a bare URL (no query) at a closing paren, e.g. a parenthetical", () => {
+  const { scrubUrls } = load();
+  const s = scrubUrls("(see https://x.test/page)", 300);
+  assert.equal(s, "(see https://x.test/page)");
+});
+
+test("scrubUrls replaces a data: URL with its length, the same way navigate's own data: rule does", () => {
+  const { scrubUrls } = load();
+  const s = scrubUrls("failed to load data:text/html,<p>apikey=SECRET123</p> here", 300);
+  assert.doesNotMatch(s, /SECRET123/);
+  assert.match(s, /^failed to load data:\[\d+ chars\] here$/);
+});
+
 // --- redactEvents (I1/I2): the worker-side walker over rrweb event batches, run
 // in Audit.onRecorderEvents before anything is stored, so a recorder in any
 // document cannot bypass it. `knownTags` is a Map the caller (audit.js) keeps
@@ -373,6 +445,38 @@ test("I1: an attribute mutation's value is left alone when the target id is a kn
   const events = [{ type: 3, data: { source: 0, texts: [], removes: [], adds: [], attributes: [{ id: 11, attributes: { value: "CA" } }] } }];
   redactEvents(events, knownTags);
   assert.equal(events[0].data.attributes[0].attributes.value, "CA");
+});
+
+// Fix round 2 (controller ruling, binding): an id the walker has never seen —
+// after a worker restart (the tag map is only in memory) or any batch dropped
+// before reaching the walker — must fail closed and be masked, accepting that
+// a button's or meter's value gets masked too as a rare, acceptable cost.
+test("I1 (controller ruling): a value mutation on a completely unknown node id is masked, not left raw", () => {
+  const { redactEvents } = load();
+  const events = [{ type: 3, data: { source: 0, texts: [], removes: [], adds: [], attributes: [{ id: 57, attributes: { value: "UNKNOWNIDPW1" } }] } }];
+  redactEvents(events, new Map()); // empty map: id 57 has never been seen
+  assert.doesNotMatch(JSON.stringify(events), /UNKNOWNIDPW1/);
+});
+
+test("I1 (controller ruling): a value mutation on an id known to be something other than input/textarea is still left alone", () => {
+  const { redactEvents } = load();
+  const knownTags = new Map([[9, "div"]]);
+  const events = [{ type: 3, data: { source: 0, texts: [], removes: [], adds: [], attributes: [{ id: 9, attributes: { value: "PAGECONTENT" } }] } }];
+  redactEvents(events, knownTags);
+  assert.equal(events[0].data.attributes[0].attributes.value, "PAGECONTENT");
+});
+
+// Pulled in from the re-review: a URL can ride in as free text inside an
+// attribute that isn't one of the dedicated URL attributes (e.g. a <meta
+// property="og:url"> or any other content attribute).
+test("I2 (pulled in): a URL embedded in a non-URL attribute's free text is scrubbed too", () => {
+  const { redactEvents } = load();
+  const events = [{
+    type: 2,
+    data: { node: { type: 0, id: 1, childNodes: [{ type: 2, tagName: "meta", attributes: { property: "og:url", content: "https://x.test/a?token=OGSECRET1" }, id: 2, childNodes: [] }] } },
+  }];
+  redactEvents(events, new Map());
+  assert.doesNotMatch(JSON.stringify(events), /OGSECRET1/);
 });
 
 // A node's defining snapshot/add can land in an earlier batch than a later
