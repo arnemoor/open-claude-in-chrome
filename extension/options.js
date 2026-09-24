@@ -18,11 +18,10 @@ const tabSelect = document.getElementById("tab-select");
 const playerContainer = document.getElementById("player-container");
 const playerNotice = document.getElementById("player-notice");
 const deleteButton = document.getElementById("delete-session");
-const exportLink = document.getElementById("export-session");
+const exportButton = document.getElementById("export-session");
 
 let currentSession = null; // { session, actions, eventsByTab } for the open detail panel
 let currentPlayer = null;
-let exportUrl = null;
 
 function td(text) {
   const cell = document.createElement("td");
@@ -65,10 +64,11 @@ function clearPlayerNotice() {
 }
 
 // --- Audit settings ---
-// Wired before AuditStore is ever opened (see init()), so the switch and the
-// retention select work even when the database can't be opened, and neither
-// control's own loaded value can be reverted by a slower init step running
-// after the user has already interacted with it (M3).
+// The listeners are attached before the storage read even starts (not just
+// before AuditStore is opened), and each control's loaded value is applied
+// only if the user hasn't already changed that same control — so a click
+// during the read is written immediately and is never reverted once the read
+// resolves (M3).
 
 async function saveSettings() {
   await chrome.storage.local.set({
@@ -77,15 +77,20 @@ async function saveSettings() {
 }
 
 async function initSettings() {
+  let userChangedEnabled = false;
+  let userChangedRetention = false;
+  enabledCheckbox.addEventListener("change", () => { userChangedEnabled = true; saveSettings(); });
+  retentionSelect.addEventListener("change", () => { userChangedRetention = true; saveSettings(); });
+
   const { audit } = await chrome.storage.local.get("audit");
   const { enabled, retentionDays } = { ...DEFAULT_SETTINGS, ...audit };
-  enabledCheckbox.checked = enabled;
-  // A stored value the select doesn't offer would otherwise leave the select
-  // on some other option, and the next save would silently write that instead
-  // of the value actually shown (M7).
-  retentionSelect.value = String(VALID_RETENTIONS.includes(retentionDays) ? retentionDays : DEFAULT_SETTINGS.retentionDays);
-  enabledCheckbox.addEventListener("change", saveSettings);
-  retentionSelect.addEventListener("change", saveSettings);
+  if (!userChangedEnabled) enabledCheckbox.checked = enabled;
+  if (!userChangedRetention) {
+    // A stored value the select doesn't offer would otherwise leave the select
+    // on some other option, and the next save would silently write that instead
+    // of the value actually shown (M7).
+    retentionSelect.value = String(VALID_RETENTIONS.includes(retentionDays) ? retentionDays : DEFAULT_SETTINGS.retentionDays);
+  }
 }
 
 // --- Sessions table ---
@@ -106,6 +111,13 @@ async function renderSessions() {
       td(formatTime(session.firstSeen)), td(formatTime(session.lastSeen)),
       td(String(actionCount)), td(String(tabCount)),
     );
+    // The row looks clickable (options.css), so make the rest of it act that
+    // way too — except where the click already landed on the label's own
+    // button, which handles it itself (N5).
+    tr.addEventListener("click", (event) => {
+      if (event.target.closest("button")) return;
+      showSessionDetail(session.id);
+    });
     sessionsBody.appendChild(tr);
   }
 }
@@ -114,24 +126,34 @@ async function renderSessions() {
 
 async function showSessionDetail(id) {
   clearNotice();
-  // Bind Delete and Export to this id before anything below can throw or
-  // return early, so a failure never leaves them pointed at a previously
-  // opened session (I2).
-  deleteButton.onclick = () => deleteCurrentSession(id);
-  exportLink.onclick = () => exportSession(id);
+  // Hide any previously-shown detail immediately, and unbind Delete/Export,
+  // so neither can act on a stale session while this one loads — whether the
+  // load succeeds, finds nothing, or rejects (I2, N3).
+  detailSection.hidden = true;
+  currentSession = null;
+  deleteButton.onclick = null;
+  exportButton.onclick = null;
 
-  const data = await AuditStore.getSession(id);
+  let data;
+  try {
+    data = await AuditStore.getSession(id);
+  } catch (err) {
+    showNotice("Could not load this session.");
+    await renderSessions();
+    return;
+  }
+
   if (!data.session) {
     // Gone since the row was rendered — for example the hourly audit-prune
     // alarm ran while this page was open. Don't show a broken detail view.
-    currentSession = null;
-    detailSection.hidden = true;
     showNotice("This session no longer exists.");
     await renderSessions();
     return;
   }
 
   currentSession = data;
+  deleteButton.onclick = () => deleteCurrentSession(id);
+  exportButton.onclick = () => exportSession(id);
   detailSection.hidden = false;
   renderActions();
   renderTabSelect();
@@ -211,17 +233,19 @@ function seekToAction(action) {
   if (currentPlayer) currentPlayer.goto(action.ts - tabEvents[0].timestamp);
 }
 
-// Built on click, not eagerly on every detail open, and revoked shortly after
-// (M5) — a deleted session's exported JSON should not stay readable at an old
-// URL, and a detail view that's never exported shouldn't hold a live blob.
+// Builds a detached <a download>, clicks it, and revokes its Blob URL shortly
+// after (M5) — options.html keeps a plain, always-focusable <button> instead
+// of a live export link (N2). Each call uses its own local url/anchor, so
+// concurrent clicks can't race each other's revoke.
 function exportSession(id) {
   if (!currentSession || !currentSession.session || currentSession.session.id !== id) return;
-  if (exportUrl) URL.revokeObjectURL(exportUrl);
   const blob = new Blob([JSON.stringify(currentSession)], { type: "application/json" });
-  exportUrl = URL.createObjectURL(blob);
-  exportLink.href = exportUrl;
-  exportLink.download = `audit-session-${id}.json`;
-  setTimeout(() => URL.revokeObjectURL(exportUrl), 0);
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `audit-session-${id}.json`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
 async function deleteCurrentSession(id) {
@@ -231,7 +255,8 @@ async function deleteCurrentSession(id) {
     clearPlayerNotice();
     detailSection.hidden = true;
     currentSession = null;
-    if (exportUrl) { URL.revokeObjectURL(exportUrl); exportUrl = null; }
+    deleteButton.onclick = null;
+    exportButton.onclick = null;
   }
   await renderSessions();
 }
@@ -240,15 +265,24 @@ async function deleteCurrentSession(id) {
 
 async function auditDbExists() {
   if (typeof indexedDB.databases !== "function") return true; // no enumeration API: fall back to opening
-  const dbs = await indexedDB.databases();
-  return dbs.some((d) => d.name === "ocic-audit"); // must match store.js's AUDIT_DB_NAME
+  try {
+    const dbs = await indexedDB.databases();
+    return dbs.some((d) => d.name === "ocic-audit"); // must match store.js's AUDIT_DB_NAME
+  } catch (err) {
+    return true; // enumeration failed: fall back to opening, same as the missing-API branch (N4)
+  }
 }
 
 async function init() {
   await initSettings(); // wire the switch and select before anything that can block or fail (M3)
   if (await auditDbExists()) {
-    await AuditStore.open();
-    await renderSessions();
+    try {
+      await AuditStore.open();
+      await renderSessions();
+    } catch (err) {
+      showNotice("Could not open the audit database.");
+      sessionsEmpty.hidden = false;
+    }
   } else {
     // Never create the database just by visiting the page (M4) — a plain
     // visit with audit never enabled has nothing recorded to show anyway.

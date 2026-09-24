@@ -1,10 +1,11 @@
 // Exercises extension/options.html + options.js against real Chrome: the audit
 // settings checkbox/select, the sessions table, session detail (actions + rrweb
-// replay), JSON export, delete, and the fix-round-1 hardening (I1: no outbound
-// requests from a replay; I2: a stale or broken session can't corrupt Delete or
-// Export; M1-M9: see task-17-fix-r1.md). IndexedDB needs a real origin, so
-// extension/ is served from a local http server (same pattern as
-// audit-store.test.mjs).
+// replay), JSON export, delete, and the fix-round hardening (I1: no outbound
+// requests from a replay; I2/N3: a stale, broken or slow-loading session can't
+// corrupt Delete or Export; N1: exports must never touch the real ~/Downloads;
+// M1-M9/N2/N4/N5: see task-17-fix-r1.md and task-17-fix-r2.md). IndexedDB needs
+// a real origin, so extension/ is served from a local http server (same
+// pattern as audit-store.test.mjs).
 //
 // chrome.storage.local is stubbed with Page.addScriptToEvaluateOnNewDocument
 // (installed before navigation) so it runs without the real extension APIs;
@@ -14,11 +15,24 @@ import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import http from "node:http";
+import os from "node:os";
 import path from "node:path";
 import { chromeAvailable, launchChrome, openPage, navigate } from "./harness/browser.mjs";
 
 const EXT_DIR = path.join(import.meta.dirname, "..", "extension");
 const MIME = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css" };
+
+// N1: the export path must never write into the user's real ~/Downloads. The
+// browser-level "deny" set in before() is the primary guard; this direct
+// filesystem check is the belt-and-suspenders the ruling asks for.
+const DOWNLOADS_DIR = path.join(os.homedir(), "Downloads");
+function listAuditDownloads() {
+  try {
+    return fs.readdirSync(DOWNLOADS_DIR).filter((f) => f.startsWith("audit-session-")).sort();
+  } catch {
+    return []; // no Downloads dir at all
+  }
+}
 
 // Hand-made (not captured) rrweb event fixtures: a Meta event, a FullSnapshot of
 // a tiny DOM, plus one incremental event so a replay has a non-zero duration to
@@ -41,8 +55,10 @@ const ACTION_2 = { sessionId: "s1", ts: 1800, tool: "computer", tabId: 11, summa
 // Installed via Page.addScriptToEvaluateOnNewDocument, before the real page
 // scripts run. Backs chrome.storage.local with an in-memory object exposed as
 // window.__storageState so tests can assert on what options.js wrote, and can
-// be pre-seeded (e.g. to test a stored value the UI doesn't offer, M7).
-function storageStubSource(initialState = {}) {
+// be pre-seeded (e.g. to test a stored value the UI doesn't offer, M7) and/or
+// delayed (M3 rest: a click landing mid-read must not be reverted once a slow
+// read finally resolves).
+function storageStubSource(initialState = {}, delayMs = 0) {
   return `(() => {
     const state = ${JSON.stringify(initialState)};
     globalThis.__storageState = state;
@@ -50,13 +66,13 @@ function storageStubSource(initialState = {}) {
       storage: {
         local: {
           get(keys) {
-            return Promise.resolve().then(() => {
-              if (keys == null) return { ...state };
+            return new Promise((resolve) => setTimeout(() => {
+              if (keys == null) return resolve({ ...state });
               const list = Array.isArray(keys) ? keys : [keys];
               const out = {};
               for (const k of list) if (k in state) out[k] = state[k];
-              return out;
-            });
+              resolve(out);
+            }, ${delayMs}));
           },
           set(items) {
             return Promise.resolve().then(() => { Object.assign(state, items); });
@@ -116,17 +132,23 @@ async function retryUntil(page, actionExpr, predicateExpr, { timeout = 5000, int
   }
 }
 
-// Opens extension/options.html (with the chrome.storage stub already installed)
-// on a fresh local-server origin, so each test gets its own isolated IndexedDB,
-// runs `fn(page, origin)`, then tears the server down.
-async function withOptionsPage(fn, { initialStorage } = {}) {
+// Opens extension/options.html (with the chrome.storage stub already installed,
+// and optionally a rejecting indexedDB.databases()) on a fresh local-server
+// origin, so each test gets its own isolated IndexedDB, runs `fn(page, origin)`,
+// then tears the server down.
+async function withOptionsPage(fn, { initialStorage, storageDelayMs, rejectDbEnumeration } = {}) {
   const server = serveExtension();
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = server.address().port;
   const origin = `http://127.0.0.1:${port}`;
   try {
     const page = await openPage(browser);
-    await page.send("Page.addScriptToEvaluateOnNewDocument", { source: storageStubSource(initialStorage) });
+    await page.send("Page.addScriptToEvaluateOnNewDocument", { source: storageStubSource(initialStorage, storageDelayMs) });
+    if (rejectDbEnumeration) {
+      await page.send("Page.addScriptToEvaluateOnNewDocument", {
+        source: `indexedDB.databases = () => Promise.reject(new Error("simulated enumeration failure"));`,
+      });
+    }
     await navigate(page, `${origin}/options.html`);
     await fn(page, origin);
   } finally {
@@ -149,9 +171,44 @@ async function seedAndReload(page, origin, { session = SESSION, ts = 1000, actio
   await navigate(page, `${origin}/options.html`);
 }
 
+// Two independent sessions for the N3 tests: "session-a" is opened first and
+// must stay untouched; "session-b" is the one whose load gets slowed or made
+// to reject.
+async function seedTwoSessions(page, origin) {
+  const a = { id: "sessA", label: "session-a", cwd: "/a", pid: 1 };
+  const b = { id: "sessB", label: "session-b", cwd: "/b", pid: 2 };
+  await page.evaluate(`AuditStore.open()`);
+  await seedSession(page, a, 1000);
+  await seedSession(page, b, 2000);
+  await seedAction(page, { sessionId: "sessA", ts: 1100, tool: "navigate", tabId: 11, summary: "https://example.test/", outcome: "ok", ms: 1 });
+  await seedEvents(page, "sessA", 11, FIXTURE_EVENTS);
+  await seedAction(page, { sessionId: "sessB", ts: 2100, tool: "navigate", tabId: 12, summary: "https://example.test/", outcome: "ok", ms: 1 });
+  await seedEvents(page, "sessB", 12, FIXTURE_EVENTS);
+  await navigate(page, `${origin}/options.html`);
+  await waitFor(page, `document.querySelectorAll("#sessions-body tr").length === 2`);
+}
+
+const clickByLabel = (page, label) => page.evaluate(`Array.from(document.querySelectorAll("#sessions-body tr td button")).find((b) => b.textContent === ${JSON.stringify(label)}).click()`);
+
 let browser;
-before(async () => { if (chromeAvailable) browser = await launchChrome(); }, { timeout: 30000 });
-after(() => browser?.close());
+let downloadsAtStart;
+before(async () => {
+  downloadsAtStart = listAuditDownloads();
+  if (chromeAvailable) {
+    browser = await launchChrome();
+    // N1: deny all downloads at the browser level. An earlier version of the
+    // export test clicked a real <a download>, and headless Chrome saved it
+    // into the user's actual ~/Downloads on every run (nothing here needs a
+    // saved file — only the Blob's content, verified in-page below).
+    await browser.send("Browser.setDownloadBehavior", { behavior: "deny" });
+  }
+}, { timeout: 30000 });
+
+after(async () => {
+  await browser?.close();
+  const downloadsAtEnd = listAuditDownloads();
+  assert.deepEqual(downloadsAtEnd, downloadsAtStart, `no audit-session-* files should appear in ${DOWNLOADS_DIR} from this suite`);
+});
 
 test("ticking the audit checkbox, and choosing a retention, write to chrome.storage.local", { skip: !chromeAvailable, timeout: 20000 }, async () => {
   await withOptionsPage(async (page) => {
@@ -181,6 +238,27 @@ test("ticking the audit checkbox, and choosing a retention, write to chrome.stor
     const audit = await page.evaluate("window.__storageState.audit");
     assert.deepEqual(audit, { enabled: true, retentionDays: 30 });
   });
+});
+
+test("a click on the audit switch during a slow storage read is written and kept, not reverted once the read resolves (M3 rest)", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  await withOptionsPage(async (page) => {
+    // No retry here: the point is to land while chrome.storage.local.get() is
+    // still pending, which the listeners (now attached before that call, per
+    // the fix) must not miss.
+    await page.evaluate(`(() => {
+      const cb = document.getElementById("audit-enabled");
+      cb.checked = true;
+      cb.dispatchEvent(new Event("change"));
+    })()`);
+    await waitFor(page, `window.__storageState.audit != null`);
+    assert.equal((await page.evaluate("window.__storageState.audit")).enabled, true);
+
+    // Wait past the stub's artificial delay: the stale stored enabled:false
+    // must not overwrite the user's own click once the read finally resolves.
+    await new Promise((r) => setTimeout(r, 600));
+    assert.equal(await page.evaluate(`document.getElementById("audit-enabled").checked`), true);
+    assert.equal((await page.evaluate("window.__storageState.audit")).enabled, true);
+  }, { initialStorage: { audit: { enabled: false, retentionDays: 7 } }, storageDelayMs: 400 });
 });
 
 test("a stored retention value outside 1/7/30 falls back to 7 in the UI and in what is written (M7)", { skip: !chromeAvailable, timeout: 20000 }, async () => {
@@ -224,6 +302,14 @@ test("a plain visit never creates the audit database, and the switch still works
   });
 });
 
+test("indexedDB.databases() rejecting falls back to opening the database instead of leaving init() broken (N4)", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  await withOptionsPage(async (page, origin) => {
+    await seedAndReload(page, origin);
+    await waitFor(page, `document.querySelectorAll("#sessions-body tr").length === 1`);
+    assert.equal(await page.evaluate(`document.querySelector("#sessions-body tr td button").textContent`), "myapp");
+  }, { rejectDbEnumeration: true });
+});
+
 test("sessions table, session detail with replay, export, and delete", { skip: !chromeAvailable, timeout: 20000 }, async () => {
   await withOptionsPage(async (page, origin) => {
     await seedAndReload(page, origin);
@@ -253,20 +339,32 @@ test("sessions table, session detail with replay, export, and delete", { skip: !
     })()`);
     assert.ok(widths.player <= widths.container + 1, `player ${widths.player}px should fit its ${widths.container}px column`);
 
-    // Export is built lazily on click (M5): click and read within one evaluate
-    // call, ahead of the short-lived blob URL's revoke.
+    // N2: Export is now a plain <button> (no public href), so verify the
+    // actual Blob content by capturing what it passes to URL.createObjectURL
+    // and the filename set on the anchor it clicks, rather than reading a
+    // public href or letting a real download happen. Reading blob.text()
+    // directly also sidesteps the short-lived revoke entirely (M5). N1: also
+    // assert directly against the filesystem that nothing landed in the real
+    // ~/Downloads, on top of the browser-level "deny" set in before().
+    const downloadsBeforeExport = listAuditDownloads();
     const exportInfo = await page.evaluate(`(async () => {
-      const a = document.getElementById("export-session");
-      a.click();
-      const hasDownload = a.hasAttribute("download");
-      const isBlob = a.href.startsWith("blob:");
-      const text = await (await fetch(a.href)).text();
-      return { hasDownload, isBlob, text };
+      let blob = null;
+      let filename = null;
+      const realCreateObjectURL = URL.createObjectURL;
+      URL.createObjectURL = (b) => { blob = b; return realCreateObjectURL(b); };
+      const realClick = HTMLAnchorElement.prototype.click;
+      HTMLAnchorElement.prototype.click = function () { filename = this.download; return realClick.call(this); };
+      document.getElementById("export-session").click();
+      URL.createObjectURL = realCreateObjectURL;
+      HTMLAnchorElement.prototype.click = realClick;
+      const text = blob ? await blob.text() : null;
+      return { filename, type: blob ? blob.type : null, text };
     })()`);
-    assert.equal(exportInfo.hasDownload, true);
-    assert.equal(exportInfo.isBlob, true);
+    assert.equal(exportInfo.filename, "audit-session-s1.json");
+    assert.equal(exportInfo.type, "application/json");
     const exported = JSON.parse(exportInfo.text);
     assert.equal(exported.session.id, "s1");
+    assert.deepEqual(listAuditDownloads(), downloadsBeforeExport, "export must not write into the real ~/Downloads");
 
     await page.evaluate(`document.getElementById("delete-session").click()`);
     await waitFor(page, `document.querySelectorAll("#sessions-body tr").length === 0`);
@@ -276,6 +374,51 @@ test("sessions table, session detail with replay, export, and delete", { skip: !
     assert.equal(remaining.session, undefined);
     assert.equal(remaining.actions.length, 0);
     assert.equal(Object.keys(remaining.eventsByTab).length, 0);
+  });
+});
+
+test("Export is a real button, reachable by keyboard once a session is open (N2)", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  await withOptionsPage(async (page, origin) => {
+    // #session-detail (and Export within it) is hidden until a session is
+    // opened — any element inside a hidden ancestor is unfocusable regardless
+    // of tag, so this must open one first. N2's actual bug was that the old
+    // <a> had no href until the first click, so even once visible it wasn't
+    // focusable; a plain <button> doesn't have that problem.
+    await seedAndReload(page, origin);
+    await waitFor(page, `document.querySelectorAll("#sessions-body tr").length === 1`);
+    await page.evaluate(`document.querySelector("#sessions-body tr td button").click()`);
+    await waitFor(page, `document.getElementById("session-detail").hidden === false`);
+
+    assert.equal(await page.evaluate(`document.getElementById("export-session").tagName`), "BUTTON");
+    const focusedId = await page.evaluate(`(() => {
+      document.getElementById("export-session").focus();
+      return document.activeElement.id;
+    })()`);
+    assert.equal(focusedId, "export-session");
+  });
+});
+
+test("a click anywhere in a session row opens it once, without double-firing from the button (N5)", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  await withOptionsPage(async (page, origin) => {
+    await seedAndReload(page, origin);
+    await waitFor(page, `document.querySelectorAll("#sessions-body tr").length === 1`);
+
+    await page.evaluate(`(() => {
+      window.__getSessionCalls = 0;
+      const real = AuditStore.getSession;
+      AuditStore.getSession = (id) => { window.__getSessionCalls++; return real(id); };
+    })()`);
+
+    await page.evaluate(`document.querySelector("#sessions-body tr td button").click()`);
+    await waitFor(page, `document.getElementById("session-detail").hidden === false`);
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(await page.evaluate(`window.__getSessionCalls`), 1, "clicking the button should open the session exactly once");
+
+    await page.evaluate(`window.__getSessionCalls = 0; document.getElementById("session-detail").hidden = true;`);
+    await page.evaluate(`document.querySelectorAll("#sessions-body tr td")[1].click()`); // the cwd cell, not the button
+    await waitFor(page, `document.getElementById("session-detail").hidden === false`);
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(await page.evaluate(`window.__getSessionCalls`), 1, "a click on a non-button cell should also open the session, exactly once");
   });
 });
 
@@ -369,14 +512,14 @@ test("a session that disappears while its stale row is clicked leaves other sess
     assert.deepEqual(labels, ["pruned-app", "keepme-app"]);
 
     // Open "keepme"'s detail.
-    await page.evaluate(`Array.from(document.querySelectorAll("#sessions-body tr td button")).find((b) => b.textContent === "keepme-app").click()`);
+    await clickByLabel(page, "keepme-app");
     await waitFor(page, `!!document.querySelector(".rr-player")`);
 
     // Delete "pruned" from under the page (simulates the hourly audit-prune alarm).
     await page.evaluate(`AuditStore.deleteSession("pruned")`);
 
     // Click the now-stale "pruned" row.
-    await page.evaluate(`Array.from(document.querySelectorAll("#sessions-body tr td button")).find((b) => b.textContent === "pruned-app").click()`);
+    await clickByLabel(page, "pruned-app");
     await waitFor(page, `document.getElementById("session-detail").hidden === true`);
     await waitFor(page, `document.querySelectorAll("#sessions-body tr").length === 1`);
 
@@ -406,5 +549,59 @@ test("a session with a broken replay stream shows a notice but keeps the actions
     await page.evaluate(`document.getElementById("delete-session").click()`);
     await waitFor(page, `document.querySelectorAll("#sessions-body tr").length === 0`);
     assert.equal(await page.evaluate(`AuditStore.listSessions().then((s) => s.length)`), 0);
+  });
+});
+
+test("while a slow session load is in flight, Delete/Export are unbound instead of pointing at the previous session (N3)", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  await withOptionsPage(async (page, origin) => {
+    await seedTwoSessions(page, origin);
+
+    await clickByLabel(page, "session-a");
+    await waitFor(page, `document.getElementById("session-detail").hidden === false`);
+
+    await page.evaluate(`(() => {
+      const real = AuditStore.getSession;
+      AuditStore.getSession = (id) => new Promise((resolve) => setTimeout(() => resolve(real(id)), 400));
+    })()`);
+    await clickByLabel(page, "session-b");
+
+    // Immediately: session-a's detail is gone, and Delete/Export are unbound —
+    // neither can act on it (nor on session-b, which hasn't loaded yet).
+    assert.equal(await page.evaluate(`document.getElementById("session-detail").hidden`), true);
+    assert.equal(await page.evaluate(`document.getElementById("delete-session").onclick`), null);
+    assert.equal(await page.evaluate(`document.getElementById("export-session").onclick`), null);
+
+    await waitFor(page, `document.getElementById("session-detail").hidden === false`, { timeout: 3000 });
+    const actionTool = await page.evaluate(`document.querySelectorAll("#actions-body tr td")[1]?.textContent`);
+    assert.equal(actionTool, "navigate"); // session-b's own action, not a leftover from session-a
+  });
+});
+
+test("a rejecting session load shows a notice instead of leaving Delete/Export bound to the previous session (N3)", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  await withOptionsPage(async (page, origin) => {
+    await seedTwoSessions(page, origin);
+
+    await clickByLabel(page, "session-a");
+    await waitFor(page, `document.getElementById("session-detail").hidden === false`);
+
+    // Rejects only the first call for "sessB" (the detail-open call itself),
+    // so renderSessions()'s own per-row getSession calls afterward still work.
+    await page.evaluate(`(() => {
+      const real = AuditStore.getSession;
+      let rejectedOnce = false;
+      AuditStore.getSession = (id) => {
+        if (id === "sessB" && !rejectedOnce) { rejectedOnce = true; return Promise.reject(new Error("boom")); }
+        return real(id);
+      };
+    })()`);
+    await clickByLabel(page, "session-b");
+
+    await waitFor(page, `document.getElementById("session-detail").hidden === true`);
+    await waitFor(page, `document.getElementById("sessions-notice").hidden === false`);
+    assert.equal(await page.evaluate(`document.getElementById("delete-session").onclick`), null);
+    assert.equal(await page.evaluate(`document.getElementById("export-session").onclick`), null);
+
+    const stillA = await page.evaluate(`AuditStore.getSession("sessA")`);
+    assert.equal(stillA.session.id, "sessA");
   });
 });
