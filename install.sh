@@ -122,10 +122,25 @@ esac
 
 # Link the packaged skill into ~/.claude/skills so agents are told the upload
 # allowlist, save_to_disk location, audit mode limits and other tool quirks
-# without being asked. Only replaces a symlink that already points at a copy
-# of this repo's skill (any worktree); any other file or link there is left
-# alone. A failure here is reported, not fatal, so it can't stop the native
-# messaging setup above from taking effect.
+# without being asked. Only replaces a symlink that already points at this
+# exact skill or at another worktree/clone of this same repository. Any other
+# file or link there (including a same-named folder in an unrelated repo,
+# such as a dotfiles checkout) is left alone. A failure here is reported, not
+# fatal, so it can't stop the native messaging setup above from taking effect.
+
+# Prints the absolute path to the shared .git directory for the repository
+# containing $1 (the same result for every worktree of one repository), or
+# nothing if $1 doesn't exist or isn't inside a git repository.
+repo_common_dir() {
+  local dir="$1" common
+  [ -d "$dir" ] || return 0
+  common=$(git -C "$dir" rev-parse --git-common-dir 2>/dev/null) || return 0
+  case "$common" in
+    /*) printf '%s\n' "$common" ;;
+    *) (cd "$dir" && cd "$common" 2>/dev/null && pwd) ;;
+  esac
+}
+
 echo ""
 echo "Linking the agent skill (if you use personal Claude Code skills):"
 CLAUDE_SKILLS_DIR="$HOME/.claude/skills"
@@ -134,16 +149,23 @@ if [ -d "$CLAUDE_SKILLS_DIR" ]; then
   SKILL_LINK="$CLAUDE_SKILLS_DIR/open-claude-in-chrome"
   if [ -L "$SKILL_LINK" ]; then
     OLD_TARGET=$(readlink "$SKILL_LINK")
-    case "$OLD_TARGET" in
-      */skills/open-claude-in-chrome)
-        ln -sfn "$SKILL_SRC" "$SKILL_LINK" \
-          && echo "  Relinked skill: $SKILL_LINK (was -> $OLD_TARGET) -> $SKILL_SRC" \
-          || echo "  Could not relink skill at $SKILL_LINK: check permissions on $CLAUDE_SKILLS_DIR."
-        ;;
-      *)
-        echo "  Skipping skill link: $SKILL_LINK already points elsewhere (-> $OLD_TARGET), leaving it alone."
-        ;;
-    esac
+    SAME_REPO=false
+    if [ "$OLD_TARGET" = "$SKILL_SRC" ]; then
+      SAME_REPO=true
+    else
+      OLD_COMMON=$(repo_common_dir "$(dirname "$OLD_TARGET")")
+      NEW_COMMON=$(repo_common_dir "$SCRIPT_DIR")
+      if [ -n "$OLD_COMMON" ] && [ "$OLD_COMMON" = "$NEW_COMMON" ]; then
+        SAME_REPO=true
+      fi
+    fi
+    if [ "$SAME_REPO" = true ]; then
+      ln -sfn "$SKILL_SRC" "$SKILL_LINK" \
+        && echo "  Relinked skill: $SKILL_LINK (was -> $OLD_TARGET) -> $SKILL_SRC" \
+        || echo "  Could not relink skill at $SKILL_LINK: check permissions on $CLAUDE_SKILLS_DIR."
+    else
+      echo "  Skipping skill link: $SKILL_LINK already points elsewhere (-> $OLD_TARGET), leaving it alone."
+    fi
   elif [ -e "$SKILL_LINK" ]; then
     echo "  Skipping skill link: $SKILL_LINK already exists and was not made by this installer."
   else
