@@ -86,10 +86,25 @@ test("Object.prototype names are reported as unknown keys, not sent", async () =
 });
 
 test("an unresolvable focus kind skips newlines and notes it could not be checked", async () => {
-  const bg = await loadBackground({ overrides: { debugger: { sendCommand: async (t, m) => (m === "Runtime.evaluate" ? { result: { value: null } } : {}) } } });
+  // Record calls ourselves: overriding sendCommand replaces the harness's own recorder, so
+  // bg.calls would only ever see debugger.attach and this assertion would pass vacuously.
+  const sent = [];
+  const bg = await loadBackground({ overrides: { debugger: { sendCommand: async (t, m, p) => {
+    sent.push([m, p]);
+    return m === "Runtime.evaluate" ? { result: { value: null } } : {};
+  } } } });
   const r = await bg.handlers.computer({ action: "type", text: "a\nb", tabId: bg.tabId });
   assert.match(r.content[0].text, /line breaks were not typed: could not be checked/);
-  assert.equal(bg.calls.filter((c) => c[1] === "Input.insertText" && c[2].text === "\n").length, 0);
+  assert.ok(sent.some(([m]) => m === "Runtime.evaluate"), "the focus probe should have run");
+  assert.equal(sent.filter(([m, p]) => m === "Input.insertText" && p?.text === "\n").length, 0);
+});
+
+test("a hung focus probe falls back to unknown within its own timeout, not the 30s default", { timeout: 5000 }, async () => {
+  const bg = await loadBackground({ overrides: { debugger: { sendCommand: async (t, m) => (m === "Runtime.evaluate" ? new Promise(() => {}) : {}) } } });
+  const start = Date.now();
+  const r = await bg.handlers.computer({ action: "type", text: "a\nb", tabId: bg.tabId });
+  assert.ok(Date.now() - start < 2500, `took ${Date.now() - start}ms`);
+  assert.match(r.content[0].text, /line breaks were not typed: could not be checked/);
 });
 
 // --- Multi-line fields: textarea and contenteditable, alongside a single-line input ---
@@ -138,6 +153,38 @@ test("type on a single-line input never submits and the reply notes dropped line
   const { page, run } = await setupMulti("inp");
   const reply = await run({ action: "type", text: "l1\nl2" });
   assert.equal(await page.evaluate("inp.value"), "l1l2");
+  assert.equal(await page.evaluate("submits"), 0);
+  assert.match(reply.content[0].text, /line breaks were not typed: the focused field is single-line/);
+});
+
+test("an input nested inside a contenteditable host is still single-line", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  const page = await openPage(browser, { html: `<form id=f><div contenteditable>x<input id=x>y</div></form>
+<script>
+  window.submits = 0;
+  document.getElementById("f").addEventListener("submit", (e) => { e.preventDefault(); submits++; });
+</script>` });
+  await page.evaluate("document.getElementById('x').focus()");
+  const bg = await loadBackground({ page });
+  const run = (a) => bg.handlers.computer({ tabId: bg.tabId, ...a });
+  const reply = await run({ action: "type", text: "a\nb" });
+  assert.equal(await page.evaluate("x.value"), "ab");
+  assert.equal(await page.evaluate("submits"), 0);
+  assert.match(reply.content[0].text, /line breaks were not typed: the focused field is single-line/);
+});
+
+test("a focus change mid-type is picked up before the next newline", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  const page = await openPage(browser, { html: `<form id=f><textarea id=ta></textarea><input id=inp></form>
+<script>
+  window.submits = 0;
+  document.getElementById("f").addEventListener("submit", (e) => { e.preventDefault(); submits++; });
+  document.getElementById("ta").addEventListener("input", () => document.getElementById("inp").focus(), { once: true });
+</script>` });
+  await page.evaluate("document.getElementById('ta').focus()");
+  const bg = await loadBackground({ page });
+  const run = (a) => bg.handlers.computer({ tabId: bg.tabId, ...a });
+  const reply = await run({ action: "type", text: "a\nb" });
+  assert.equal(await page.evaluate("ta.value"), "a");
+  assert.equal(await page.evaluate("inp.value"), "b");
   assert.equal(await page.evaluate("submits"), 0);
   assert.match(reply.content[0].text, /line breaks were not typed: the focused field is single-line/);
 });
