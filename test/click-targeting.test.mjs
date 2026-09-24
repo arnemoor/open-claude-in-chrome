@@ -296,10 +296,15 @@ test("find does not flag an absolutely positioned item off-screen when it escape
 
 // N2: don't scroll a target through its own label — the click already reaches the (possibly
 // visually hidden) control via the label, and don't claim a scroll happened when nothing moved.
+// R5: top:10px sits close enough to the top that even the old, buggy centering retry clamps
+// to scrollY 0 anyway (nothing above to scroll into), so a scrollY-unchanged assertion couldn't
+// fail on the old code. Lower on the page, centering it for real would need a real scroll
+// (~203px against e16d440), so the assertion actually distinguishes "correctly skipped" from
+// "tried to scroll and got lucky".
 test("a visually-hidden checkbox behind its own label is clicked without scrolling or a false cover warning", { skip: !chromeAvailable, timeout: 20000 }, async () => {
   const { page, cs, bg } = await setup(`
-    <input id="cb" type="checkbox" style="position:absolute;clip-path:inset(50%);top:10px;left:10px">
-    <label for="cb" style="position:absolute;top:10px;left:10px;width:20px;height:20px;display:block;background:#ccc"></label>
+    <input id="cb" type="checkbox" style="position:absolute;clip-path:inset(50%);top:550px;left:10px">
+    <label for="cb" style="position:absolute;top:550px;left:10px;width:20px;height:20px;display:block;background:#ccc"></label>
     <div style="height:3000px"></div>`);
   const found = await cs.invoke({ type: "findElements", query: "checkbox" });
   const ref = found.result.find((r) => r.role === "checkbox").ref;
@@ -326,4 +331,87 @@ test("left_click_drag to an in-view ref still drags normally", { skip: !chromeAv
   const ref = (await refOf("Drop")).ref;
   const r = await bg.handlers.computer({ action: "left_click_drag", start_coordinate: [10, 10], ref, tabId: bg.tabId });
   assert.match(r.content[0].text, /^Dragged from \(10, 10\) to \(\d+, \d+\)/);
+});
+
+// R1: a position:sticky target near the very top of a long page, once scrolled well past its
+// natural position, stays clamped at the same viewport-relative spot regardless of further
+// scrolling in a wide range — so a retry's scrollIntoView can move window.scrollY a lot while
+// the target's own rect (already sticky-clamped both before and after) never changes. Covered
+// by a position:fixed banner that tracks it exactly (also never moves), so it stays covered
+// either way; the point is that `scrolled` must still become true.
+const STICKY_COVERED_HTML = `
+  <button id="target" style="position:sticky;top:0;display:block;width:100px;height:21px;margin:0">Target</button>
+  <div style="height:4000px"></div>
+  <div id="banner" style="position:fixed;top:0;left:0;width:100px;height:21px;background:red">Banner</div>`;
+
+test("scrolled is true when the window scrolls even if a sticky target's own rect doesn't move", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  const { page, bg, refOf } = await setup(STICKY_COVERED_HTML);
+  await page.evaluate("window.scrollTo(0, 2000)");
+  const ref = (await refOf("Target")).ref;
+  const r = await bg.handlers.computer({ action: "left_click", ref, tabId: bg.tabId });
+  assert.match(r.content[0].text, /after scrolling it into view/);
+});
+
+test("left_click_drag refuses a sticky ref whose resolution scrolled the window without moving its own rect", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  const { page, bg, refOf } = await setup(STICKY_COVERED_HTML);
+  await page.evaluate("window.scrollTo(0, 2000)");
+  const ref = (await refOf("Target")).ref;
+  const r = await bg.handlers.computer({ action: "left_click_drag", start_coordinate: [10, 10], ref, tabId: bg.tabId });
+  assert.equal(r.content[0].text, `Scrolled ${ref} into view, so start_coordinate is stale. Take a new screenshot and retry the drag.`);
+});
+
+// R2: browsers do not forward a click on interactive content (a real link, not just an
+// ARIA-role or onclick-handled span) nested inside a label to the label's control — isOwnLabel
+// must not treat that as "safe to click through", the same as e16d440 correctly warned.
+test("interactive content inside the target's own label is still reported as covering it", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  const { page, cs, bg } = await setup(`
+    <input id="cb2" type="checkbox" style="position:absolute;top:10px;left:10px;width:20px;height:20px;margin:0">
+    <label for="cb2" style="position:absolute;top:10px;left:10px;width:100px;height:20px;display:block">
+      <a href="#" id="terms" style="position:absolute;top:0;left:0;width:100px;height:20px;display:block">terms</a>
+    </label>`);
+  const found = await cs.invoke({ type: "findElements", query: "checkbox" });
+  const ref = found.result.find((r) => r.role === "checkbox").ref;
+  const r = await bg.handlers.computer({ action: "left_click", ref, tabId: bg.tabId });
+  assert.match(r.content[0].text, /Warning: The click point is covered by a#terms/);
+  assert.equal(await page.evaluate("document.getElementById('cb2').checked"), false);
+});
+
+// R3: dom.closest (used by the old isOwnLabel/labelNotes) never crosses a shadow boundary, so
+// a label whose visible content is a shadow-DOM icon looks like it has no enclosing label at
+// all from the icon's own hit-tested point — both must instead walk the flat tree.
+const SHADOW_LABEL_HTML = (id, extraAttr = "") => `
+  <input id="${id}" type="checkbox" ${extraAttr} style="position:absolute;clip-path:inset(50%);top:10px;left:10px">
+  <label for="${id}" style="position:absolute;top:10px;left:10px;width:20px;height:20px;display:block">
+    <span id="icon-host-${id}"></span>
+  </label>
+  <script>document.getElementById("icon-host-${id}").attachShadow({mode:"open"}).innerHTML = '<svg width="20" height="20"><rect width="20" height="20"/></svg>';</script>`;
+
+test("a visually-hidden checkbox whose label holds a shadow-DOM icon is clicked without a false cover warning", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  const { page, cs, bg } = await setup(SHADOW_LABEL_HTML("cb3"));
+  const found = await cs.invoke({ type: "findElements", query: "checkbox" });
+  const ref = found.result.find((r) => r.role === "checkbox").ref;
+  const r = await bg.handlers.computer({ action: "left_click", ref, tabId: bg.tabId });
+  assert.doesNotMatch(r.content[0].text, /Warning/);
+  assert.equal(await page.evaluate("scrollY"), 0);
+  assert.equal(await page.evaluate("document.getElementById('cb3').checked"), true);
+});
+
+test("a shadow-DOM-icon label still carries the disabled-control note", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  const { cs, bg } = await setup(SHADOW_LABEL_HTML("cb4", "disabled"));
+  const found = await cs.invoke({ type: "findElements", query: "checkbox" });
+  const ref = found.result.find((r) => r.role === "checkbox").ref;
+  const r = await bg.handlers.computer({ action: "left_click", ref, tabId: bg.tabId });
+  assert.match(r.content[0].text, /This label's control is disabled\./);
+});
+
+// R4: html's own overflow, once non-visible, becomes the designated viewport-scrolling root,
+// and body's overflow stops propagating to the viewport — body reverts to a normal block whose
+// own overflow really does clip its content, so it must not be unconditionally skipped either.
+test("find flags an element clipped by body's own overflow even though html is also non-visible", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  const { bg } = await setup(`
+    <style>html{overflow:hidden} body{overflow:hidden;height:100px}</style>
+    <div style="height:300px"></div>
+    <button id="target">Target</button>`, { doctype: true });
+  const r = await bg.handlers.find({ query: "Target", tabId: bg.tabId });
+  assert.match(r.content[0].text, /off-screen/);
 });

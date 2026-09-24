@@ -23,6 +23,7 @@
   const offsetParentGet = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "offsetParent").get;
   const docTitleGet = Object.getOwnPropertyDescriptor(Document.prototype, "title").get;
   const docBodyGet = Object.getOwnPropertyDescriptor(Document.prototype, "body").get;
+  const docDocumentElementGet = Object.getOwnPropertyDescriptor(Document.prototype, "documentElement").get;
   const getAttributeFn = Element.prototype.getAttribute;
   const closestFn = Element.prototype.closest;
   const matchesFn = Element.prototype.matches;
@@ -64,6 +65,7 @@
     str,
     docTitle: () => str(docTitleGet.call(document)),
     docBody: () => docBodyGet.call(document),
+    docDocumentElement: () => docDocumentElementGet.call(document),
     docQuery: (sel) => docQueryFn.call(document, sel),
     docById: (id) => docByIdFn.call(document, id),
     docElementFromPoint: (x, y) => docElementFromPointFn.call(document, x, y),
@@ -611,21 +613,28 @@
   // page-viewport check alone can't see this: an element's own rect is still computed in full
   // even when a container clips it from view, so a target can pass that check while still
   // being invisible inside its own scroll container. But a naive "check every ancestor's
-  // overflow" walk over-clips: html/body's own overflow describes the viewport (already
-  // checked separately, and clipping against their rect is redundant at best); a
-  // position:fixed element's only clip is the viewport itself, regardless of what any
-  // ancestor's overflow does; and an absolutely positioned box's containing block is its
-  // nearest *non-static* ancestor, so it escapes (is not clipped by) any unpositioned
-  // overflow:hidden wrapper in between (the classic "menu that escapes a card" technique).
+  // overflow" walk over-clips: a position:fixed element's only clip is the viewport itself,
+  // regardless of what any ancestor's overflow does; and an absolutely positioned box's
+  // containing block is its nearest *non-static* ancestor, so it escapes (is not clipped by)
+  // any unpositioned overflow:hidden wrapper in between (the classic "menu that escapes a
+  // card" technique). html is always skipped (its own overflow either controls the viewport
+  // directly or is superseded), but body is skipped only when html's own overflow is fully
+  // visible on both axes — that's the only case where body's overflow propagates to become the
+  // viewport's scrolling behaviour. Once html's overflow is anything else, html becomes the
+  // designated root scrolling element and body reverts to an ordinary block whose own overflow
+  // really does clip its own content.
   function clippedByAncestor(x, y, el) {
     let pos = getComputedStyle(el).position;
     if (pos === "fixed") return false;
+
+    const htmlStyle = getComputedStyle(dom.docDocumentElement());
+    const bodyOverflowPropagates = htmlStyle.overflowX === "visible" && htmlStyle.overflowY === "visible";
 
     let node = flatTreeParent(el);
     while (node) {
       if (!(node instanceof Element)) { node = flatTreeParent(node); continue; }
       const tag = dom.tag(node);
-      if (tag === "html" || tag === "body") { node = flatTreeParent(node); continue; }
+      if (tag === "html" || (tag === "body" && bodyOverflowPropagates)) { node = flatTreeParent(node); continue; }
 
       const nodeStyle = getComputedStyle(node);
       const nodePosition = nodeStyle.position;
@@ -679,28 +688,67 @@
     return el;
   }
 
+  // The <label> enclosing `hit`, walking the flat tree (see flatTreeParent) rather than
+  // dom.closest: a label whose visible content is drawn inside a shadow root (an icon custom
+  // element, say) needs to cross that shadow boundary to be found at all, and dom.closest
+  // never does. Shared by labelNotes and isOwnLabel.
+  function enclosingLabel(hit) {
+    let n = hit;
+    while (n) {
+      if (n instanceof HTMLLabelElement) return n;
+      n = flatTreeParent(n);
+    }
+    return null;
+  }
+
   // Shared by getRefTarget and probePoint: warn when the hit point is inside a <label> whose
   // control is missing or disabled, since a click there won't do what it looks like it will.
   function labelNotes(hit) {
     const notes = [];
-    const label = dom.closest(hit, "label");
+    const label = enclosingLabel(hit);
     if (label) {
-      const control = label instanceof HTMLLabelElement ? labelControlGet.call(label) : null;
+      const control = labelControlGet.call(label);
       if (!control) notes.push("This label has no associated control, so the click may do nothing.");
       else if (dom.matches(control, ":disabled")) notes.push("This label's control is disabled.");
     }
     return notes;
   }
 
-  // Whether `hit` is inside a <label> whose associated control is `target` itself — a click at
-  // target's own coordinates reaches target through that label regardless (browsers forward a
-  // label click to its control natively), which is exactly the visually-hidden-checkbox
-  // pattern, not a real "covered" problem. labelNotes already surfaces a disabled control.
+  // HTML "interactive content" (the spec category, not M9's broader display set of things
+  // that merely *look* clickable): a browser does not forward a click on any of these, nested
+  // inside a label, to the label's own control — it activates the nested element instead.
+  const LABEL_ESCAPE_SELECTOR = 'a[href], button, input:not([type="hidden"]), select, textarea, details, iframe, embed, audio[controls], video[controls]';
+
+  // Whether `hit` is inside a <label> whose associated control is `target` itself, with no
+  // interactive content (a real link, not an ARIA role or onclick handler) between the hit and
+  // the label — a click at target's own coordinates reaches target through such a label
+  // regardless (browsers forward a plain label click to its control natively), which is
+  // exactly the visually-hidden-checkbox pattern, not a real "covered" problem. labelNotes
+  // already surfaces a disabled control.
   function isOwnLabel(hit, target) {
-    const label = dom.closest(hit, "label");
-    if (!label) return false;
-    const control = label instanceof HTMLLabelElement ? labelControlGet.call(label) : null;
-    return control === target;
+    const label = enclosingLabel(hit);
+    if (!label || labelControlGet.call(label) !== target) return false;
+    let n = hit;
+    while (n !== label) {
+      if (n !== target && n instanceof Element && dom.matches(n, LABEL_ESCAPE_SELECTOR)) return false;
+      n = flatTreeParent(n);
+    }
+    return true;
+  }
+
+  // Scrolls el into view and reports the new rounded center plus whether anything observable
+  // actually moved: the target's own center, or the window's scroll position. Either alone can
+  // miss a real scroll: a position:sticky target can stay clamped at the same viewport-relative
+  // spot across a wide scroll range (its own rect never changes even though window.scrollY
+  // moves a lot), and comparing only the rect would call that "didn't scroll".
+  function scrollIntoViewIfMoved(el, x, y) {
+    const beforeScrollX = scrollX, beforeScrollY = scrollY;
+    dom.scrollIntoView(el, { block: "center", inline: "center", behavior: "instant" });
+    const rect = dom.rect(el);
+    const newX = Math.round(rect.x + rect.width / 2);
+    const newY = Math.round(rect.y + rect.height / 2);
+    const moved = newX !== x || newY !== y || scrollX !== beforeScrollX || scrollY !== beforeScrollY;
+    return { x: newX, y: newY, moved };
   }
 
   function getRefTarget(refId) {
@@ -723,13 +771,10 @@
 
     let scrolled = false;
     if (outOfView()) {
-      dom.scrollIntoView(el, { block: "center", inline: "center", behavior: "instant" });
-      rect = dom.rect(el);
-      const newX = Math.round(rect.x + rect.width / 2);
-      const newY = Math.round(rect.y + rect.height / 2);
-      if (newX !== x || newY !== y) scrolled = true;
-      x = newX;
-      y = newY;
+      const result = scrollIntoViewIfMoved(el, x, y);
+      x = result.x;
+      y = result.y;
+      if (result.moved) scrolled = true;
       if (outOfView()) {
         return { error: `Element ${refId} is outside the viewport and could not be scrolled into view.` };
       }
@@ -742,15 +787,12 @@
       // (scrolled) area of its own scroll container(s) — a clipped target can still hit-test
       // to whatever's painted behind it. Try scrolling it into view once more before
       // concluding it's genuinely covered by something else. `scrolled` only becomes true if
-      // this actually moves the target (e.g. a covered target on a page with nothing to
-      // scroll must not claim it scrolled anything).
-      dom.scrollIntoView(el, { block: "center", inline: "center", behavior: "instant" });
-      rect = dom.rect(el);
-      const newX = Math.round(rect.x + rect.width / 2);
-      const newY = Math.round(rect.y + rect.height / 2);
-      if (newX !== x || newY !== y) scrolled = true;
-      x = newX;
-      y = newY;
+      // this actually moves something (e.g. a covered target on a page with nothing to scroll
+      // must not claim it scrolled anything).
+      const result = scrollIntoViewIfMoved(el, x, y);
+      x = result.x;
+      y = result.y;
+      if (result.moved) scrolled = true;
       hit = deepElementFromPoint(x, y);
       covered = !isInFlatTree(hit, el) && !isOwnLabel(hit, el);
     }
