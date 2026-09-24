@@ -674,29 +674,44 @@ const toolHandlers = {
     let coordinate = args.coordinate;
     // Click actions and hover accept either a ref or a coordinate: a ref is resolved (and
     // scrolled into view if needed) by getRefTarget; a bare coordinate is only hit-tested by
-    // probePoint, to name what it hits and to refuse one that's outside the viewport. Neither
-    // applies to scroll_to (handled in its own case below) or to scroll/left_click_drag, which
-    // only ever take a plain coordinate.
+    // probePoint, to name what it hits and to refuse one that's outside the viewport. scroll
+    // and left_click_drag also accept a ref (restored below, resolved the same way as click
+    // actions) but never a probed/refused coordinate, since neither is "clicking" a point the
+    // way the actions above are. scroll_to has its own ref handling in its case below.
     const isPointerAction = ["left_click", "right_click", "double_click", "triple_click", "hover"].includes(action);
+    const refResolvesToCoordinate = isPointerAction || action === "scroll" || action === "left_click_drag";
     let scrolled = false;
     let hit = "";
     let notes = [];
-    if (isPointerAction && args.ref && !coordinate) {
+    if (refResolvesToCoordinate && args.ref && !coordinate) {
       const resp = await sendContentMessage(tabId, { type: "getRefTarget", ref: args.ref });
       const target = resp?.result;
       if (!target || target.error) return { content: [{ type: "text", text: target?.error || `Could not resolve ref "${args.ref}".` }] };
       coordinate = [target.x, target.y];
-      scrolled = target.scrolled;
-      hit = target.hit;
-      notes = target.notes;
-    } else if (isPointerAction && coordinate) {
-      const resp = await sendContentMessage(tabId, { type: "probePoint", x: coordinate[0], y: coordinate[1] });
-      const probe = resp?.result;
-      if (!probe || !probe.inViewport) {
-        return { content: [{ type: "text", text: `Coordinate (${coordinate[0]}, ${coordinate[1]}) is outside the viewport (${probe?.viewport || ""}). Scroll first or use a ref.` }] };
+      if (isPointerAction) {
+        scrolled = target.scrolled;
+        hit = target.hit;
+        notes = target.notes;
       }
-      hit = probe.hit;
-      notes = probe.notes;
+    } else if (isPointerAction && coordinate) {
+      // A page where no content script can run at all (a certificate interstitial, a network
+      // error page) never answers this message. Refuse only on an explicit "outside the
+      // viewport" verdict; anything else (no content script, an old one without this handler)
+      // falls through and the click still goes ahead, just without hit info.
+      let probe = null;
+      try {
+        const resp = await sendContentMessage(tabId, { type: "probePoint", x: coordinate[0], y: coordinate[1] });
+        probe = resp?.result;
+      } catch {
+        probe = null;
+      }
+      if (probe?.inViewport === false) {
+        return { content: [{ type: "text", text: `Coordinate (${coordinate[0]}, ${coordinate[1]}) is outside the viewport (${probe.viewport || ""}). Scroll first or use a ref.` }] };
+      }
+      if (probe) {
+        hit = probe.hit;
+        notes = probe.notes;
+      }
     }
 
     const modifiers = parseModifierString(args.modifiers);
@@ -834,6 +849,7 @@ const toolHandlers = {
           const resp = await sendContentMessage(tabId, { type: "scrollToRef", ref: args.ref });
           const target = resp?.result;
           if (!target || target.error) return { content: [{ type: "text", text: target?.error || `Could not resolve ref "${args.ref}".` }] };
+          if (!target.inViewport) return { content: [{ type: "text", text: `Scrolled toward ${args.ref} but it is still outside the viewport at (${target.x}, ${target.y}).` }] };
           return { content: [{ type: "text", text: `Scrolled ${args.ref} into view at (${target.x}, ${target.y}).` }] };
         }
         await cdp(tabId, "Runtime.evaluate", { expression: `window.scrollTo(${coordinate[0]}, ${coordinate[1]})` });

@@ -30,8 +30,10 @@
   const docQueryFn = Document.prototype.querySelector;
   const docByIdFn = Document.prototype.getElementById;
   const docElementFromPointFn = Document.prototype.elementFromPoint;
-  const containsFn = Node.prototype.contains;
   const scrollIntoViewFn = Element.prototype.scrollIntoView;
+  const parentNodeGet = Object.getOwnPropertyDescriptor(Node.prototype, "parentNode").get;
+  const isConnectedGet = Object.getOwnPropertyDescriptor(Node.prototype, "isConnected").get;
+  const assignedSlotGet = Object.getOwnPropertyDescriptor(Element.prototype, "assignedSlot").get;
   // Tag-owned getter (HTMLLabelElement only): guarded by `instanceof` at its one call site
   // (labelNotes), the same rule as offsetParentGet above, so it's not part of the dom object.
   const labelControlGet = Object.getOwnPropertyDescriptor(HTMLLabelElement.prototype, "control").get;
@@ -56,7 +58,8 @@
     closest: (el, sel) => (el ? closestFn.call(el, sel) : null),
     matches: (el, sel) => (el ? matchesFn.call(el, sel) : false),
     rect: (el) => (el ? rectFn.call(el) : null),
-    contains: (el, other) => (el ? containsFn.call(el, other) : false),
+    parentNode: (n) => (n ? parentNodeGet.call(n) : null),
+    isConnected: (n) => (n ? isConnectedGet.call(n) : false),
     scrollIntoView: (el, opts) => { if (el) scrollIntoViewFn.call(el, opts); },
     str,
     docTitle: () => str(docTitleGet.call(document)),
@@ -400,14 +403,18 @@
       if (searchable.includes(q)) {
         const ref = getOrAssignRef(el);
         const rect = dom.rect(el);
-        const cx = rect.x + rect.width / 2;
-        const cy = rect.y + rect.height / 2;
+        // Round before deciding in/out of viewport (not after): a float center right at the
+        // edge (e.g. innerHeight - 0.5) is genuinely inside, but rounds to a pixel that isn't,
+        // and coordinates always report the rounded value. Deciding on the unrounded float
+        // would disagree with the very point a click actually lands on.
+        const x = Math.round(rect.x + rect.width / 2);
+        const y = Math.round(rect.y + rect.height / 2);
         results.push({
           ref,
           role: role || tag,
           name: name || text.substring(0, 80),
-          coordinates: [Math.round(cx), Math.round(cy)],
-          inViewport: cx >= 0 && cx < innerWidth && cy >= 0 && cy < innerHeight,
+          coordinates: [x, y],
+          inViewport: x >= 0 && x < innerWidth && y >= 0 && y < innerHeight && !clippedByAncestor(x, y, el),
         });
       }
     }
@@ -559,6 +566,67 @@
 
   // --- Click targeting: describe what's at a point, scroll refs into view, hit-test ---
 
+  // The flat-tree parent of a node: its assigned slot if it's been distributed into one
+  // (slotted content lives in the light DOM, not as a child of the shadow tree it renders
+  // into), else a ShadowRoot's host once its own parentNode chain runs out, else its regular
+  // parentNode. Node.contains() and Element.closest() never cross a shadow boundary, so a
+  // plain ancestor walk misses slotted content and shadow-internal nodes; walking the flat
+  // tree instead follows what's actually rendered on screen.
+  function flatTreeParent(node) {
+    if (node instanceof Element) {
+      const slot = assignedSlotGet.call(node);
+      if (slot) return slot;
+    }
+    if (node instanceof ShadowRoot) return node.host;
+    return dom.parentNode(node);
+  }
+
+  // Whether `hit` is `target` or a flat-tree descendant of it (see flatTreeParent).
+  function isInFlatTree(hit, target) {
+    let n = hit;
+    while (n) {
+      if (n === target) return true;
+      n = flatTreeParent(n);
+    }
+    return false;
+  }
+
+  const INTERACTIVE_SELECTOR = 'a[href], button, input, select, textarea, label, summary, [role="button"], [role="link"], [role="checkbox"], [role="menuitem"], [role="tab"], [role="option"], [contenteditable], [onclick]';
+
+  // Hit-testing often lands on a decorative inner node (an icon's <path>, a styled <span>)
+  // rather than the interactive element it decorates. Walk the flat tree up from the raw hit
+  // and describe the nearest thing that actually looks clickable, falling back to the raw hit
+  // itself when nothing on the way up matches.
+  function nearestInteractive(hit) {
+    let n = hit;
+    while (n) {
+      if (n instanceof Element && dom.matches(n, INTERACTIVE_SELECTOR)) return n;
+      n = flatTreeParent(n);
+    }
+    return hit;
+  }
+
+  // True when the point (x, y) falls outside the visible (scrolled) area of some ancestor
+  // that clips overflow. The page-viewport check alone can't see this: an element's own rect
+  // is still computed in full even when a container clips it from view, so a target can pass
+  // that check while still being invisible inside its own scroll container.
+  function clippedByAncestor(x, y, el) {
+    let node = flatTreeParent(el);
+    while (node) {
+      if (node instanceof Element) {
+        const style = getComputedStyle(node);
+        const clipsX = style.overflowX !== "visible";
+        const clipsY = style.overflowY !== "visible";
+        if (clipsX || clipsY) {
+          const r = dom.rect(node);
+          if ((clipsX && (x < r.x || x >= r.x + r.width)) || (clipsY && (y < r.y || y >= r.y + r.height))) return true;
+        }
+      }
+      node = flatTreeParent(node);
+    }
+    return false;
+  }
+
   // tag + #id + .firstClass + ' "name"' (accessible name, clipped to 40 chars), the whole
   // string capped at 80 chars. E.g. `button#go.primary "Sign in"`.
   function describeElement(el) {
@@ -605,39 +673,55 @@
   function getRefTarget(refId) {
     const el = resolveRef(refId);
     if (!el) return { error: `Element ${refId} not found. Take a new read_page or find.` };
+    if (!dom.isConnected(el)) return { error: `Element ${refId} no longer exists. Take a new read_page or find.` };
 
     let rect = dom.rect(el);
     if (rect.width === 0 || rect.height === 0) {
       return { error: `Element ${refId} has no size (hidden?).` };
     }
 
-    let cx = rect.x + rect.width / 2;
-    let cy = rect.y + rect.height / 2;
-    const outOfView = () => cx < 0 || cx >= innerWidth || cy < 0 || cy >= innerHeight;
+    // Round before deciding in/out of viewport (not after): a float center right at the edge
+    // (e.g. innerHeight - 0.5) is genuinely inside, but rounds to a pixel that isn't, and the
+    // rounded value is what's actually hit-tested and dispatched. Deciding on the unrounded
+    // float would disagree with the very point the click lands on.
+    let x = Math.round(rect.x + rect.width / 2);
+    let y = Math.round(rect.y + rect.height / 2);
+    const outOfView = () => x < 0 || x >= innerWidth || y < 0 || y >= innerHeight;
 
     let scrolled = false;
     if (outOfView()) {
       dom.scrollIntoView(el, { block: "center", inline: "center", behavior: "instant" });
       scrolled = true;
       rect = dom.rect(el);
-      cx = rect.x + rect.width / 2;
-      cy = rect.y + rect.height / 2;
+      x = Math.round(rect.x + rect.width / 2);
+      y = Math.round(rect.y + rect.height / 2);
       if (outOfView()) {
         return { error: `Element ${refId} is outside the viewport and could not be scrolled into view.` };
       }
     }
 
-    const x = Math.round(cx);
-    const y = Math.round(cy);
-    const hit = deepElementFromPoint(x, y);
-    const shadow = dom.shadowRoot(el);
-    const covered = hit !== el && !dom.contains(el, hit) && !dom.contains(shadow, hit);
+    let hit = deepElementFromPoint(x, y);
+    let covered = !isInFlatTree(hit, el);
+    if (covered) {
+      // Passing the page-viewport check doesn't mean the element is inside the visible
+      // (scrolled) area of its own scroll container(s) — a clipped target can still hit-test
+      // to whatever's painted behind it. Try scrolling it into view once more before
+      // concluding it's genuinely covered by something else.
+      dom.scrollIntoView(el, { block: "center", inline: "center", behavior: "instant" });
+      scrolled = true;
+      rect = dom.rect(el);
+      x = Math.round(rect.x + rect.width / 2);
+      y = Math.round(rect.y + rect.height / 2);
+      hit = deepElementFromPoint(x, y);
+      covered = !isInFlatTree(hit, el);
+    }
 
+    const shownHit = nearestInteractive(hit);
     const notes = [];
-    if (covered) notes.push(`The click point is covered by ${describeElement(hit)}.`);
+    if (covered) notes.push(`The click point is covered by ${describeElement(shownHit)}.`);
     notes.push(...labelNotes(hit));
 
-    return { x, y, scrolled, hit: describeElement(hit), covered, notes };
+    return { x, y, scrolled, hit: describeElement(shownHit), covered, notes };
   }
 
   function probePoint(x, y) {
@@ -645,7 +729,7 @@
     return {
       inViewport: x >= 0 && x < innerWidth && y >= 0 && y < innerHeight,
       viewport: `${innerWidth}x${innerHeight}`,
-      hit: describeElement(hit),
+      hit: describeElement(nearestInteractive(hit)),
       notes: labelNotes(hit),
     };
   }
@@ -653,6 +737,11 @@
   function scrollToRef(refId) {
     const el = resolveRef(refId);
     if (!el) return { error: `Element ${refId} not found. Take a new read_page or find.` };
+    if (!dom.isConnected(el)) return { error: `Element ${refId} no longer exists. Take a new read_page or find.` };
+    const rect0 = dom.rect(el);
+    if (rect0.width === 0 || rect0.height === 0) {
+      return { error: `Element ${refId} has no size (hidden?).` };
+    }
     dom.scrollIntoView(el, { block: "center", inline: "center", behavior: "instant" });
     const rect = dom.rect(el);
     const x = Math.round(rect.x + rect.width / 2);
