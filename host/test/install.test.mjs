@@ -1,7 +1,8 @@
-// Covers install.sh's agent-skill symlink logic only (M9): does it relink,
-// leave alone, or warn correctly for every combination of old-link shape
+// Covers install.sh's agent-skill symlink logic: does it relink, leave
+// alone, or warn correctly for every combination of old-link shape
 // (absolute/relative, existing/dangling, physical vs. symlink-reached) and
-// repo (this one/another one)?
+// repo (this one/another one)? Also covers how the native host wrapper and
+// manifest it writes carry a checkout path with unusual characters.
 //
 // Every test runs install.sh from an ISOLATED TEMP COPY of the files it
 // needs (a fresh git repo), never the real checkout under test (N4):
@@ -45,9 +46,9 @@ function skillLink(home) {
   return path.join(home, ".claude", "skills", "open-claude-in-chrome");
 }
 
-function runInstall(repoRoot, home) {
+function runInstall(repoRoot, home, extensionIds = ["faketestextensionid"]) {
   fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
-  return execFileSync(path.join(repoRoot, "install.sh"), ["faketestextensionid"], {
+  return execFileSync(path.join(repoRoot, "install.sh"), extensionIds, {
     cwd: repoRoot,
     env: { ...process.env, HOME: home },
     ...EXEC_OPTS,
@@ -230,4 +231,70 @@ test("a dangling old link unrelated to this repo is left alone and the message n
   const out = runInstall(repo, home);
   assert.equal(fs.readlinkSync(link), unrelatedGoneTarget, "an unrelated dangling link must be left untouched");
   assert.match(out, /dangling/);
+});
+
+// The browser starts the native host through the wrapper install.sh writes,
+// which it finds through the manifest's "path". A checkout path holding
+// characters that are special in sh or in JSON must reach both as the exact
+// same string, and nothing in it may run as a command.
+function chromeManifestDir(home) {
+  return process.platform === "darwin"
+    ? path.join(home, "Library", "Application Support", "Google", "Chrome", "NativeMessagingHosts")
+    : path.join(home, ".config", "google-chrome", "NativeMessagingHosts");
+}
+
+function manifestFile(home) {
+  return path.join(chromeManifestDir(home), "com.anthropic.open_claude_in_chrome.json");
+}
+
+for (const [label, dirName] of [
+  ["$, backticks and $(...)", "dollar $HOME tick `touch pwned` sub $(touch pwned)"],
+  ["\", \\, $, a backtick, $(...) and single quotes", `all " back\\slash $HOME \`touch pwned\` $(touch pwned) 'q'`],
+]) {
+  test(`a checkout path with ${label} gives a valid wrapper and manifest, and nothing in it runs`, { timeout: 10000 }, () => {
+    const repo = makeTempRepo(path.join(mkdtemp(), dirName));
+    const home = mkdtemp();
+    fs.mkdirSync(path.dirname(chromeManifestDir(home)), { recursive: true }); // install.sh skips a browser whose folder is missing
+    const hostJs = path.join(repo, "host", "native-host.js");
+    fs.writeFileSync(hostJs, "process.stdout.write(JSON.stringify(process.argv.slice(1)));\n");
+    runInstall(repo, home);
+    assert.ok(!fs.existsSync(path.join(repo, "pwned")), "install.sh must not run anything from the checkout path");
+
+    const wrapper = path.join(repo, "host", "native-host-wrapper.sh");
+    const manifest = JSON.parse(fs.readFileSync(manifestFile(home), "utf-8"));
+    assert.equal(manifest.path, wrapper);
+    execFileSync("/bin/sh", ["-n", wrapper], EXEC_OPTS);
+
+    const cwd = mkdtemp();
+    let out, runError;
+    try {
+      out = execFileSync(wrapper, [], { cwd, env: { ...process.env, HOME: home }, ...EXEC_OPTS });
+    } catch (err) {
+      runError = err;
+    }
+    assert.ok(!fs.existsSync(path.join(cwd, "pwned")), "the wrapper must not run anything from the checkout path");
+    assert.ifError(runError);
+    assert.deepEqual(JSON.parse(out), [hostJs]);
+  });
+}
+
+test("the manifest for ordinary extension ids keeps its exact bytes", { timeout: 10000 }, () => {
+  const repo = makeTempRepo();
+  const home = mkdtemp();
+  fs.mkdirSync(path.dirname(chromeManifestDir(home)), { recursive: true });
+  runInstall(repo, home, ["aaaabbbbccccddddeeeeffffgggghhhh", "ppppoooonnnnmmmmllllkkkkjjjjiiii"]);
+  const wrapper = path.join(repo, "host", "native-host-wrapper.sh");
+  assert.equal(fs.readFileSync(manifestFile(home), "utf-8"), [
+    "{",
+    '  "name": "com.anthropic.open_claude_in_chrome",',
+    '  "description": "Open Claude in Chrome Native Messaging Host",',
+    `  "path": "${wrapper}",`,
+    '  "type": "stdio",',
+    '  "allowed_origins": [',
+    '    "chrome-extension://aaaabbbbccccddddeeeeffffgggghhhh/",',
+    '    "chrome-extension://ppppoooonnnnmmmmllllkkkkjjjjiiii/"',
+    "  ]",
+    "}",
+    "",
+  ].join("\n"));
 });

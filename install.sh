@@ -45,36 +45,37 @@ if [ ! -d "$HOST_DIR/node_modules" ]; then
   cd "$SCRIPT_DIR"
 fi
 
+# Prints $1 as one single-quoted sh word, with each ' inside written as '\''.
+# Nothing else is special inside single quotes, so the checkout path reaches
+# the wrapper as written, whatever quotes, $, backticks or backslashes it has.
+sh_quote() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
 # Create the native host wrapper script
 # Chrome launches this via native messaging — it needs to find node and the script.
 cat > "$NATIVE_HOST_PATH" << WRAPPER
 #!/bin/sh
-exec "$(which node)" "$HOST_DIR/native-host.js"
+exec $(sh_quote "$(which node)") $(sh_quote "$HOST_DIR/native-host.js")
 WRAPPER
 chmod +x "$NATIVE_HOST_PATH"
 
 echo "Created native host wrapper: $NATIVE_HOST_PATH"
 
-# Build allowed_origins array from all extension IDs
-ORIGINS=""
-for i in "${!EXTENSION_IDS[@]}"; do
-  if [ $i -gt 0 ]; then ORIGINS="$ORIGINS,"; fi
-  ORIGINS="$ORIGINS
-    \"chrome-extension://${EXTENSION_IDS[$i]}/\""
-done
-
-# Native messaging host manifest
+# Native messaging host manifest, built by node so JSON.stringify escapes the
+# path and the extension IDs.
 generate_manifest() {
-  cat << EOF
-{
-  "name": "$HOST_NAME",
-  "description": "Open Claude in Chrome Native Messaging Host",
-  "path": "$NATIVE_HOST_PATH",
-  "type": "stdio",
-  "allowed_origins": [$ORIGINS
-  ]
-}
-EOF
+  node -e '
+    const [name, hostPath, ...ids] = process.argv.slice(1);
+    const manifest = {
+      name,
+      description: "Open Claude in Chrome Native Messaging Host",
+      path: hostPath,
+      type: "stdio",
+      allowed_origins: ids.map((id) => `chrome-extension://${id}/`),
+    };
+    process.stdout.write(JSON.stringify(manifest, null, 2) + "\n");
+  ' "$HOST_NAME" "$NATIVE_HOST_PATH" "${EXTENSION_IDS[@]}"
 }
 
 # Platform-specific installation
