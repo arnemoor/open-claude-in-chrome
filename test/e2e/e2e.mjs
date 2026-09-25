@@ -597,7 +597,15 @@ document.getElementById('file-input').addEventListener('change', function (e) {
     await cdpSend("Runtime.enable", {}, sessionId);
     const pEval = (expression, opts) => evalInPage(cdpSend, sessionId, expression, opts);
 
-    await waitFor(() => pEval("document.getElementById('audit-enabled') !== null"), { timeoutMs: 10000, intervalMs: 200 });
+    // The page's scripts sit at the end of <body>, so the checkbox exists
+    // before options.js has attached its "change" listener. A click then only
+    // toggles the box, and options.js resets it to the stored value. By the
+    // load event options.js has run. The element check keeps the new tab's
+    // initial about:blank, already "complete", from passing.
+    await waitFor(
+      () => pEval("document.getElementById('audit-enabled') !== null && document.readyState === 'complete'"),
+      { timeoutMs: 10000, intervalMs: 200 },
+    );
 
     // "Prefer the real checkbox": a real .click() toggles it and fires the
     // page's own "change" listener, which is what actually persists the setting
