@@ -763,6 +763,69 @@ test("a thrown error's outcome is scrubbed of a URL's query and fragment before 
   assert.match(outcome, /^error:.*bank\.test\/reset\?…#…/);
 });
 
+// A refusal or failure comes back as a result with isError, not as a throw, and
+// must still be recorded as an error, with its text scrubbed like a thrown one.
+test("a refused call is recorded with outcome error: and its text", async () => {
+  const fakeStore = makeFakeStore();
+  const bg = await loadBackground({
+    beforeRun: injectFakeStore(fakeStore),
+    overrides: { tabs: { get: async (id) => ({ id, windowId: 1, status: "complete", url: "https://example.test/", groupId: 8 }) } },
+  });
+  await flush();
+  await bg.chrome.storage.local.set({ audit: { enabled: true, retentionDays: 7 } });
+
+  bg.deliver({ type: "tool_request", id: "1.s1.1", tool: "get_page_text", args: { tabId: 99 }, session: SESSION });
+  await flush();
+
+  assert.equal(fakeStore.actions.length, 1);
+  assert.equal(fakeStore.actions[0].outcome, "error: Tab 99 is not in the MCP group.");
+  assert.equal(bg.posted[0].type, "tool_response");
+  assert.equal(bg.posted[0].result.isError, true);
+});
+
+test("an error result's outcome is scrubbed of a URL's query and fragment", async () => {
+  const fakeStore = makeFakeStore();
+  const bg = await loadBackground({
+    beforeRun: injectFakeStore(fakeStore),
+    overrides: { tabs: { update: async () => { throw new Error("boom"); } } },
+  });
+  await flush();
+  await bg.chrome.storage.local.set({ audit: { enabled: true, retentionDays: 7 } });
+
+  bg.deliver({ type: "tool_request", id: "1.s1.1", tool: "navigate", args: { url: "https://x.test/reset?token=SECRET#frag", tabId: bg.tabId }, session: SESSION });
+  await flush(100);
+
+  assert.equal(fakeStore.actions.length, 1);
+  const { outcome } = fakeStore.actions[0];
+  assert.doesNotMatch(outcome, /SECRET|frag/);
+  assert.match(outcome, /^error: Could not navigate to https:\/\/x\.test\/reset\?…#…/);
+});
+
+test("a batch that stops on an error result is recorded as an error, and so is the failed action, and the rest is not run", async () => {
+  const fakeStore = makeFakeStore();
+  const content = { invoke: async (msg) => (msg.type === "setFormValue" ? { result: { error: "Element ref_99 not found or was garbage collected." } } : { result: [] }) };
+  const bg = await loadBackground({ content, beforeRun: injectFakeStore(fakeStore) });
+  await flush();
+  await bg.chrome.storage.local.set({ audit: { enabled: true, retentionDays: 7 } });
+
+  bg.deliver({
+    type: "tool_request", id: "1.s1.1", tool: "browser_batch",
+    args: { actions: [
+      { name: "computer", input: { action: "screenshot", tabId: bg.tabId } },
+      { name: "form_input", input: { ref: "ref_99", value: "100", tabId: bg.tabId } },
+      { name: "computer", input: { action: "key", text: "Enter", tabId: bg.tabId } },
+    ] },
+    session: SESSION,
+  });
+  await flush(300);
+
+  assert.deepEqual(fakeStore.actions.map((a) => [a.tool, a.outcome]), [
+    ["computer", "ok"],
+    ["form_input", "error: Error: Element ref_99 not found or was garbage collected."],
+    ["browser_batch", "error: Action 2 (form_input) failed, so the batch stopped."],
+  ]);
+});
+
 // M8: audit.js must not leak its internal helpers into the shared worker scope.
 test("audit.js exposes only globalThis.Audit, not its internal helpers", async () => {
   const bg = await loadBackground({ beforeRun: injectFakeStore(makeFakeStore()) });

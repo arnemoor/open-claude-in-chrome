@@ -332,7 +332,7 @@
     if (startRefId) {
       const el = resolveRef(startRefId);
       if (el) root = el;
-      else return `Error: ref_id "${startRefId}" not found or element was garbage collected.`;
+      else return { error: `Error: ref_id "${startRefId}" not found or element was garbage collected.` };
     }
 
     walk(root, 0, "");

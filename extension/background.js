@@ -814,6 +814,13 @@ function normalizeNavigateUrl(input, ownExtensionId) {
 }
 
 // --- Tool handlers ---
+
+// A reply that reports a refusal or a failure. isError lets the MCP client, and browser_batch,
+// tell it from a success without reading its text.
+function errorResult(text) {
+  return { content: [{ type: "text", text }], isError: true };
+}
+
 const toolHandlers = {
   async tabs_context_mcp(args) {
     await ensureTabGroup(args.createIfEmpty);
@@ -837,7 +844,7 @@ const toolHandlers = {
       await ensureTabGroup(true);
       groupTabs = await chrome.tabs.query({ groupId: tabGroupId });
       if (groupTabs.length === 0) {
-        return { content: [{ type: "text", text: "Could not create or find the MCP tab group." }] };
+        return errorResult("Could not create or find the MCP tab group.");
       }
     }
     // about:blank, not the default New Tab Page: that is a chrome:// page, which refuses the
@@ -859,7 +866,7 @@ const toolHandlers = {
   async tabs_close_mcp(args) {
     const { tabId } = args;
     const tabError = await tabAccessError(tabId, { allowBlockedUrl: true, allowDialog: true });
-    if (tabError) return { content: [{ type: "text", text: tabError }] };
+    if (tabError) return errorResult(tabError);
     // chrome.tabs.onRemoved cleans up our per-tab state (attached debugger,
     // console/network buffers). Chrome auto-removes the tab group when its last
     // tab is closed, so no extra group teardown is needed here.
@@ -870,7 +877,7 @@ const toolHandlers = {
   async navigate(args) {
     const { url, tabId } = args;
     const tabError = await tabAccessError(tabId, { allowDialog: true });
-    if (tabError) return { content: [{ type: "text", text: tabError }] };
+    if (tabError) return errorResult(tabError);
 
     // Attach before navigating, not after: otherwise a page that opens a dialog on load is
     // never seen, and every CDP call then hangs for the full 30s until the user closes it.
@@ -892,14 +899,14 @@ const toolHandlers = {
     } else {
       const normalized = normalizeNavigateUrl(url, chrome.runtime.id);
       if (normalized.error) {
-        return { content: [{ type: "text", text: normalized.error }] };
+        return errorResult(normalized.error);
       }
       try {
         await chrome.tabs.update(tabId, { url: normalized.url });
       } catch (err) {
         let message = err.message;
         if (!message.endsWith(".")) message += ".";
-        return { content: [{ type: "text", text: `Could not navigate to ${normalized.url}: ${message}` }] };
+        return errorResult(`Could not navigate to ${normalized.url}: ${message}`);
       }
     }
 
@@ -926,7 +933,7 @@ const toolHandlers = {
     // land on a local file or this extension's own page — refuse instead of reporting its title.
     const tab = await chrome.tabs.get(tabId);
     if (isBlockedUrl(tab.url, chrome.runtime.id)) {
-      return { content: [{ type: "text", text: `Tab ${tabId} shows a local file or this extension's own page, which the agent cannot use.` }] };
+      return errorResult(`Tab ${tabId} shows a local file or this extension's own page, which the agent cannot use.`);
     }
 
     const tabs = await chrome.tabs.query({ groupId: tabGroupId });
@@ -942,7 +949,7 @@ const toolHandlers = {
   async computer(args) {
     const { action, tabId } = args;
     const tabError = await tabAccessError(tabId);
-    if (tabError) return { content: [{ type: "text", text: tabError }] };
+    if (tabError) return errorResult(tabError);
 
     let coordinate = args.coordinate;
     // Click actions and hover accept either a ref or a coordinate: a ref is resolved (and
@@ -959,7 +966,7 @@ const toolHandlers = {
     if (refResolvesToCoordinate && args.ref && !coordinate) {
       const resp = await sendContentMessage(tabId, { type: "getRefTarget", ref: args.ref });
       const target = resp?.result;
-      if (!target || target.error) return { content: [{ type: "text", text: target?.error || `Could not resolve ref "${args.ref}".` }] };
+      if (!target || target.error) return errorResult(target?.error || `Could not resolve ref "${args.ref}".`);
       coordinate = [target.x, target.y];
       // Captured regardless of action: left_click_drag needs to know a ref scroll happened
       // even though it doesn't report hit/notes the way a click does (see its case below).
@@ -981,10 +988,10 @@ const toolHandlers = {
         probe = null;
       }
       if (probe?.error) {
-        return { content: [{ type: "text", text: probe.error }] };
+        return errorResult(probe.error);
       }
       if (probe?.inViewport === false) {
-        return { content: [{ type: "text", text: `Coordinate (${coordinate[0]}, ${coordinate[1]}) is outside the viewport (${probe.viewport || ""}). Scroll first or use a ref.` }] };
+        return errorResult(`Coordinate (${coordinate[0]}, ${coordinate[1]}) is outside the viewport (${probe.viewport || ""}). Scroll first or use a ref.`);
       }
       if (probe) {
         hit = probe.hit;
@@ -1010,38 +1017,38 @@ const toolHandlers = {
       }
 
       case "left_click": {
-        if (!coordinate) return { content: [{ type: "text", text: "coordinate is required for left_click" }] };
+        if (!coordinate) return errorResult("coordinate is required for left_click");
         const text = await dispatchPointerAction("Clicked", coordinate, hit, scrolled, notes, () => mouseClick(tabId, coordinate[0], coordinate[1], { modifiers }));
         return { content: [{ type: "text", text }] };
       }
 
       case "right_click": {
-        if (!coordinate) return { content: [{ type: "text", text: "coordinate is required for right_click" }] };
+        if (!coordinate) return errorResult("coordinate is required for right_click");
         const text = await dispatchPointerAction("Right-clicked", coordinate, hit, scrolled, notes, () => mouseClick(tabId, coordinate[0], coordinate[1], { button: "right", modifiers }));
         return { content: [{ type: "text", text }] };
       }
 
       case "double_click": {
-        if (!coordinate) return { content: [{ type: "text", text: "coordinate is required for double_click" }] };
+        if (!coordinate) return errorResult("coordinate is required for double_click");
         const text = await dispatchPointerAction("Double-clicked", coordinate, hit, scrolled, notes, () => mouseClick(tabId, coordinate[0], coordinate[1], { clickCount: 2, modifiers }));
         return { content: [{ type: "text", text }] };
       }
 
       case "triple_click": {
-        if (!coordinate) return { content: [{ type: "text", text: "coordinate is required for triple_click" }] };
+        if (!coordinate) return errorResult("coordinate is required for triple_click");
         const text = await dispatchPointerAction("Triple-clicked", coordinate, hit, scrolled, notes, () => mouseClick(tabId, coordinate[0], coordinate[1], { clickCount: 3, modifiers }));
         return { content: [{ type: "text", text }] };
       }
 
       case "hover": {
-        if (!coordinate) return { content: [{ type: "text", text: "coordinate is required for hover" }] };
+        if (!coordinate) return errorResult("coordinate is required for hover");
         await dispatchMouse(tabId, "mouseMoved", coordinate[0], coordinate[1], { modifiers });
         await sleep(200);
         return { content: [{ type: "text", text: pointerReply("Hovered", coordinate, hit, scrolled, notes) }] };
       }
 
       case "type": {
-        if (!args.text) return { content: [{ type: "text", text: "text is required for type action" }] };
+        if (!args.text) return errorResult("text is required for type action");
         await ensureAttached(tabId);
         // "\r\n" and a lone "\r" both mean one line break. Per-character insertion of an
         // un-normalized "\r\n" would otherwise land as two in a multiline field.
@@ -1076,14 +1083,14 @@ const toolHandlers = {
       }
 
       case "key": {
-        if (!args.text) return { content: [{ type: "text", text: "text is required for key action" }] };
+        if (!args.text) return errorResult("text is required for key action");
         await ensureAttached(tabId);
         const repeat = Math.min(args.repeat || 1, 100);
         let combos;
         try {
           combos = args.text.split(" ").filter(Boolean).map(parseKeyCombo);
         } catch (err) {
-          return { content: [{ type: "text", text: err.message }] };
+          return errorResult(err.message);
         }
         for (let r = 0; r < repeat; r++) {
           for (const { def, modifiers: keyMods } of combos) {
@@ -1095,7 +1102,7 @@ const toolHandlers = {
       }
 
       case "scroll": {
-        if (!coordinate) return { content: [{ type: "text", text: "coordinate is required for scroll" }] };
+        if (!coordinate) return errorResult("coordinate is required for scroll");
         const dir = args.scroll_direction || "down";
         const amount = Math.min(args.scroll_amount || 3, 10);
         const deltaX = dir === "left" ? -amount * 100 : dir === "right" ? amount * 100 : 0;
@@ -1119,12 +1126,12 @@ const toolHandlers = {
       }
 
       case "scroll_to": {
-        if (!coordinate && !args.ref) return { content: [{ type: "text", text: "coordinate or ref is required for scroll_to" }] };
+        if (!coordinate && !args.ref) return errorResult("coordinate or ref is required for scroll_to");
         if (args.ref) {
           const resp = await sendContentMessage(tabId, { type: "scrollToRef", ref: args.ref });
           const target = resp?.result;
-          if (!target || target.error) return { content: [{ type: "text", text: target?.error || `Could not resolve ref "${args.ref}".` }] };
-          if (!target.inViewport) return { content: [{ type: "text", text: `Scrolled toward ${args.ref} but it is still outside the viewport at (${target.x}, ${target.y}).` }] };
+          if (!target || target.error) return errorResult(target?.error || `Could not resolve ref "${args.ref}".`);
+          if (!target.inViewport) return errorResult(`Scrolled toward ${args.ref} but it is still outside the viewport at (${target.x}, ${target.y}).`);
           return { content: [{ type: "text", text: `Scrolled ${args.ref} into view at (${target.x}, ${target.y}).` }] };
         }
         await cdp(tabId, "Runtime.evaluate", { expression: `window.scrollTo(${coordinate[0]}, ${coordinate[1]})` });
@@ -1140,13 +1147,13 @@ const toolHandlers = {
 
       case "left_click_drag": {
         if (!args.start_coordinate || !coordinate) {
-          return { content: [{ type: "text", text: "start_coordinate and coordinate are required for left_click_drag" }] };
+          return errorResult("start_coordinate and coordinate are required for left_click_drag");
         }
         // start_coordinate was read from a screenshot taken before resolving the ref. If that
         // resolution had to scroll the page, everything the caller saw (including
         // start_coordinate) is now stale — dragging from it would start in the wrong place.
         if (args.ref && scrolled) {
-          return { content: [{ type: "text", text: `Scrolled ${args.ref} into view, so start_coordinate is stale. Take a new screenshot and retry the drag.` }] };
+          return errorResult(`Scrolled ${args.ref} into view, so start_coordinate is stale. Take a new screenshot and retry the drag.`);
         }
         const [sx, sy] = args.start_coordinate;
         const [ex, ey] = coordinate;
@@ -1168,7 +1175,7 @@ const toolHandlers = {
 
       case "zoom": {
         if (!args.region || args.region.length !== 4) {
-          return { content: [{ type: "text", text: "region [x0, y0, x1, y1] is required for zoom" }] };
+          return errorResult("region [x0, y0, x1, y1] is required for zoom");
         }
         // Return the full screenshot with the region noted; the caller can crop
         // to it. Screenshots are JPEG (see takeScreenshot), so label them as such.
@@ -1184,14 +1191,14 @@ const toolHandlers = {
       }
 
       default:
-        return { content: [{ type: "text", text: `Unknown computer action: ${action}` }] };
+        return errorResult(`Unknown computer action: ${action}`);
     }
   },
 
   async read_page(args) {
     const { tabId } = args;
     const tabError = await tabAccessError(tabId);
-    if (tabError) return { content: [{ type: "text", text: tabError }] };
+    if (tabError) return errorResult(tabError);
 
     const resp = await sendContentMessage(tabId, {
       type: "generateAccessibilityTree",
@@ -1203,9 +1210,10 @@ const toolHandlers = {
       },
     });
 
-    if (resp?.result?.error) return { content: [{ type: "text", text: resp.result.error }] };
+    if (resp?.result?.error) return errorResult(resp.result.error);
+    if (!resp?.result) return errorResult("Error: Could not generate accessibility tree");
 
-    let tree = resp?.result || "Error: Could not generate accessibility tree";
+    let tree = resp.result;
     // Append viewport dimensions so Claude knows the coordinate space
     const vp = await readViewport(tabId);
     if (vp) tree += `\n\nViewport: ${vp.width}x${vp.height}`;
@@ -1215,11 +1223,11 @@ const toolHandlers = {
   async get_page_text(args) {
     const { tabId } = args;
     const tabError = await tabAccessError(tabId);
-    if (tabError) return { content: [{ type: "text", text: tabError }] };
+    if (tabError) return errorResult(tabError);
 
     const resp = await sendContentMessage(tabId, { type: "getPageText" });
-    if (resp?.result?.error) return { content: [{ type: "text", text: resp.result.error }] };
-    if (!resp?.result) return { content: [{ type: "text", text: "Error: Could not extract page text" }] };
+    if (resp?.result?.error) return errorResult(resp.result.error);
+    if (!resp?.result) return errorResult("Error: Could not extract page text");
 
     try {
       const data = JSON.parse(resp.result);
@@ -1239,10 +1247,10 @@ const toolHandlers = {
   async find(args) {
     const { query, tabId } = args;
     const tabError = await tabAccessError(tabId);
-    if (tabError) return { content: [{ type: "text", text: tabError }] };
+    if (tabError) return errorResult(tabError);
 
     const resp = await sendContentMessage(tabId, { type: "findElements", query });
-    if (resp?.result?.error) return { content: [{ type: "text", text: resp.result.error }] };
+    if (resp?.result?.error) return errorResult(resp.result.error);
     const results = resp?.result || [];
 
     if (results.length === 0) {
@@ -1262,19 +1270,19 @@ const toolHandlers = {
   async form_input(args) {
     const { ref, value, tabId } = args;
     const tabError = await tabAccessError(tabId);
-    if (tabError) return { content: [{ type: "text", text: tabError }] };
+    if (tabError) return errorResult(tabError);
 
     const resp = await sendContentMessage(tabId, { type: "setFormValue", ref, value });
     const result = resp?.result;
 
-    if (result?.error) return { content: [{ type: "text", text: `Error: ${result.error}` }] };
+    if (result?.error) return errorResult(`Error: ${result.error}`);
     return { content: [{ type: "text", text: `Set ${ref} to "${value}". Result: ${JSON.stringify(result)}` }] };
   },
 
   async javascript_tool(args) {
     const { text, tabId } = args;
     const tabError = await tabAccessError(tabId);
-    if (tabError) return { content: [{ type: "text", text: tabError }] };
+    if (tabError) return errorResult(tabError);
 
     await ensureAttached(tabId);
     try {
@@ -1288,9 +1296,7 @@ const toolHandlers = {
       }, 55000);
 
       if (result.exceptionDetails) {
-        return {
-          content: [{ type: "text", text: `Error: ${result.exceptionDetails.text || JSON.stringify(result.exceptionDetails)}` }],
-        };
+        return errorResult(`Error: ${result.exceptionDetails.text || JSON.stringify(result.exceptionDetails)}`);
       }
 
       const val = result.result;
@@ -1299,14 +1305,14 @@ const toolHandlers = {
         content: [{ type: "text", text: val.value !== undefined ? JSON.stringify(val.value) : val.description || String(val) }],
       };
     } catch (e) {
-      return { content: [{ type: "text", text: `Error: ${e.message}` }] };
+      return errorResult(`Error: ${e.message}`);
     }
   },
 
   async read_console_messages(args) {
     const { tabId, pattern, limit = 100, onlyErrors, clear } = args;
     const tabError = await tabAccessError(tabId);
-    if (tabError) return { content: [{ type: "text", text: tabError }] };
+    if (tabError) return errorResult(tabError);
 
     // Ensure console domain is enabled
     await ensureAttached(tabId);
@@ -1349,7 +1355,7 @@ const toolHandlers = {
   async read_network_requests(args) {
     const { tabId, urlPattern, limit = 100, clear } = args;
     const tabError = await tabAccessError(tabId);
-    if (tabError) return { content: [{ type: "text", text: tabError }] };
+    if (tabError) return errorResult(tabError);
 
     // Ensure network domain is enabled
     await ensureAttached(tabId);
@@ -1381,7 +1387,7 @@ const toolHandlers = {
   async resize_window(args) {
     const { width, height, tabId } = args;
     const tabError = await tabAccessError(tabId, { allowDialog: true });
-    if (tabError) return { content: [{ type: "text", text: tabError }] };
+    if (tabError) return errorResult(tabError);
 
     const tab = await chrome.tabs.get(tabId);
     const windowId = tab.windowId;
@@ -1427,37 +1433,38 @@ const toolHandlers = {
 
   // Run a sequence of tool actions in order and aggregate their content blocks
   // (text and images interleave naturally). Each action is { name, input } and
-  // dispatches through the same toolHandlers map as a normal request. Stops on
-  // the first action that throws; nested browser_batch is rejected.
+  // dispatches through the same toolHandlers map as a normal request. Stops at
+  // the first action that throws or replies with isError, so nothing after a
+  // failed step runs, and the batch's own reply then carries isError too.
+  // Nested browser_batch is rejected.
   async browser_batch(args, ctx) {
     const actions = Array.isArray(args.actions) ? args.actions : [];
     if (actions.length === 0) {
-      return { content: [{ type: "text", text: "browser_batch requires a non-empty 'actions' array." }] };
+      return errorResult("browser_batch requires a non-empty 'actions' array.");
     }
 
     const content = [];
+    const fail = (text) => {
+      content.push({ type: "text", text });
+      return { content, isError: true };
+    };
     for (let i = 0; i < actions.length; i++) {
       const name = actions[i]?.name;
       const input = actions[i]?.input || {};
 
-      if (name === "browser_batch") {
-        content.push({ type: "text", text: `Action ${i + 1}: nested browser_batch is not allowed.` });
-        break;
-      }
+      if (name === "browser_batch") return fail(`Action ${i + 1}: nested browser_batch is not allowed.`);
       const handler = toolHandlers[name];
-      if (!handler) {
-        content.push({ type: "text", text: `Action ${i + 1}: unknown tool "${name}".` });
-        break;
-      }
+      if (!handler) return fail(`Action ${i + 1}: unknown tool "${name}".`);
 
       content.push({ type: "text", text: `--- Action ${i + 1}/${actions.length}: ${name} ---` });
+      let result;
       try {
-        const result = await handler(input, ctx);
-        if (result?.content) content.push(...result.content);
+        result = await handler(input, ctx);
       } catch (err) {
-        content.push({ type: "text", text: `Action ${i + 1} (${name}) failed: ${err.message}` });
-        break;
+        return fail(`Action ${i + 1} (${name}) failed: ${err.message}`);
       }
+      if (result?.content) content.push(...result.content);
+      if (result?.isError) return fail(`Action ${i + 1} (${name}) failed, so the batch stopped.`);
     }
 
     return { content };
@@ -1466,19 +1473,19 @@ const toolHandlers = {
   async upload_image(args) {
     const { imageId, ref, coordinate, filename, tabId } = args;
     const tabError = await tabAccessError(tabId);
-    if (tabError) return { content: [{ type: "text", text: tabError }] };
+    if (tabError) return errorResult(tabError);
 
     // Only screenshots captured by the computer tool this session are stored.
     // "user-uploaded" images have no equivalent here (no Claude.ai file channel).
     const base64 = screenshotStore.get(imageId);
     if (!base64) {
-      return { content: [{ type: "text", text: `Image "${imageId}" not found. Only screenshots captured by the computer tool in this session can be uploaded.` }] };
+      return errorResult(`Image "${imageId}" not found. Only screenshots captured by the computer tool in this session can be uploaded.`);
     }
 
     // Best-effort: only the ref path (file input) is supported. The coordinate
     // drag & drop path (e.g. Google Docs) is not implemented in this fork.
     if (!ref) {
-      return { content: [{ type: "text", text: "upload_image requires a 'ref' to a file input in this extension. Coordinate-based drag & drop is not supported." }] };
+      return errorResult("upload_image requires a 'ref' to a file input in this extension. Coordinate-based drag & drop is not supported.");
     }
 
     // Stored screenshots are JPEG (see takeScreenshot). Set the File mime to
@@ -1492,7 +1499,7 @@ const toolHandlers = {
     });
     const result = resp?.result;
     if (!result || result.error) {
-      return { content: [{ type: "text", text: `Error: ${result?.error || "image upload failed"}` }] };
+      return errorResult(`Error: ${result?.error || "image upload failed"}`);
     }
     return { content: [{ type: "text", text: `Uploaded image ${imageId} to ${ref} (${result.name}, ${result.size} bytes).` }] };
   },
@@ -1500,10 +1507,10 @@ const toolHandlers = {
   async file_upload(args) {
     const { paths, ref, tabId } = args;
     const tabError = await tabAccessError(tabId);
-    if (tabError) return { content: [{ type: "text", text: tabError }] };
-    if (!ref) return { content: [{ type: "text", text: "file_upload requires a 'ref' to a file input." }] };
+    if (tabError) return errorResult(tabError);
+    if (!ref) return errorResult("file_upload requires a 'ref' to a file input.");
     if (!Array.isArray(paths) || paths.length === 0) {
-      return { content: [{ type: "text", text: "file_upload requires 'paths' to be a non-empty array of absolute file paths." }] };
+      return errorResult("file_upload requires 'paths' to be a non-empty array of absolute file paths.");
     }
 
     // The host checks every path against the upload allowlist before a request
@@ -1515,7 +1522,7 @@ const toolHandlers = {
     // be reachable by DOM.querySelector from the document root.)
     const mark = await sendContentMessage(tabId, { type: "markFileInput", ref });
     if (!mark?.result || mark.result.error) {
-      return { content: [{ type: "text", text: `Error: ${mark?.result?.error || "could not resolve a file input for the ref"}` }] };
+      return errorResult(`Error: ${mark?.result?.error || "could not resolve a file input for the ref"}`);
     }
     const token = mark.result.token;
 
@@ -1526,7 +1533,7 @@ const toolHandlers = {
         selector: `[data-mcp-file-input="${token}"]`,
       });
       if (!nodeId) {
-        return { content: [{ type: "text", text: "Error: could not locate the file input node via CDP (it may be inside shadow DOM)." }] };
+        return errorResult("Error: could not locate the file input node via CDP (it may be inside shadow DOM).");
       }
       await cdp(tabId, "DOM.setFileInputFiles", { nodeId, files: paths });
     } finally {

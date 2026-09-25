@@ -258,11 +258,20 @@
         }
         const ms = Date.now() - started;
         if (allowed) ensureRecorder(tabId);
-        safeRecord(name, args, ctx, "ok", ms);
+        const outcome = result && result.isError === true ? `error: ${scrubUrls(errorResultText(result), AUDIT_ERROR_CLIP)}` : "ok";
+        safeRecord(name, args, ctx, outcome, ms);
         return result;
       };
     }
     return handlers;
+  }
+
+  // A refusal or a failure comes back as a result with isError, not a throw.
+  // Its last text block says what failed (a browser_batch lists the actions it
+  // ran before the line naming the one that failed).
+  function errorResultText(result) {
+    const texts = (Array.isArray(result.content) ? result.content : []).filter((c) => c && c.type === "text" && typeof c.text === "string");
+    return texts.length > 0 ? texts[texts.length - 1].text : "";
   }
 
   // The owner is set synchronously in wrapHandlers,
