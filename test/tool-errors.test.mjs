@@ -98,6 +98,24 @@ test("upload_image, file_upload, tabs_create_mcp and an empty browser_batch repo
   assert.equal(await refusal(empty, (b) => b.handlers.tabs_create_mcp({})), "Could not create or find the MCP tab group.");
 });
 
+// These tools exist for parity only and do nothing here, so their reply is a failure.
+test("the stub tools reply with isError", async () => {
+  const bg = await loadBackground();
+  const calls = [
+    ["gif_creator", { action: "start_recording", tabId: 11 }],
+    ["shortcuts_list", { tabId: 11 }],
+    ["shortcuts_execute", { tabId: 11, command: "summarize" }],
+    ["switch_browser", {}],
+    ["list_connected_browsers", {}],
+    ["select_browser", { deviceId: "device-1" }],
+  ];
+  for (const [name, args] of calls) {
+    const r = await bg.handlers[name](args);
+    assert.equal(r.isError, true, `${name}: ${JSON.stringify(r)}`);
+    assert.match(r.content[0].text, /not (yet )?(implemented|supported)/, name);
+  }
+});
+
 test("a success carries no isError, and neither do status answers or a click that opened a dialog", async () => {
   let bg;
   const sendCommand = async (t, m, p) => {

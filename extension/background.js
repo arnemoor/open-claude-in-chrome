@@ -1570,31 +1570,31 @@ const toolHandlers = {
   },
 
   async gif_creator(args) {
-    return { content: [{ type: "text", text: "GIF recording is not yet implemented in this extension." }] };
+    return errorResult("GIF recording is not yet implemented in this extension.");
   },
 
   async shortcuts_list(args) {
-    return { content: [{ type: "text", text: "No shortcuts available. Shortcuts are not supported in this extension." }] };
+    return errorResult("No shortcuts available. Shortcuts are not supported in this extension.");
   },
 
   async shortcuts_execute(args) {
-    return { content: [{ type: "text", text: "Shortcuts are not supported in this extension." }] };
+    return errorResult("Shortcuts are not supported in this extension.");
   },
 
   async switch_browser(args) {
-    return { content: [{ type: "text", text: "Browser switching is not yet supported. The extension connects to whichever browser has it loaded (Chrome, Brave, or Edge). To switch, disable the extension in the current browser, enable it in the target browser, and restart both." }] };
+    return errorResult("Browser switching is not yet supported. The extension connects to whichever browser has it loaded (Chrome, Brave, or Edge). To switch, disable the extension in the current browser, enable it in the target browser, and restart both.");
   },
 
   async list_connected_browsers(args) {
     // Honest stub: this fork uses Chrome native messaging with one host per
     // browser and no shared account relay, so there is no multi-browser
     // registry (deviceIds) to enumerate.
-    return { content: [{ type: "text", text: "Listing connected browsers is not supported in this extension. It uses native messaging with a single browser per host, so there is no multi-browser registry to enumerate." }] };
+    return errorResult("Listing connected browsers is not supported in this extension. It uses native messaging with a single browser per host, so there is no multi-browser registry to enumerate.");
   },
 
   async select_browser(args) {
     // Honest stub: no deviceId registry exists (see list_connected_browsers).
-    return { content: [{ type: "text", text: "Selecting a browser by deviceId is not supported in this extension. The native-messaging host connects to whichever single browser has the extension loaded." }] };
+    return errorResult("Selecting a browser by deviceId is not supported in this extension. The native-messaging host connects to whichever single browser has the extension loaded.");
   },
 
 };

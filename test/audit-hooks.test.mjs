@@ -150,14 +150,14 @@ test("browser_batch with 2 actions records 3 actions: the batch and its 2 nested
 
   bg.deliver({
     type: "tool_request", id: "1.s1.1", tool: "browser_batch",
-    args: { actions: [{ name: "gif_creator", input: {} }, { name: "shortcuts_list", input: {} }] },
+    args: { actions: [{ name: "tabs_context_mcp", input: {} }, { name: "computer", input: { action: "screenshot", tabId: bg.tabId } }] },
     session: SESSION,
   });
-  await flush();
+  await flush(100);
 
   assert.equal(fakeStore.actions.length, 3);
-  assert.deepEqual(fakeStore.actions.map((a) => a.tool), ["gif_creator", "shortcuts_list", "browser_batch"]);
-  assert.match(fakeStore.actions[2].summary, /^batch of 2: gif_creator, shortcuts_list$/);
+  assert.deepEqual(fakeStore.actions.map((a) => a.tool), ["tabs_context_mcp", "computer", "browser_batch"]);
+  assert.match(fakeStore.actions[2].summary, /^batch of 2: tabs_context_mcp, computer$/);
 });
 
 // M5: a nested `type` inside a browser_batch is dispatched through the same
