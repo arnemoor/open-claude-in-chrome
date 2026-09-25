@@ -542,8 +542,9 @@
 
   // The target can be the ref'd element itself, a <form> for example, so each branch below is
   // guarded by instanceof before it reads a property, and the rest goes through captured methods.
-  // A target with no value to set is an error: assigning el.value there only made an expando
-  // that the reply reported as a success while the page showed nothing.
+  // A change that did not take is an error, never a success: a target with no value to set
+  // (assigning el.value there only made an expando), a checkbox or radio that does not end at the
+  // requested state, or a value the field rejects.
   function setFormValue(refId, value) {
     const el = resolveRef(refId);
     if (!el) return { error: `Element ${refId} not found or was garbage collected.` };
@@ -564,11 +565,25 @@
     } else if (target instanceof HTMLInputElement && (target.type === "checkbox" || target.type === "radio")) {
       const shouldCheck = typeof value === "boolean" ? value : value === "true";
       if (target.checked !== shouldCheck) target.click();
+      if (target.checked !== shouldCheck) {
+        if (target.type === "radio" && !shouldCheck) {
+          return { error: `${refId} is a radio button, and a click cannot uncheck it. Check another radio button of its group instead.` };
+        }
+        return { error: `${refId} is still ${target.checked ? "checked" : "unchecked"}: the page did not let the click change it.` };
+      }
       return { success: true, checked: target.checked };
     } else if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
       // Use the native setter for actual input/textarea elements
       const proto = target instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-      Object.getOwnPropertyDescriptor(proto, "value").set.call(target, String(value));
+      const setValue = Object.getOwnPropertyDescriptor(proto, "value").set;
+      const before = target.value;
+      setValue.call(target, String(value));
+      // Value sanitization (type date, number, color, ...) turns a value the field rejects into
+      // "". The old value is put back then, and no input or change event is sent.
+      if (String(value) !== "" && target.value === "") {
+        setValue.call(target, before);
+        return { error: `${refId} did not accept the value: the field would be left empty. Check the value's format.` };
+      }
     } else if (target instanceof HTMLElement && isContentEditableGet.call(target)) {
       textContentSet.call(target, String(value));
       readBack = () => dom.text(target);
