@@ -238,6 +238,14 @@
       if (!enabled) return;
       const key = tabOwners.get(tabId);
       if (!key) return; // no owner for this tab: drop
+      // Item 9: a tab's recorder keeps running (and keeps sending batches)
+      // after the tab itself leaves the MCP group — nothing tells the
+      // content script to stop. Re-check the same gate wrapHandlers used to
+      // grant ownership in the first place, and clear the stale owner rather
+      // than merely gating this one batch: if the tab later rejoins the
+      // group with no new audited call, a batch for it must still be
+      // dropped, not resumed under whichever session owned it before.
+      if (!(await isTabAllowed(tabId))) { tabOwners.delete(tabId); tabOwnerSetAt.delete(tabId); return; }
       await store.open();
       // I4: the owning session's row may be gone (pruned, or deleted from the
       // options page) even though the in-memory tab-ownership map still

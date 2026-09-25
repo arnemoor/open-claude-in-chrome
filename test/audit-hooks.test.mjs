@@ -397,6 +397,40 @@ test("I5: a tab inside the MCP group still gets a recorder", async () => {
   assert.equal(ensureRecorderCalls(bg).length, 4);
 });
 
+// Item 9: a tab's recorder keeps running (and keeps sending batches) after the
+// tab leaves the MCP group — nothing tells the content script to stop. Those
+// batches must stop being stored the moment isTabAllowed(tabId) goes false,
+// and the stale owner must be cleared, not just gated: if the tab later
+// rejoins the group with no new audited call re-establishing ownership, a
+// batch for it must still be dropped, not resumed under the old owner.
+test("item 9: recorder events stop and the owner is cleared once a tab leaves the MCP group", async () => {
+  const fakeStore = makeFakeStore();
+  let insideGroup = true;
+  const bg = await loadBackground({
+    beforeRun: injectFakeStore(fakeStore),
+    overrides: { tabs: { get: async (id) => ({ id, windowId: 1, status: "complete", url: "https://example.test/", groupId: insideGroup ? 7 : -1 }) } },
+  });
+  await flush();
+  await bg.chrome.storage.local.set({ audit: { enabled: true, retentionDays: 7 } });
+
+  bg.deliver({ type: "tool_request", id: "1.s1.1", tool: "gif_creator", args: { tabId: 42 }, session: SESSION });
+  await flush();
+
+  bg.chrome.runtime.onMessage.fire({ type: "ocic_audit_events", events: [{ type: 2 }] }, { id: bg.chrome.runtime.id, tab: { id: 42 }, frameId: 0 }, () => {});
+  await flush();
+  assert.equal(fakeStore.calls.filter((c) => c[0] === "addEvents").length, 1, "still inside the group: the batch is stored");
+
+  insideGroup = false; // the tab leaves the MCP group (dragged out, ungrouped), no new tool call
+  bg.chrome.runtime.onMessage.fire({ type: "ocic_audit_events", events: [{ type: 2 }] }, { id: bg.chrome.runtime.id, tab: { id: 42 }, frameId: 0 }, () => {});
+  await flush();
+  assert.equal(fakeStore.calls.filter((c) => c[0] === "addEvents").length, 1, "left the group: the next batch must be dropped");
+
+  insideGroup = true; // the tab rejoins, but nothing has re-established ownership
+  bg.chrome.runtime.onMessage.fire({ type: "ocic_audit_events", events: [{ type: 2 }] }, { id: bg.chrome.runtime.id, tab: { id: 42 }, frameId: 0 }, () => {});
+  await flush();
+  assert.equal(fakeStore.calls.filter((c) => c[0] === "addEvents").length, 1, "the owner was cleared on leaving, so rejoining alone must not resume storing under the old owner");
+});
+
 // M1: `started` used to be captured after the before-hook but `ms` was computed
 // after the after-hook too, so a slow ensureRecorder call (a large page's full
 // snapshot, or now I4's own timeout budget) inflated the recorded duration of
