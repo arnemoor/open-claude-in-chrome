@@ -8,6 +8,8 @@
 //
 // Skipped unless OCIC_E2E=1, and skipped (not failed) when Google Chrome.app
 // is missing, so `node --test test/` stays fast and never launches a browser.
+// With OCIC_E2E=1 and Chrome present, every other setup failure (the extension
+// does not load, the native host never starts) fails the run.
 //
 // Run: OCIC_E2E=1 node --test test/e2e/e2e.mjs
 
@@ -233,7 +235,6 @@ document.getElementById('file-input').addEventListener('change', function (e) {
 
   let tempHome, profile, testServer, base, chromeProc, mcpClient, mcpTransport;
   let extensionId, nativeHostPid, tabId, cdpSend; // cdpSend: step 10 reuses the browser-level CDP pipe
-  let setupError = null; // set only for the documented "loadUnpacked impossible" fallback
 
   before(async () => {
     tempHome = fs.mkdtempSync("/tmp/ocic-");
@@ -271,10 +272,10 @@ document.getElementById('file-input').addEventListener('change', function (e) {
       const result = await cdpSend("Extensions.loadUnpacked", { path: EXTENSION_DIR });
       extensionId = result.id;
     } catch (err) {
-      setupError =
-        `Extensions.loadUnpacked failed on this Chrome build: ${err.message}\n` +
-        `Chrome stderr tail:\n${chromeStderr.slice(-2000)}`;
-      return; // it()s below check setupError and skip themselves
+      throw new Error(
+        `Extensions.loadUnpacked failed: ${err.message}\n` +
+        `Chrome stderr tail:\n${chromeStderr.slice(-2000)}`,
+      );
     }
 
     // Register the native host manifest + wrapper under the ISOLATED
@@ -308,10 +309,10 @@ document.getElementById('file-input').addEventListener('change', function (e) {
     try {
       await waitFor(() => fs.existsSync(sockPath) && fs.existsSync(logPath), { timeoutMs: 20000, intervalMs: 400 });
     } catch {
-      setupError =
+      throw new Error(
         `The isolated native host never came up within 20s (socket or log missing under ${tempHome}).\n` +
-        `Chrome stderr tail:\n${chromeStderr.slice(-2000)}`;
-      return;
+        `Chrome stderr tail:\n${chromeStderr.slice(-2000)}`,
+      );
     }
 
     // --- SAFETY CHECK: this must be OUR host, in OUR worktree, before any
@@ -383,8 +384,7 @@ document.getElementById('file-input').addEventListener('change', function (e) {
 
   // --- steps ----------------------------------------------------------------
 
-  it("1. tabs_context_mcp with createIfEmpty", { timeout: 15000 }, async (t) => {
-    if (setupError) return t.skip(setupError);
+  it("1. tabs_context_mcp with createIfEmpty", { timeout: 15000 }, async () => {
     const res = await mcpClient.callTool({ name: "tabs_context_mcp", arguments: { createIfEmpty: true } });
     const text = res.content[0].text;
     const parsed = JSON.parse(text.split("\n\n")[0]);
@@ -394,15 +394,13 @@ document.getElementById('file-input').addEventListener('change', function (e) {
     assert.ok(Number.isInteger(tabId), `expected a numeric tabId, got: ${JSON.stringify(parsed)}`);
   });
 
-  it("2. navigate to a local http test page", { timeout: 15000 }, async (t) => {
-    if (setupError) return t.skip(setupError);
+  it("2. navigate to a local http test page", { timeout: 15000 }, async () => {
     const res = await mcpClient.callTool({ name: "navigate", arguments: { url: `${base}/`, tabId } });
     const text = res.content[0].text;
     assert.match(text, new RegExp(`Navigated to ${reEscape(base)}/`), `unexpected navigate reply: ${text}`);
   });
 
-  it("3. find an off-screen button, then left_click by ref: it is scrolled and hit", { timeout: 15000 }, async (t) => {
-    if (setupError) return t.skip(setupError);
+  it("3. find an off-screen button, then left_click by ref: it is scrolled and hit", { timeout: 15000 }, async () => {
     const found = await mcpClient.callTool({ name: "find", arguments: { query: "offscreen action button", tabId } });
     const foundText = found.content[0].text;
     assert.match(foundText, /\[off-screen, click by ref to scroll it into view\]/, `expected the button to be reported off-screen: ${foundText}`);
@@ -425,8 +423,7 @@ document.getElementById('file-input').addEventListener('change', function (e) {
     assert.match(after.content[0].text, /offscreen button clicked/, `expected the click handler to have run: ${after.content[0].text}`);
   });
 
-  it('4. type "Grüße", then key "Enter": the form submits', { timeout: 15000 }, async (t) => {
-    if (setupError) return t.skip(setupError);
+  it('4. type "Grüße", then key "Enter": the form submits', { timeout: 15000 }, async () => {
     await mcpClient.callTool({ name: "navigate", arguments: { url: `${base}/form`, tabId } });
 
     const typed = await mcpClient.callTool({ name: "computer", arguments: { action: "type", text: "Grüße", tabId } });
@@ -447,8 +444,7 @@ document.getElementById('file-input').addEventListener('change', function (e) {
     assert.equal(tab.title, "submitted:Grüße", `expected the server-reflected title to round-trip exactly, got: ${tab.title}`);
   });
 
-  it("5. computer screenshot with save_to_disk: the file exists, mode 0600", { timeout: 15000 }, async (t) => {
-    if (setupError) return t.skip(setupError);
+  it("5. computer screenshot with save_to_disk: the file exists, mode 0600", { timeout: 15000 }, async () => {
     const res = await mcpClient.callTool({ name: "computer", arguments: { action: "screenshot", save_to_disk: true, tabId } });
     const savedBlock = res.content.find((b) => b.type === "text" && b.text.startsWith("Saved to disk:"));
     assert.ok(savedBlock, `expected a "Saved to disk:" block, got: ${JSON.stringify(res.content.map((b) => b.type))}`);
@@ -459,8 +455,7 @@ document.getElementById('file-input').addEventListener('change', function (e) {
     assert.equal(stat.mode & 0o777, 0o600, `expected mode 0600, got ${(stat.mode & 0o777).toString(8)}`);
   });
 
-  it("6. file_upload from Downloads succeeds, from secret.txt is refused", { timeout: 15000 }, async (t) => {
-    if (setupError) return t.skip(setupError);
+  it("6. file_upload from Downloads succeeds, from secret.txt is refused", { timeout: 15000 }, async () => {
     fs.mkdirSync(path.join(tempHome, "Downloads"), { recursive: true });
     const allowedFile = path.join(tempHome, "Downloads", "e2e-upload.txt");
     fs.writeFileSync(allowedFile, "hello e2e");
@@ -488,8 +483,7 @@ document.getElementById('file-input').addEventListener('change', function (e) {
     assert.match(confirm.content[0].text, /e2e-upload\.txt/, `expected to find the uploaded filename reflected in the page: ${confirm.content[0].text}`);
   });
 
-  it("7. resize_window: the reply shows the real sizes", { timeout: 15000 }, async (t) => {
-    if (setupError) return t.skip(setupError);
+  it("7. resize_window: the reply shows the real sizes", { timeout: 15000 }, async () => {
     const res = await mcpClient.callTool({ name: "resize_window", arguments: { width: 1000, height: 700, tabId } });
     const text = res.content[0].text;
     const m = text.match(/^Resized window to (\d+)x(\d+)/);
@@ -498,8 +492,7 @@ document.getElementById('file-input').addEventListener('change', function (e) {
     assert.equal(Number(m[2]), 700, `expected height 700, got reply: ${text}`);
   });
 
-  it("8. read_network_requests after a redirect", { timeout: 15000 }, async (t) => {
-    if (setupError) return t.skip(setupError);
+  it("8. read_network_requests after a redirect", { timeout: 15000 }, async () => {
     // Enables the Network domain for this tab; requests logged from here on.
     await mcpClient.callTool({ name: "read_network_requests", arguments: { tabId } });
 
@@ -523,8 +516,7 @@ document.getElementById('file-input').addEventListener('change', function (e) {
     assert.match(text, targetHop, `expected the final hop logged with status 200: ${text}`);
   });
 
-  it("9. kill the native host during a wait of 5s: the call fails with LOST, then auto-reconnects", { timeout: 45000 }, async (t) => {
-    if (setupError) return t.skip(setupError);
+  it("9. kill the native host during a wait of 5s: the call fails with LOST, then auto-reconnects", { timeout: 45000 }, async () => {
     const logPath = path.join(tempHome, ".config", "open-claude-in-chrome", "logs", "native-host.log");
     const before9 = lastLogEvent(logPath, "start");
     assert.ok(before9, "expected a prior native-host start event");
@@ -572,8 +564,7 @@ document.getElementById('file-input').addEventListener('change', function (e) {
     assert.ok(after9 && after9.pid !== killPid, `expected a new native-host pid after the kill, still saw ${killPid}`);
   });
 
-  it("10. audit mode: session appears in the options page with a redacted action list", { timeout: 30000 }, async (t) => {
-    if (setupError) return t.skip(setupError);
+  it("10. audit mode: session appears in the options page with a redacted action list", { timeout: 30000 }, async () => {
 
     const TOKEN_TYPED = "E2ESECRETTYPED";
     const TOKEN_QUERY = "E2ESECRETQ";
