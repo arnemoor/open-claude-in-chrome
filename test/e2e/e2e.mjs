@@ -9,13 +9,15 @@
 // Skipped unless OCIC_E2E=1, and skipped (not failed) when Google Chrome.app
 // is missing, so `node --test test/` stays fast and never launches a browser.
 // With OCIC_E2E=1 and Chrome present, every other setup failure (the extension
-// does not load, the native host never starts) fails the run.
+// does not load, the native host never starts) fails the run. The last block
+// in this file checks that by running the file again as a child, once with a
+// broken extension and once with a native host that exits at once.
 //
 // Run: OCIC_E2E=1 node --test test/e2e/e2e.mjs
 
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { spawn, execSync } from "node:child_process";
+import { spawn, spawnSync, execSync } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
@@ -32,8 +34,10 @@ const CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const chromeAvailable = fs.existsSync(CHROME);
 
 const WORKTREE = path.resolve(import.meta.dirname, "..", "..");
-const EXTENSION_DIR = path.join(WORKTREE, "extension");
-const NATIVE_HOST_JS = path.join(WORKTREE, "host", "native-host.js");
+// Test-only overrides, set only by the setup-failure block at the end of this
+// file for its own child runs.
+const EXTENSION_DIR = process.env.OCIC_E2E_EXTENSION_DIR || path.join(WORKTREE, "extension");
+const NATIVE_HOST_JS = process.env.OCIC_E2E_NATIVE_HOST_JS || path.join(WORKTREE, "host", "native-host.js");
 const MCP_SERVER_JS = path.join(WORKTREE, "host", "mcp-server.js");
 const HOST_NAME = "com.anthropic.open_claude_in_chrome";
 
@@ -656,4 +660,49 @@ document.getElementById('file-input').addEventListener('change', function (e) {
     const newFiles = [...listAuditFiles()].filter((f) => !auditFilesBefore.has(f));
     assert.deepEqual(newFiles, [], `expected no new audit-session-*.json in ${realDownloads}, found: ${newFiles.join(", ")}`);
   });
+});
+
+// The setup-failure path itself. Each case runs this file again as a child
+// with OCIC_E2E=1 and one test-only override: an extension folder whose
+// manifest is not valid JSON, or a native host script that exits at once.
+// The child keeps every isolation step of the block above (its own temp HOME
+// and Chrome profile, kills only by checked pid), and it skips this block.
+const isChildRun = Boolean(process.env.OCIC_E2E_EXTENSION_DIR || process.env.OCIC_E2E_NATIVE_HOST_JS);
+
+describe("end-to-end: a setup failure fails the run", { skip: skipReason || (isChildRun && "child run") }, () => {
+  let fixtures;
+
+  before(() => {
+    fixtures = fs.mkdtempSync("/tmp/ocic-");
+    fs.mkdirSync(path.join(fixtures, "extension"));
+    fs.writeFileSync(path.join(fixtures, "extension", "manifest.json"), "{ not valid json\n");
+    fs.writeFileSync(path.join(fixtures, "native-host.js"), "process.exit(3);\n");
+    fs.mkdirSync(path.join(fixtures, "home"));
+  });
+
+  after(() => {
+    if (fixtures) fs.rmSync(fixtures, { recursive: true, force: true });
+  });
+
+  const cases = [
+    { label: "an extension that does not load", override: "OCIC_E2E_EXTENSION_DIR", fixture: "extension", expected: /Extensions\.loadUnpacked failed: .*Manifest is not valid JSON/ },
+    { label: "a native host that never starts", override: "OCIC_E2E_NATIVE_HOST_JS", fixture: "native-host.js", expected: /The isolated native host never came up within 20s/ },
+  ];
+
+  for (const { label, override, fixture, expected } of cases) {
+    it(`${label} fails the run instead of skipping it`, { timeout: 120000 }, () => {
+      const env = { ...process.env, OCIC_E2E: "1", HOME: path.join(fixtures, "home"), [override]: path.join(fixtures, fixture) };
+      // Inherited from this run's own test runner, it would make the child
+      // report to a parent that never reads it, and exit 0 with no output.
+      delete env.NODE_TEST_CONTEXT;
+      const child = spawnSync(process.execPath, ["--test", "--test-reporter=spec", import.meta.filename], {
+        env,
+        encoding: "utf8",
+        timeout: 110000,
+      });
+      const output = `${child.stdout}${child.stderr}`;
+      assert.ok(child.status !== null && child.status !== 0, `expected the child run to fail by itself, got status ${child.status}, signal ${child.signal}:\n${output}`);
+      assert.match(output, expected, `expected the setup failure in the child's output:\n${output}`);
+    });
+  }
 });
