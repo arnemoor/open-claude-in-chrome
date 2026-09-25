@@ -18,6 +18,7 @@ const attachedTabs = new Map(); // tabId -> { enabledDomains: Set }
 const consoleMessages = new Map(); // tabId -> [{level, text, timestamp, url}]
 const networkRequests = new Map(); // tabId -> [{url, method, status, type, timestamp}]
 const screenshotStore = new Map(); // imageId -> base64
+const openDialogs = new Map(); // tabId -> message, while a JS dialog (alert/confirm/prompt/beforeunload) blocks the page
 
 // --- Keep-alive alarm ---
 chrome.alarms.create("keepalive", { periodInMinutes: 0.4 });
@@ -74,8 +75,9 @@ function sendError(id, error) {
 }
 
 // --- Duplicate request dedupe ---
-// Keeps the ids of the last 500 delivered tool_requests for 10 minutes, so a
-// request re-delivered (e.g. after a reconnect) is ignored instead of running twice.
+// Keeps the ids of the last 500 delivered tool_requests for 10 minutes, so a frame the same
+// hub process happens to deliver twice is ignored instead of running twice. Not a reconnect
+// guard: a new hub process always mints a fresh runId, so ids never collide across those.
 const DEDUPE_TTL_MS = 10 * 60 * 1000;
 const DEDUPE_MAX_IDS = 500;
 const deliveredIds = new Map(); // id -> first-seen timestamp, in insertion order
@@ -123,15 +125,20 @@ async function ensureTabGroup(createIfEmpty) {
 }
 
 function formatTabContext(tabs) {
-  const available = tabs.map((t) => ({
-    tabId: t.id,
-    title: t.title || "Untitled",
-    url: t.url || "",
-  }));
+  // A blocked tab (a local file, or this extension's own page) stays listed so the agent can
+  // see it exists, but with no title and no real URL \u2014 the agent can't act on it anyway (every
+  // tool that takes a tabId refuses it via tabAccessError above).
+  const available = tabs.map((t) =>
+    isBlockedUrl(t.url || "", chrome.runtime.id)
+      ? { tabId: t.id, title: "", url: "(blocked)" }
+      : { tabId: t.id, title: t.title || "Untitled", url: t.url || "" }
+  );
 
   let text = `Tab Context:\n- Available tabs:\n`;
   for (const t of available) {
-    text += `  \u2022 tabId ${t.tabId}: "${t.title}" (${t.url})\n`;
+    text += t.url === "(blocked)"
+      ? `  \u2022 tabId ${t.tabId}: (blocked)\n`
+      : `  \u2022 tabId ${t.tabId}: "${t.title}" (${t.url})\n`;
   }
 
   return {
@@ -144,28 +151,47 @@ function formatTabContext(tabs) {
   };
 }
 
-async function isInGroup(tabId) {
+// Single check used by every tool handler that takes a tabId: not in the MCP group, showing a
+// local file or this extension's own page (also reached via back/forward, or a tab dragged into
+// the group by hand — see isBlockedUrl below), or blocked behind an open JS dialog. Returns null
+// when tabId is fine to use, or the exact refusal text to show the agent otherwise.
+async function tabAccessError(tabId) {
   // Always check live state — in-memory tabGroupTabs can be stale after service worker restart
+  let tab;
   try {
-    const tab = await chrome.tabs.get(tabId);
-    if (tab.groupId !== -1) {
-      // Recover tabGroupId if we lost it (service worker restart)
-      if (tabGroupId === null) {
-        try {
-          const group = await chrome.tabGroups.get(tab.groupId);
-          if (group.title === "MCP") {
-            tabGroupId = group.id;
-            const groupTabs = await chrome.tabs.query({ groupId: tabGroupId });
-            tabGroupTabs = new Set(groupTabs.map((t) => t.id));
-          }
-        } catch {}
-      }
-      return tab.groupId === tabGroupId;
-    }
-    return tabGroupTabs.has(tabId);
+    tab = await chrome.tabs.get(tabId);
   } catch {
-    return false;
+    return `Tab ${tabId} is not in the MCP group.`;
   }
+
+  let inGroup;
+  if (tab.groupId !== -1) {
+    // Recover tabGroupId if we lost it (service worker restart)
+    if (tabGroupId === null) {
+      try {
+        const group = await chrome.tabGroups.get(tab.groupId);
+        if (group.title === "MCP") {
+          tabGroupId = group.id;
+          const groupTabs = await chrome.tabs.query({ groupId: tabGroupId });
+          tabGroupTabs = new Set(groupTabs.map((t) => t.id));
+        }
+      } catch {}
+    }
+    inGroup = tab.groupId === tabGroupId;
+  } else {
+    inGroup = tabGroupTabs.has(tabId);
+  }
+  if (!inGroup) return `Tab ${tabId} is not in the MCP group.`;
+
+  if (isBlockedUrl(tab.url, chrome.runtime.id)) {
+    return `Tab ${tabId} shows a local file or this extension's own page, which the agent cannot use.`;
+  }
+
+  if (openDialogs.has(tabId)) {
+    return `A JavaScript dialog is open on this tab ("${openDialogs.get(tabId)}"). It blocks the page until the user closes it.`;
+  }
+
+  return null;
 }
 
 // --- CDP helpers ---
@@ -191,6 +217,10 @@ async function ensureAttached(tabId) {
         // Input.dispatchMouseEvent. Width and height 0 leave the viewport size alone, so the
         // page keeps following the real window (resize_window, window chrome).
         await rawCdp(tabId, "Emulation.setDeviceMetricsOverride", { width: 0, height: 0, deviceScaleFactor: 1, mobile: false });
+        // Enabled unconditionally, not lazily via ensureDomain like Console/Network below, so a
+        // dialog opened before any tool asks for the Page domain is still tracked (see
+        // openDialogs and the onEvent listener below).
+        await rawCdp(tabId, "Page.enable", {});
       } catch (err) {
         try { await chrome.debugger.detach({ tabId }); } catch {}
         throw err;
@@ -198,7 +228,7 @@ async function ensureAttached(tabId) {
       // Only mark the tab attached once the pin has actually taken effect, so a caller that
       // joins mid-flight (below) never runs a command before it, and a failed pin never leaves
       // attachedTabs pointing at a tab whose debugger session we just tore down.
-      attachedTabs.set(tabId, { enabledDomains: new Set() });
+      attachedTabs.set(tabId, { enabledDomains: new Set(["Page"]) });
     })().finally(() => {
       // Guard against deleting a NEWER attempt: if the tab got detached and re-attached while
       // this attempt was still in flight, `attaching` may already hold someone else's promise.
@@ -254,17 +284,31 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   attaching.delete(tabId);
   consoleMessages.delete(tabId);
   networkRequests.delete(tabId);
+  openDialogs.delete(tabId);
 });
 
 // Handle user dismissing debugger bar
 chrome.debugger.onDetach.addListener((source, reason) => {
   attachedTabs.delete(source.tabId);
   attaching.delete(source.tabId);
+  openDialogs.delete(source.tabId);
 });
 
-// --- CDP event listeners for console and network ---
+// --- CDP event listeners for dialogs, console and network ---
 chrome.debugger.onEvent.addListener((source, method, params) => {
   const tabId = source.tabId;
+
+  // A JS dialog (alert/confirm/prompt/beforeunload) freezes the page until the user answers
+  // it: CDP commands against the page either silently no-op (Input.dispatchKeyEvent) or hang
+  // until it closes (Runtime.evaluate, Page.captureScreenshot). tabAccessError checks this
+  // before a tool handler ever reaches one of those, instead of reporting a false success or
+  // waiting out a long timeout.
+  if (method === "Page.javascriptDialogOpening") {
+    openDialogs.set(tabId, params.message || "");
+  }
+  if (method === "Page.javascriptDialogClosed") {
+    openDialogs.delete(tabId);
+  }
 
   if (method === "Console.messageAdded" && params.message) {
     const msgs = consoleMessages.get(tabId) || [];
@@ -448,7 +492,7 @@ async function pressKey(tabId, def, modifiers) {
   // case-sensitive lookup would miss "cmd+A" even though "cmd+a" resolves it.
   const macKey = def.key.toLowerCase();
   if (IS_MAC && modifiers === MOD_META && Object.hasOwn(MAC_EDIT_COMMANDS, macKey)) down.commands = [MAC_EDIT_COMMANDS[macKey]];
-  if (IS_MAC && modifiers === (MOD_META | MOD_SHIFT) && def.key === "z") down.commands = ["redo"];
+  if (IS_MAC && modifiers === (MOD_META | MOD_SHIFT) && macKey === "z") down.commands = ["redo"];
   await cdp(tabId, "Input.dispatchKeyEvent", down);
   await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyUp", key, code: def.code, windowsVirtualKeyCode: def.keyCode, modifiers });
 }
@@ -501,19 +545,30 @@ function parseModifierString(modStr) {
 }
 
 // --- Content script communication ---
-async function sendContentMessage(tabId, message) {
-  try {
-    const response = await chrome.tabs.sendMessage(tabId, message);
-    return response;
-  } catch {
-    // Content script might not be injected yet, try injecting
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      files: ["content.js"],
-    });
-    // Retry
-    return chrome.tabs.sendMessage(tabId, message);
-  }
+const CONTENT_MESSAGE_TIMEOUT_MS = 10000;
+
+// A page that never answers (e.g. frozen behind a JS dialog — tabAccessError normally catches
+// that first, but a dialog opened between that check and this call is still possible) used to
+// hang forever: neither attempt below had any timeout of its own.
+async function sendContentMessage(tabId, message, timeoutMs = CONTENT_MESSAGE_TIMEOUT_MS) {
+  const attempt = (async () => {
+    try {
+      return await chrome.tabs.sendMessage(tabId, message);
+    } catch {
+      // Content script might not be injected yet, try injecting
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        files: ["content.js"],
+      });
+      // Retry
+      return chrome.tabs.sendMessage(tabId, message);
+    }
+  })();
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`Tab ${tabId} did not respond within ${timeoutMs / 1000}s. If a JavaScript dialog is open on it, close it and try again.`)), timeoutMs);
+  });
+  return Promise.race([attempt, timeout]).finally(() => clearTimeout(timer));
 }
 
 // --- Screenshot helper ---
@@ -606,6 +661,53 @@ const KEEP_AS_IS_SCHEMES = new Set([
   "http", "https", "file", "data", "about", "chrome", "brave", "edge",
   "view-source", "blob", "ftp", "chrome-extension",
 ]);
+// view-source: and blob: can wrap another URL, and Chrome resolves that inner URL in the
+// wrapper's own context — including the extension's own origin for a wrapped chrome-extension:
+// URL, or the local filesystem for a wrapped file: URL — so callers unwrap before checking what
+// they actually point at. An inner URL that fails to parse just stops the unwrap; it isn't an
+// error by itself (the outer URL, e.g. view-source:https://..., is still valid). Refuses (returns
+// null) past MAX_UNWRAPS layers instead of re-parsing an attacker-sized string once per layer,
+// which is quadratic in the wrapper count.
+const MAX_UNWRAPS = 4;
+function unwrapViewSourceOrBlob(parsed) {
+  let inner = parsed;
+  let depth = 0;
+  while (inner.protocol === "view-source:" || inner.protocol === "blob:") {
+    if (depth >= MAX_UNWRAPS) return null;
+    depth++;
+    let next;
+    try {
+      next = new URL(inner.href.slice(inner.protocol.length));
+    } catch {
+      break;
+    }
+    inner = next;
+  }
+  return inner;
+}
+
+// True when `url` is (or unwraps, through nested view-source:/blob:, to) a file: URL or this
+// extension's own chrome-extension: origin — the two kinds of page the agent is never allowed to
+// act on, whether reached through navigate's own url argument (normalizeNavigateUrl below) or
+// because a tab simply already shows one (tabAccessError above — e.g. after back/forward, or
+// dragged into the group by hand).
+function isBlockedUrl(url, ownExtensionId) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  const inner = unwrapViewSourceOrBlob(parsed);
+  if (inner === null) return true; // pathological nesting: treat as blocked rather than let it through
+  // Node's URL parser leaves a non-special scheme's host case as-is, but Chrome lowercases it
+  // when it canonicalizes a chrome-extension: URL, so compare against the lowercased host.
+  // Chrome's parser also canonicalizes percent-encoded and extra-slash host variants to that
+  // same host before this compare runs, so those are refused too in production — just not by
+  // this in-process check alone, which is why own-page-refusal.test.mjs pins them via real Chrome.
+  return inner.protocol === "file:" || (inner.protocol === "chrome-extension:" && inner.hostname.toLowerCase() === ownExtensionId);
+}
+
 function normalizeNavigateUrl(input, ownExtensionId) {
   let url = input.trim();
   const schemeMatch = url.match(NAVIGATE_SCHEME_RE);
@@ -631,26 +733,19 @@ function normalizeNavigateUrl(input, ownExtensionId) {
     return { error: `Invalid URL: "${input}". Could not parse as a valid URL.` };
   }
 
-  // view-source: and blob: can wrap another URL, and Chrome resolves that inner URL in the
-  // wrapper's own context — including the extension's own origin for a wrapped
-  // chrome-extension: URL — so unwrap before the own-id check below. An inner URL that
-  // fails to parse just stops the unwrap; it isn't an error by itself (the outer URL, e.g.
-  // view-source:https://..., is still valid).
-  let inner = parsed;
-  while (inner.protocol === "view-source:" || inner.protocol === "blob:") {
-    let next;
-    try {
-      next = new URL(inner.href.slice(inner.protocol.length));
-    } catch {
-      break;
-    }
-    inner = next;
+  const inner = unwrapViewSourceOrBlob(parsed);
+  if (inner === null) {
+    return { error: "Too many nested view-source:/blob: wrappers." };
   }
 
-  // Node's URL parser leaves a non-special scheme's host case as-is, but Chrome lowercases
-  // it when it canonicalizes a chrome-extension: URL, so compare against the lowercased
-  // host. (Percent-encoded and extra-slash host variants rely on that same browser
-  // canonicalization and aren't covered by this in-process check.)
+  // Unpacked extensions get file: access by default, so this would otherwise let the agent
+  // read any local file (navigate there, then get_page_text) regardless of the upload
+  // allowlist — see final-review-a C1.
+  if (inner.protocol === "file:") {
+    return { error: "file: URLs are blocked: the agent cannot open local files." };
+  }
+
+  // See isBlockedUrl above for the host-canonicalization caveat this compare relies on.
   if (inner.protocol === "chrome-extension:" && inner.hostname.toLowerCase() === ownExtensionId) {
     return { error: "This extension's own pages cannot be opened by the agent." };
   }
@@ -673,9 +768,19 @@ const toolHandlers = {
 
   async tabs_create_mcp(args) {
     await ensureTabGroup(true);
-    const groupTabs = await chrome.tabs.query({ groupId: tabGroupId });
-    const createArgs = groupTabs[0] ? { windowId: groupTabs[0].windowId, active: true } : { active: true };
-    const tab = await chrome.tabs.create(createArgs);
+    let groupTabs = await chrome.tabs.query({ groupId: tabGroupId });
+    if (groupTabs.length === 0) {
+      // The group's one tab could have closed in the gap since ensureTabGroup last checked
+      // (Chrome auto-removes a group once its last tab is gone), leaving tabGroupId stale.
+      // Retry once instead of falling back to a windowId-less tabs.create, which lands in the
+      // operator's own window and then fails to group (Minor 8).
+      await ensureTabGroup(true);
+      groupTabs = await chrome.tabs.query({ groupId: tabGroupId });
+      if (groupTabs.length === 0) {
+        return { content: [{ type: "text", text: "Could not create or find the MCP tab group." }] };
+      }
+    }
+    const tab = await chrome.tabs.create({ windowId: groupTabs[0].windowId, active: true });
     await chrome.tabs.group({ tabIds: [tab.id], groupId: tabGroupId });
     tabGroupTabs.add(tab.id);
     const tabs = await chrome.tabs.query({ groupId: tabGroupId });
@@ -686,7 +791,8 @@ const toolHandlers = {
 
   async tabs_close_mcp(args) {
     const { tabId } = args;
-    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    const tabError = await tabAccessError(tabId);
+    if (tabError) return { content: [{ type: "text", text: tabError }] };
     // chrome.tabs.onRemoved cleans up our per-tab state (attached debugger,
     // console/network buffers). Chrome auto-removes the tab group when its last
     // tab is closed, so no extra group teardown is needed here.
@@ -696,11 +802,9 @@ const toolHandlers = {
 
   async navigate(args) {
     const { url, tabId } = args;
-    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    const tabError = await tabAccessError(tabId);
+    if (tabError) return { content: [{ type: "text", text: tabError }] };
 
-    const FILE_URL_HINT = ` To open local files, enable "Allow access to file URLs" for Open Claude in Chrome in chrome://extensions.`;
-    const FILE_URL_RE = /^file:/i;
-    let targetUrl = null;
     if (url === "back") {
       await chrome.tabs.goBack(tabId);
     } else if (url === "forward") {
@@ -710,48 +814,53 @@ const toolHandlers = {
       if (normalized.error) {
         return { content: [{ type: "text", text: normalized.error }] };
       }
-      targetUrl = normalized.url;
       try {
-        await chrome.tabs.update(tabId, { url: targetUrl });
+        await chrome.tabs.update(tabId, { url: normalized.url });
       } catch (err) {
         let message = err.message;
         if (!message.endsWith(".")) message += ".";
-        let text = `Could not navigate to ${targetUrl}: ${message}`;
-        if (FILE_URL_RE.test(targetUrl)) text += FILE_URL_HINT;
-        return { content: [{ type: "text", text }] };
+        return { content: [{ type: "text", text: `Could not navigate to ${normalized.url}: ${message}` }] };
       }
     }
 
     // Wait for page load — short timeout to avoid service worker idle kill
     // If the page takes longer, the caller can use screenshot/wait to check
     await new Promise((resolve) => {
+      let timer;
       const listener = (updatedTabId, info) => {
         if (updatedTabId === tabId && info.status === "complete") {
           chrome.tabs.onUpdated.removeListener(listener);
+          clearTimeout(timer);
           resolve();
         }
       };
       chrome.tabs.onUpdated.addListener(listener);
       // 10s max — enough for most pages, avoids service worker timeout
-      setTimeout(() => {
+      timer = setTimeout(() => {
         chrome.tabs.onUpdated.removeListener(listener);
         resolve();
       }, 10000);
     });
 
+    // back/forward (unlike an explicit url, already refused above by normalizeNavigateUrl) can
+    // land on a local file or this extension's own page — refuse instead of reporting its title.
     const tab = await chrome.tabs.get(tabId);
+    if (isBlockedUrl(tab.url, chrome.runtime.id)) {
+      return { content: [{ type: "text", text: `Tab ${tabId} shows a local file or this extension's own page, which the agent cannot use.` }] };
+    }
+
     const tabs = await chrome.tabs.query({ groupId: tabGroupId });
     const loading = tab.status !== "complete" ? " (still loading)" : "";
-    let text = `Navigated to ${tab.url}${loading}.\n## Pages\n` +
+    const text = `Navigated to ${tab.url}${loading}.\n## Pages\n` +
       tabs.map((t, i) => `${i + 1}: ${t.url}${t.id === tabId ? " [selected]" : ""}`).join("\n");
-    if (targetUrl && FILE_URL_RE.test(targetUrl) && !tab.url.startsWith("file:")) text += FILE_URL_HINT;
 
     return { content: [{ type: "text", text }] };
   },
 
   async computer(args) {
     const { action, tabId } = args;
-    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    const tabError = await tabAccessError(tabId);
+    if (tabError) return { content: [{ type: "text", text: tabError }] };
 
     let coordinate = args.coordinate;
     // Click actions and hover accept either a ref or a coordinate: a ref is resolved (and
@@ -806,7 +915,7 @@ const toolHandlers = {
         const vp = await readViewport(tabId);
         const dims = vp ? `${vp.width}x${vp.height}` : "";
         const image = { type: "image", data: base64, mimeType: "image/jpeg" };
-        if (args.save_to_disk) image.saveToDisk = "screenshot";
+        if (args.save_to_disk === true) image.saveToDisk = "screenshot";
         return {
           content: [
             { type: "text", text: `Successfully captured screenshot (${dims}, jpeg) - ID: ${imageId}.` },
@@ -980,7 +1089,7 @@ const toolHandlers = {
         // to it. Screenshots are JPEG (see takeScreenshot), so label them as such.
         const { base64: fullBase64 } = await takeScreenshot(tabId);
         const image = { type: "image", data: fullBase64, mimeType: "image/jpeg" };
-        if (args.save_to_disk) image.saveToDisk = "zoom";
+        if (args.save_to_disk === true) image.saveToDisk = "zoom";
         return {
           content: [
             { type: "text", text: `Zoom region: [${args.region.join(", ")}]` },
@@ -996,7 +1105,8 @@ const toolHandlers = {
 
   async read_page(args) {
     const { tabId } = args;
-    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    const tabError = await tabAccessError(tabId);
+    if (tabError) return { content: [{ type: "text", text: tabError }] };
 
     const resp = await sendContentMessage(tabId, {
       type: "generateAccessibilityTree",
@@ -1017,7 +1127,8 @@ const toolHandlers = {
 
   async get_page_text(args) {
     const { tabId } = args;
-    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    const tabError = await tabAccessError(tabId);
+    if (tabError) return { content: [{ type: "text", text: tabError }] };
 
     const resp = await sendContentMessage(tabId, { type: "getPageText" });
     if (!resp?.result) return { content: [{ type: "text", text: "Error: Could not extract page text" }] };
@@ -1039,7 +1150,8 @@ const toolHandlers = {
 
   async find(args) {
     const { query, tabId } = args;
-    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    const tabError = await tabAccessError(tabId);
+    if (tabError) return { content: [{ type: "text", text: tabError }] };
 
     const resp = await sendContentMessage(tabId, { type: "findElements", query });
     const results = resp?.result || [];
@@ -1060,7 +1172,8 @@ const toolHandlers = {
 
   async form_input(args) {
     const { ref, value, tabId } = args;
-    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    const tabError = await tabAccessError(tabId);
+    if (tabError) return { content: [{ type: "text", text: tabError }] };
 
     const resp = await sendContentMessage(tabId, { type: "setFormValue", ref, value });
     const result = resp?.result;
@@ -1071,7 +1184,8 @@ const toolHandlers = {
 
   async javascript_tool(args) {
     const { text, tabId } = args;
-    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    const tabError = await tabAccessError(tabId);
+    if (tabError) return { content: [{ type: "text", text: tabError }] };
 
     await ensureAttached(tabId);
     try {
@@ -1102,7 +1216,8 @@ const toolHandlers = {
 
   async read_console_messages(args) {
     const { tabId, pattern, limit = 100, onlyErrors, clear } = args;
-    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    const tabError = await tabAccessError(tabId);
+    if (tabError) return { content: [{ type: "text", text: tabError }] };
 
     // Ensure console domain is enabled
     await ensureAttached(tabId);
@@ -1144,7 +1259,8 @@ const toolHandlers = {
 
   async read_network_requests(args) {
     const { tabId, urlPattern, limit = 100, clear } = args;
-    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    const tabError = await tabAccessError(tabId);
+    if (tabError) return { content: [{ type: "text", text: tabError }] };
 
     // Ensure network domain is enabled
     await ensureAttached(tabId);
@@ -1175,7 +1291,8 @@ const toolHandlers = {
 
   async resize_window(args) {
     const { width, height, tabId } = args;
-    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    const tabError = await tabAccessError(tabId);
+    if (tabError) return { content: [{ type: "text", text: tabError }] };
 
     const tab = await chrome.tabs.get(tabId);
     const windowId = tab.windowId;
@@ -1259,7 +1376,8 @@ const toolHandlers = {
 
   async upload_image(args) {
     const { imageId, ref, coordinate, filename, tabId } = args;
-    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    const tabError = await tabAccessError(tabId);
+    if (tabError) return { content: [{ type: "text", text: tabError }] };
 
     // Only screenshots captured by the computer tool this session are stored.
     // "user-uploaded" images have no equivalent here (no Claude.ai file channel).
@@ -1292,7 +1410,8 @@ const toolHandlers = {
 
   async file_upload(args) {
     const { paths, ref, tabId } = args;
-    if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
+    const tabError = await tabAccessError(tabId);
+    if (tabError) return { content: [{ type: "text", text: tabError }] };
     if (!ref) return { content: [{ type: "text", text: "file_upload requires a 'ref' to a file input." }] };
     if (!Array.isArray(paths) || paths.length === 0) {
       return { content: [{ type: "text", text: "file_upload requires 'paths' to be a non-empty array of absolute file paths." }] };
@@ -1379,7 +1498,7 @@ async function handleToolRequest(id, tool, args, session) {
   }
 }
 
-// --- Audit: recorder events relayed from the in-page recorder (Task 16) ---
+// --- Audit: recorder events relayed from the in-page recorder ---
 // Sender-derived tabId (not a field in msg): a content script can't spoof another
 // tab's id, and onRecorderEvents itself drops events for a tab with no owner.
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {

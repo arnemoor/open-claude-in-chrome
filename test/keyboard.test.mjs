@@ -69,6 +69,32 @@ test("cmd+A (uppercase) selects on macOS like cmd+a", { skip: !chromeAvailable |
   assert.deepEqual(await page.evaluate("[i.value, i.selectionStart, i.selectionEnd]"), ["hello", 0, 5]);
 });
 
+// Minor 6: the redo check compared the raw, case-sensitive def.key against "z", so only the
+// lowercase spelling of the combo (cmd+shift+z) matched. cmd+shift+Z — the usual way to write
+// "redo" — sent no redo command at all.
+test("cmd+shift+Z (uppercase) sends a redo command on macOS, same as cmd+shift+z", { skip: process.platform !== "darwin" }, async () => {
+  const sent = [];
+  const bg = await loadBackground({ overrides: { debugger: { sendCommand: async (t, m, p) => {
+    if (m === "Input.dispatchKeyEvent" && p.type !== "keyUp") sent.push(p.commands && [...p.commands]); // spread: vm-realm arrays fail strict deepEqual
+    return {};
+  } } } });
+  await bg.handlers.computer({ action: "key", text: "cmd+shift+z", tabId: bg.tabId });
+  await bg.handlers.computer({ action: "key", text: "cmd+shift+Z", tabId: bg.tabId });
+  assert.deepEqual(sent, [["redo"], ["redo"]]);
+});
+
+test("real Chrome: cmd+shift+Z redoes an edit undone with cmd+z, matching cmd+shift+z", { skip: !chromeAvailable || process.platform !== "darwin", timeout: 20000 }, async () => {
+  const { page, run } = await setup();
+  await run({ action: "type", text: "hello" });
+  await run({ action: "key", text: "cmd+a" });
+  await run({ action: "key", text: "Backspace" });
+  assert.equal(await page.evaluate("i.value"), "");
+  await run({ action: "key", text: "cmd+z" }); // undo the delete
+  assert.equal(await page.evaluate("i.value"), "hello");
+  await run({ action: "key", text: "cmd+shift+Z" }); // redo the delete
+  assert.equal(await page.evaluate("i.value"), "");
+});
+
 test("unknown key names are reported, not sent", async () => {
   const bg = await loadBackground();
   const r = await bg.handlers.computer({ action: "key", text: "Foo", tabId: bg.tabId });
