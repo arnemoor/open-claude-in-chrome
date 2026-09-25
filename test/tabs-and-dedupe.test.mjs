@@ -22,9 +22,9 @@ test("tabs_create_mcp retries group creation instead of creating a windowless ta
   let queryCalls = 0;
   const bg = await loadBackground({
     overrides: {
-      // Kept empty so the background recoverTabGroupState() call (unrelated to this test) finds
-      // no group to adopt and leaves tabGroupId alone, instead of racing the counter below.
-      tabGroups: { query: async () => [] },
+      // No stored group id, so the startup recoverTabGroupState() call (unrelated to this test)
+      // adopts no group and leaves tabGroupId alone, instead of racing the counter below.
+      storage: { session: { get: async () => ({}) } },
       tabs: {
         query: async () => {
           queryCalls++;

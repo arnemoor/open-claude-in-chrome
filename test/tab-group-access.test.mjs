@@ -1,13 +1,101 @@
-// The MCP tab group is the only access boundary: a tab counts as in it only while Chrome says
-// so right now. A tab the extension once cached but that the user has since dragged out of the
-// group (or popped into its own window) is refused, and what the extension still held for it is
-// released.
+// The MCP tab group is the only access boundary. Only the group this extension created counts:
+// after a service worker restart it is found again by the id stored in session storage, never by
+// its title. A tab counts as in it only while Chrome says so right now: a tab the extension once
+// cached but that the user has since dragged out of the group (or popped into its own window) is
+// refused, and what the extension still held for it is released.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { loadBackground } from "./harness/fake-chrome.mjs";
 
 const TAB = { windowId: 1, status: "complete", url: "https://example.test/" };
 const flush = (ms = 0) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// --- A service worker restart adopts only the group this extension created ---
+
+// A fresh worker with explicit session storage (`stored`), never the harness default. `groups`
+// are the groups Chrome reports, in this order, with their tabs. Group 99 is the user's own group,
+// titled "MCP" too. A group this extension creates gets id 8, in a new window whose tab is 21.
+async function restartedWorker({ stored, groups }) {
+  const session = { ...stored };
+  const log = [];
+  const tabs = {};
+  for (const g of groups) for (const id of g.tabIds) tabs[id] = { ...TAB, id, groupId: g.id, title: `tab ${id}` };
+  const groupList = groups.map(({ id, title }) => ({ id, title }));
+  const bg = await loadBackground({
+    overrides: {
+      storage: {
+        session: {
+          get: async (key) => (key in session ? { [key]: session[key] } : {}),
+          set: async (items) => { log.push(["storage.session.set", { ...items }]); Object.assign(session, items); },
+          remove: async (key) => { log.push(["storage.session.remove", key]); delete session[key]; },
+        },
+      },
+      tabGroups: {
+        get: async (id) => { const g = groupList.find((x) => x.id === id); if (!g) throw new Error(`No group with id: ${id}.`); return g; },
+        query: async ({ title } = {}) => groupList.filter((g) => title === undefined || g.title === title),
+        update: async (id, props) => { log.push(["tabGroups.update", id, { ...props }]); Object.assign(groupList.find((g) => g.id === id), props); },
+      },
+      tabs: {
+        get: async (id) => { if (!tabs[id]) throw new Error(`No tab with id: ${id}.`); return tabs[id]; },
+        query: async ({ groupId } = {}) => Object.values(tabs).filter((t) => t.groupId === groupId),
+        group: async ({ tabIds, groupId }) => {
+          log.push(["tabs.group", [...tabIds], groupId]);
+          const id = groupId ?? 8;
+          if (!groupList.some((g) => g.id === id)) groupList.push({ id, title: "" });
+          for (const tabId of tabIds) tabs[tabId].groupId = id;
+          return id;
+        },
+      },
+      windows: {
+        create: async () => { log.push(["windows.create"]); tabs[21] = { ...TAB, id: 21, windowId: 2, groupId: -1, title: "", url: "about:blank" }; return { id: 2, tabs: [{ id: 21 }] }; },
+      },
+    },
+  });
+  await flush(); // let the startup recovery settle before the first call
+  return { bg, session, log, tabs, groupList };
+}
+
+const listedTabs = (result) => JSON.parse(result.content[0].text.split("\n\n")[0]);
+
+// Not adopted: tab 11 in the user's group is refused. On demand a group of its own is created and
+// stored, and the user's group keeps its tabs, its title and its members.
+async function assertUserGroupIgnored(w) {
+  assert.equal((await w.bg.handlers.tabs_context_mcp({})).content[0].text, "No MCP tab group exists. Use createIfEmpty: true to create one.");
+  const refused = await w.bg.handlers.get_page_text({ tabId: 11 });
+  assert.equal(refused.isError, true);
+  assert.equal(refused.content[0].text, "Tab 11 is not in the MCP group.");
+
+  const created = listedTabs(await w.bg.handlers.tabs_context_mcp({ createIfEmpty: true }));
+  assert.equal(created.tabGroupId, 8);
+  assert.deepEqual(created.availableTabs.map((t) => t.tabId), [21]);
+  assert.equal(w.session.mcpTabGroupId, 8, "the new group's id is stored");
+
+  assert.equal(w.tabs[11].groupId, 99, "tab 11 stays in the user's group");
+  assert.ok(!w.log.some(([op, a, b]) => op === "tabs.group" && (a.includes(11) || b === 99)), `no tab moved into or out of the user's group: ${JSON.stringify(w.log)}`);
+  assert.ok(!w.log.some(([op, id]) => op === "tabGroups.update" && id === 99), "the user's group is not renamed");
+  assert.equal((await w.bg.handlers.get_page_text({ tabId: 11 })).content[0].text, "Tab 11 is not in the MCP group.");
+}
+
+test("with nothing stored, a worker restart does not adopt the user's own MCP group", async () => {
+  await assertUserGroupIgnored(await restartedWorker({ stored: {}, groups: [{ id: 99, title: "MCP", tabIds: [11] }] }));
+});
+
+test("a stored group id whose group is gone is not adopted, nor is the user's own MCP group", async () => {
+  await assertUserGroupIgnored(await restartedWorker({ stored: { mcpTabGroupId: 5 }, groups: [{ id: 99, title: "MCP", tabIds: [11] }] }));
+});
+
+// The user's group comes first in Chrome's list, so a match by title would take it.
+test("a stored group id that still exists is adopted after a worker restart", async () => {
+  const w = await restartedWorker({ stored: { mcpTabGroupId: 7 }, groups: [{ id: 99, title: "MCP", tabIds: [50] }, { id: 7, title: "MCP", tabIds: [11] }] });
+  const context = listedTabs(await w.bg.handlers.tabs_context_mcp({}));
+  assert.equal(context.tabGroupId, 7);
+  assert.deepEqual(context.availableTabs.map((t) => t.tabId), [11]);
+  assert.equal("isError" in (await w.bg.handlers.computer({ action: "screenshot", tabId: 11 })), false);
+  assert.equal((await w.bg.handlers.get_page_text({ tabId: 50 })).content[0].text, "Tab 50 is not in the MCP group.");
+  assert.ok(!w.log.some(([op]) => op === "windows.create" || op === "tabs.group"), "no new group was created");
+});
+
+// --- Access follows the tab's live group membership ---
 
 test("a cached tab that is no longer in the MCP group is refused", async () => {
   let groupId = 7;

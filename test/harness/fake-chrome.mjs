@@ -21,8 +21,8 @@ export function event() {
   };
 }
 
-function memoryArea() {
-  const data = {};
+function memoryArea(initial = {}) {
+  const data = { ...initial };
   return {
     data,
     get: async (keys) => {
@@ -105,7 +105,9 @@ export async function loadBackground({ page = null, content = null, tab = {}, wi
       onEvent: event(),
     },
     scripting: { executeScript: async (p) => { calls.push(["scripting.executeScript", p]); return []; } },
-    storage: { local: memoryArea(), session: memoryArea(), onChanged: event() },
+    // Group 7 is the one this extension created before the worker started: background.js adopts
+    // a group only by the id it stored in session storage.
+    storage: { local: memoryArea(), session: memoryArea({ mcpTabGroupId: GROUP_ID }), onChanged: event() },
   };
   deepAssign(chrome, overrides);
   if (page) {

@@ -110,7 +110,13 @@ function firstDelivery(id) {
 }
 
 // --- Tab group management ---
+// The id of the group this extension created, kept in session storage: that survives a service
+// worker restart, but not a browser restart or an extension reload, after which group ids no
+// longer mean the same group.
+const TAB_GROUP_ID_KEY = "mcpTabGroupId";
+
 async function ensureTabGroup(createIfEmpty) {
+  await tabGroupRecovery;
   // Check if our tab group still exists
   if (tabGroupId !== null) {
     try {
@@ -136,6 +142,7 @@ async function ensureTabGroup(createIfEmpty) {
   await chrome.tabGroups.update(groupId, { title: "MCP", color: "blue" });
   tabGroupId = groupId;
   tabGroupTabs = new Set([tab.id]);
+  await chrome.storage.session.set({ [TAB_GROUP_ID_KEY]: groupId });
 }
 
 function formatTabContext(tabs) {
@@ -176,6 +183,7 @@ function formatTabContext(tabs) {
 //     resize_window — window.get/update are browser-level and readViewport already degrades to
 //     null within its own short budget instead of hanging).
 async function tabAccessError(tabId, { allowBlockedUrl = false, allowDialog = false } = {}) {
+  await tabGroupRecovery;
   let tab;
   try {
     tab = await chrome.tabs.get(tabId);
@@ -183,17 +191,6 @@ async function tabAccessError(tabId, { allowBlockedUrl = false, allowDialog = fa
     return `Tab ${tabId} is not in the MCP group.`;
   }
 
-  // Recover tabGroupId if we lost it (service worker restart)
-  if (tab.groupId !== -1 && tabGroupId === null) {
-    try {
-      const group = await chrome.tabGroups.get(tab.groupId);
-      if (group.title === "MCP") {
-        tabGroupId = group.id;
-        const groupTabs = await chrome.tabs.query({ groupId: tabGroupId });
-        tabGroupTabs = new Set(groupTabs.map((t) => t.id));
-      }
-    } catch {}
-  }
   // Only the tab's live groupId counts, never the tabGroupTabs cache: a tab the user dragged out
   // of the group, or popped into its own window, has groupId -1 at once, before any event has
   // updated the cache.
@@ -1645,21 +1642,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 // --- Init ---
 
-// Recover MCP tab group state after service worker restart
+// Recover MCP tab group state after a service worker restart: only the group this extension
+// created, by the id it stored, never a group found by its title, which the user can give any
+// group of their own. A stored group that is gone is not adopted, and a new one is created on
+// demand. tabAccessError and ensureTabGroup wait for this, so a first call cannot race it.
 async function recoverTabGroupState() {
   try {
-    const groups = await chrome.tabGroups.query({ title: "MCP" });
-    if (groups.length > 0) {
-      tabGroupId = groups[0].id;
-      const tabs = await chrome.tabs.query({ groupId: tabGroupId });
-      tabGroupTabs = new Set(tabs.map((t) => t.id));
-    }
+    const { [TAB_GROUP_ID_KEY]: storedId } = await chrome.storage.session.get(TAB_GROUP_ID_KEY);
+    if (typeof storedId !== "number") return;
+    await chrome.tabGroups.get(storedId); // rejects when the group no longer exists
+    tabGroupId = storedId;
+    const tabs = await chrome.tabs.query({ groupId: storedId });
+    tabGroupTabs = new Set(tabs.map((t) => t.id));
   } catch {
-    // Not critical — will be set on first tabs_context_mcp call
+    // Not critical: a new group is created on the first tabs_context_mcp or tabs_create_mcp call
   }
 }
 
-recoverTabGroupState();
+const tabGroupRecovery = recoverTabGroupState();
 connectNativeHost();
 // Audit records only tabs the tools may use, but an open JS dialog must not
 // stop a tab's recording, so the dialog state is ignored here.
