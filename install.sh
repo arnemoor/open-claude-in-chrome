@@ -115,7 +115,7 @@ case "$(uname)" in
     ;;
   *)
     echo "Error: Unsupported platform $(uname). This script supports macOS and Linux."
-    echo "For Windows, manually create the registry entries and host manifest."
+    echo "Windows is not supported: the bridge is built on Unix domain sockets and process.getuid(), which Windows doesn't have."
     exit 1
     ;;
 esac
@@ -149,22 +149,39 @@ if [ -d "$CLAUDE_SKILLS_DIR" ]; then
   SKILL_LINK="$CLAUDE_SKILLS_DIR/open-claude-in-chrome"
   if [ -L "$SKILL_LINK" ]; then
     OLD_TARGET=$(readlink "$SKILL_LINK")
+    # A relative target (some older installs made one) resolves against the
+    # link's own directory, the same way the OS resolves it, not against
+    # wherever this script happens to be invoked from.
+    case "$OLD_TARGET" in
+      /*) OLD_TARGET_ABS="$OLD_TARGET" ;;
+      *) OLD_TARGET_ABS="$CLAUDE_SKILLS_DIR/$OLD_TARGET" ;;
+    esac
+    NEW_COMMON=$(repo_common_dir "$SCRIPT_DIR")
     SAME_REPO=false
-    if [ "$OLD_TARGET" = "$SKILL_SRC" ]; then
+    REASON="already points elsewhere"
+    if [ "$OLD_TARGET_ABS" = "$SKILL_SRC" ]; then
       SAME_REPO=true
-    else
-      OLD_COMMON=$(repo_common_dir "$(dirname "$OLD_TARGET")")
-      NEW_COMMON=$(repo_common_dir "$SCRIPT_DIR")
+    elif [ -d "$(dirname "$OLD_TARGET_ABS")" ]; then
+      OLD_COMMON=$(repo_common_dir "$(dirname "$OLD_TARGET_ABS")")
       if [ -n "$OLD_COMMON" ] && [ "$OLD_COMMON" = "$NEW_COMMON" ]; then
         SAME_REPO=true
       fi
+    else
+      # Dangling: its directory is gone (e.g. a removed worktree), so git can
+      # no longer tell us its repo. Fall back to a structural check instead:
+      # every worktree of this repo lives under this same repo's own root.
+      REPO_ROOT=$(dirname "$NEW_COMMON")
+      case "$OLD_TARGET_ABS" in
+        "$REPO_ROOT"|"$REPO_ROOT"/*) SAME_REPO=true ;;
+        *) REASON="is dangling and not clearly part of this repository" ;;
+      esac
     fi
     if [ "$SAME_REPO" = true ]; then
       ln -sfn "$SKILL_SRC" "$SKILL_LINK" \
         && echo "  Relinked skill: $SKILL_LINK (was -> $OLD_TARGET) -> $SKILL_SRC" \
         || echo "  Could not relink skill at $SKILL_LINK: check permissions on $CLAUDE_SKILLS_DIR."
     else
-      echo "  Skipping skill link: $SKILL_LINK already points elsewhere (-> $OLD_TARGET), leaving it alone."
+      echo "  Skipping skill link: $SKILL_LINK $REASON (-> $OLD_TARGET), leaving it alone."
     fi
   elif [ -e "$SKILL_LINK" ]; then
     echo "  Skipping skill link: $SKILL_LINK already exists and was not made by this installer."
