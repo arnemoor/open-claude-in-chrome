@@ -1,5 +1,5 @@
-rrweb-player (npm package "rrweb-player", version 2.1.6)
-https://github.com/rrweb-io/rrweb/tree/master/packages/rrweb-player
+rrweb (npm packages "@rrweb/record" 2.1.6 and "rrweb-player" 2.1.6)
+https://github.com/rrweb-io/rrweb
 
 MIT License
 

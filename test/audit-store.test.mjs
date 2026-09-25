@@ -39,6 +39,7 @@ const getSession = (page, id) => call(page, `AuditStore.getSession(${JSON.string
 const listSessions = (page) => call(page, "AuditStore.listSessions()");
 const deleteSession = (page, id) => call(page, `AuditStore.deleteSession(${JSON.stringify(id)})`);
 const prune = (page, opts) => call(page, `AuditStore.prune(${JSON.stringify(opts)})`);
+const hasSession = (page, id) => call(page, `AuditStore.hasSession(${JSON.stringify(id)})`);
 
 test("upsertSession twice keeps one row and updates lastSeen", { skip: !chromeAvailable, timeout: 20000 }, async () => {
   await withStore(async (page) => {
@@ -121,5 +122,82 @@ test("prune with maxSessions keeps only the newest sessions", { skip: !chromeAva
 
     const sessions = await listSessions(page);
     assert.deepEqual(sessions.map((s) => s.id), ["s3"]);
+  });
+});
+
+// I4: prune previously only ever looked at a session's own lastSeen, so a
+// long-running session (still "active", lastSeen recent) kept every action and
+// event it had ever produced, however old — they never aged out on their own.
+test("prune deletes old actions and events by their own ts, even under a session that is still active", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  await withStore(async (page) => {
+    const dayMs = 24 * 60 * 60 * 1000;
+    // Anchor everything to a vantage point far in the future relative to the
+    // real wall clock: addEvents stamps its row with the real Date.now() (its
+    // signature takes no ts), so pruning "as of" a point 100 days from now
+    // makes that real-time event row unambiguously "old" without depending on
+    // exactly when this test happens to run.
+    const pruneNow = Date.now() + 100 * dayMs;
+    await upsert(page, { id: "s1", label: "app", cwd: "/x", pid: 1 }, pruneNow); // lastSeen == the vantage point: still "active"
+    await addAction(page, { sessionId: "s1", ts: pruneNow - 10 * dayMs, tool: "navigate", tabId: 1, summary: "old", outcome: "ok", ms: 1 });
+    await addAction(page, { sessionId: "s1", ts: pruneNow - 1 * dayMs, tool: "navigate", tabId: 1, summary: "recent", outcome: "ok", ms: 1 });
+    await addEvents(page, "s1", 1, [{ type: 2, data: { tag: "should-be-pruned" } }]);
+
+    await prune(page, { retentionDays: 7, maxSessions: 200, now: pruneNow });
+
+    const sessions = await listSessions(page);
+    assert.equal(sessions.length, 1, "the session itself is still active (lastSeen == the vantage point) and must survive");
+    const { actions, eventsByTab } = await getSession(page, "s1");
+    assert.deepEqual(actions.map((a) => a.summary), ["recent"]);
+    assert.equal(Object.keys(eventsByTab).length, 0, "the event row (real-time ts, ~100 days before the vantage point) must be pruned");
+  });
+});
+
+test("hasSession reports existence without fetching actions or events", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  await withStore(async (page) => {
+    assert.equal(await hasSession(page, "s1"), false);
+    await upsert(page, { id: "s1", label: "app", cwd: "/x", pid: 1 }, 1000);
+    assert.equal(await hasSession(page, "s1"), true);
+    await deleteSession(page, "s1");
+    assert.equal(await hasSession(page, "s1"), false);
+  });
+});
+
+// M6: a stale cached connection promise would make every future audit write
+// fail (or hang) after a single dropped connection, until the service worker
+// happens to restart. A versionchange (another connection wants to upgrade the
+// database — e.g. a later schema bump) must not be one of those permanent-failure
+// triggers: store.js's connection must get out of the way, not block it forever.
+test("store.js releases its connection on versionchange instead of blocking a version bump from elsewhere", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  await withStore(async (page) => {
+    await upsert(page, { id: "s1", label: "a", cwd: "/x", pid: 1 }, 1000); // proves the v1 connection is open and working
+    const outcome = await page.evaluate(`
+      new Promise((resolve) => {
+        const req = indexedDB.open("ocic-audit", 2);
+        req.onupgradeneeded = () => {};
+        req.onsuccess = () => { req.result.close(); resolve("success"); };
+        req.onerror = () => resolve("error:" + (req.error && req.error.name));
+        req.onblocked = () => resolve("blocked");
+        setTimeout(() => resolve("timeout"), 3000);
+      })
+    `);
+    assert.equal(outcome, "success");
+  });
+});
+
+// M8: the three classic scripts share the worker's (or, here, the page's) global
+// scope. store.js must not leak its internal helpers, and must not replace
+// window.open — a real collision confirmed in the review (Task 17 loads
+// store.js on options.html).
+test("store.js exposes only globalThis.AuditStore and leaves window.open alone", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  await withStore(async (page) => {
+    const clean = await page.evaluate(`
+      (function () {
+        const noInternals = typeof openDb === "undefined" && typeof getDb === "undefined" &&
+          typeof reqp === "undefined" && typeof upsertSession === "undefined" && typeof dbPromise === "undefined";
+        const openIsNative = typeof window.open === "function" && window.open.toString().indexOf("[native code]") !== -1;
+        return noInternals && openIsNative;
+      })()
+    `);
+    assert.equal(clean, true);
   });
 });

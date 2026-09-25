@@ -1382,8 +1382,21 @@ async function handleToolRequest(id, tool, args, session) {
 // --- Audit: recorder events relayed from the in-page recorder (Task 16) ---
 // Sender-derived tabId (not a field in msg): a content script can't spoof another
 // tab's id, and onRecorderEvents itself drops events for a tab with no owner.
+// sender.id must match our own extension id and sender.tab must be set, so only our
+// injected recorder.js — not some other message — reaches Audit.onRecorderEvents.
+// M6: sender.id is always our own for anything reaching onMessage (no
+// externally_connectable in the manifest), so on its own it is a weak gate — this
+// extension's own pages (e.g. Task 17's options.html opened in a tab) pass it and
+// sender.tab too. frameId must be the top frame (injection always targets frame
+// 0), and origin must not be one of the extension's own pages.
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg && msg.type === "auditRecorderEvents" && sender.tab) {
+  if (
+    msg && msg.type === "ocic_audit_events" &&
+    sender.id === chrome.runtime.id &&
+    sender.tab &&
+    sender.frameId === 0 &&
+    sender.origin !== `chrome-extension://${chrome.runtime.id}`
+  ) {
     Audit.onRecorderEvents(sender.tab.id, msg.events || []);
     sendResponse({ ok: true });
   }
@@ -1407,4 +1420,4 @@ async function recoverTabGroupState() {
 
 recoverTabGroupState();
 connectNativeHost();
-Audit.init({ store: AuditStore });
+Audit.init({ store: AuditStore, isTabAllowed: isInGroup });
