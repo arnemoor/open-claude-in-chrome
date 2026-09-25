@@ -21,6 +21,7 @@ const screenshotStore = new Map(); // imageId -> base64
 const openDialogs = new Map(); // tabId -> message, while a JS dialog (alert/confirm/prompt/beforeunload) blocks the page
 const pendingCdpRejects = new Map(); // tabId -> Set<reject>, one entry per in-flight rawCdp call on that tab
 const releasedTabs = new Set(); // tabIds that left the MCP group: no CDP command reaches them until they are back
+let groupRecoverySettled = false; // set once the startup recovery has restored tabGroupId, or found nothing to restore
 
 // Thrown to reject every pending rawCdp call on a tab the instant its dialog opens, instead of
 // letting each one run out its own CDP_TIMEOUT_MS: a dialog freezes the renderer, so an
@@ -342,6 +343,14 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   forgetTab(tabId);
 });
 
+// Group events are read against tabGroupId, which the startup recovery restores: before it has
+// settled, the rejoin event that woke a stopped worker would read as a leave. Events in that
+// window run once it has, in their order. Later ones run at once.
+function whenGroupKnown(handle) {
+  if (groupRecoverySettled) handle();
+  else tabGroupRecovery.then(handle);
+}
+
 // A tab that leaves the MCP group (dragged out, popped into its own window, moved to another
 // group, or ungrouped) is released at once, on top of tabAccessError refusing it by its live
 // groupId. Any other groupId counts, not only tabs in tabGroupTabs: another call's
@@ -350,23 +359,25 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 // created there.
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (!("groupId" in changeInfo)) return;
-  if (tabGroupId !== null && changeInfo.groupId === tabGroupId) {
-    releasedTabs.delete(tabId);
-    tabGroupTabs.add(tabId);
-    return;
-  }
-  releasedTabs.add(tabId);
-  forgetTab(tabId);
+  whenGroupKnown(() => {
+    if (tabGroupId !== null && changeInfo.groupId === tabGroupId) {
+      releasedTabs.delete(tabId);
+      tabGroupTabs.add(tabId);
+      return;
+    }
+    releasedTabs.add(tabId);
+    forgetTab(tabId);
+  });
 });
 
 // The MCP group is gone: its last tab closed or left it, or the user ungrouped it. Its tabs are
 // released by their own events above. Forgetting its id, the stored one too, makes the next
 // tabs_context_mcp or tabs_create_mcp create a new group.
-chrome.tabGroups.onRemoved.addListener((group) => {
+chrome.tabGroups.onRemoved.addListener((group) => whenGroupKnown(() => {
   if (group.id !== tabGroupId) return;
   tabGroupId = null;
   chrome.storage.session.remove(TAB_GROUP_ID_KEY).catch(() => {});
-});
+}));
 
 // Handle user dismissing debugger bar
 chrome.debugger.onDetach.addListener((source, reason) => {
@@ -1710,7 +1721,7 @@ async function recoverTabGroupState() {
   }
 }
 
-const tabGroupRecovery = recoverTabGroupState();
+const tabGroupRecovery = recoverTabGroupState().then(() => { groupRecoverySettled = true; });
 connectNativeHost();
 // Audit records only tabs the tools may use, but an open JS dialog must not
 // stop a tab's recording, so the dialog state is ignored here.

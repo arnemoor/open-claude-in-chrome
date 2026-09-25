@@ -108,6 +108,45 @@ test("removing the MCP group forgets its stored id, and the next call creates a 
   assert.equal(w.session.mcpTabGroupId, 8);
 });
 
+// A stopped worker can be woken by the tab's own groupId event, before its startup recovery has
+// read the stored group id. The event is classified once that recovery has settled.
+function workerWokenByEvent() {
+  let openStorage;
+  const storageRead = new Promise((resolve) => { openStorage = resolve; });
+  let groupId = 7;
+  return {
+    setGroup: (g) => { groupId = g; },
+    openStorage: () => openStorage(),
+    load: () => loadBackground({
+      overrides: {
+        storage: { session: { get: async () => { await storageRead; return { mcpTabGroupId: 7 }; } } },
+        tabs: { get: async (id) => ({ ...TAB, id, groupId }) },
+      },
+    }),
+  };
+}
+
+test("a rejoin that wakes the worker during its startup recovery counts as a join", async () => {
+  const w = workerWokenByEvent();
+  const bg = await w.load();
+  bg.chrome.tabs.onUpdated.fire(11, { groupId: 7 }, { ...TAB, id: 11, groupId: 7 });
+  w.openStorage();
+  await flush();
+  assert.equal(bg.get("releasedTabs").has(11), false);
+  const shot = await bg.handlers.computer({ action: "screenshot", tabId: 11 });
+  assert.equal("isError" in shot, false, JSON.stringify(shot));
+});
+
+test("a leave that wakes the worker during its startup recovery still releases the tab", async () => {
+  const w = workerWokenByEvent();
+  const bg = await w.load();
+  w.setGroup(-1);
+  bg.chrome.tabs.onUpdated.fire(11, { groupId: -1 }, { ...TAB, id: 11, groupId: -1 });
+  w.openStorage();
+  await flush();
+  assert.equal(bg.get("releasedTabs").has(11), true);
+});
+
 // --- Access follows the tab's live group membership ---
 
 test("a cached tab that is no longer in the MCP group is refused", async () => {
