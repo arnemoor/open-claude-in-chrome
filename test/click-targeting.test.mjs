@@ -379,12 +379,17 @@ test("interactive content inside the target's own label is still reported as cov
 // R3: dom.closest (used by the old isOwnLabel/labelNotes) never crosses a shadow boundary, so
 // a label whose visible content is a shadow-DOM icon looks like it has no enclosing label at
 // all from the icon's own hit-tested point — both must instead walk the flat tree.
+// Minor 13: top:10px plus no other content leaves the page unable to scroll at all, so
+// `scrollY === 0` below held vacuously (there was nowhere to scroll to) regardless of whether
+// the code correctly avoided scrolling. Moved low, with a tall div added below, the same way R5
+// already fixed the equivalent plain (non-shadow) checkbox-behind-its-own-label test above.
 const SHADOW_LABEL_HTML = (id, extraAttr = "") => `
-  <input id="${id}" type="checkbox" ${extraAttr} style="position:absolute;clip-path:inset(50%);top:10px;left:10px">
-  <label for="${id}" style="position:absolute;top:10px;left:10px;width:20px;height:20px;display:block">
+  <input id="${id}" type="checkbox" ${extraAttr} style="position:absolute;clip-path:inset(50%);top:550px;left:10px">
+  <label for="${id}" style="position:absolute;top:550px;left:10px;width:20px;height:20px;display:block">
     <span id="icon-host-${id}"></span>
   </label>
-  <script>document.getElementById("icon-host-${id}").attachShadow({mode:"open"}).innerHTML = '<svg width="20" height="20"><rect width="20" height="20"/></svg>';</script>`;
+  <script>document.getElementById("icon-host-${id}").attachShadow({mode:"open"}).innerHTML = '<svg width="20" height="20"><rect width="20" height="20"/></svg>';</script>
+  <div style="height:3000px"></div>`;
 
 test("a visually-hidden checkbox whose label holds a shadow-DOM icon is clicked without a false cover warning", { skip: !chromeAvailable, timeout: 20000 }, async () => {
   const { page, cs, bg } = await setup(SHADOW_LABEL_HTML("cb3"));
@@ -414,4 +419,35 @@ test("find flags an element clipped by body's own overflow even though html is a
     <button id="target">Target</button>`, { doctype: true });
   const r = await bg.handlers.find({ query: "Target", tabId: bg.tabId });
   assert.match(r.content[0].text, /off-screen/);
+});
+
+// Minor 2: labelNotes used to warn on the label's control regardless of what the hit point
+// actually was, so interactive content of its own — nested between the hit and the label —
+// produced a false warning even though the click never reaches the label's control at all.
+test("a shadow input inside a label with no recognized .control is not falsely warned as controlless", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  const { bg, refOf } = await setup(`
+    <label id="name-label" style="display:block;width:200px">Name
+      <my-input id="mi"></my-input>
+    </label>
+    <script>
+      customElements.define("my-input", class extends HTMLElement {
+        connectedCallback() {
+          this.attachShadow({ mode: "open" }).innerHTML = '<input id="shadow-input" aria-label="ShadowInput">';
+        }
+      });
+    </script>`);
+  const ref = (await refOf("ShadowInput")).ref;
+  const r = await bg.handlers.computer({ action: "left_click", ref, tabId: bg.tabId });
+  assert.doesNotMatch(r.content[0].text, /This label has no associated control/);
+});
+
+test("a button inside a label pointing at a disabled control is not falsely warned as disabled", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  const { bg, refOf } = await setup(`
+    <label for="c5" style="display:block;width:200px">
+      <button id="inner-btn" aria-label="InnerBtn">Go</button>
+    </label>
+    <input id="c5" type="checkbox" disabled>`);
+  const ref = (await refOf("InnerBtn")).ref;
+  const r = await bg.handlers.computer({ action: "left_click", ref, tabId: bg.tabId });
+  assert.doesNotMatch(r.content[0].text, /This label's control is disabled/);
 });

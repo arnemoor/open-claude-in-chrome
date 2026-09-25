@@ -110,6 +110,18 @@ describe("end-to-end: real extension in an isolated headless Chrome", { skip: sk
     let buf = "";
     let seq = 0;
     const pending = new Map();
+    // A Chrome that dies at startup closes the pipe without ever answering in-flight sends.
+    // Reject them (and any later send) instead of hanging before() forever.
+    let closedErr = null;
+    const onClosed = (err) => {
+      if (closedErr) return;
+      closedErr = err || new Error("Chrome CDP pipe closed");
+      for (const { reject } of pending.values()) reject(closedErr);
+      pending.clear();
+    };
+    pipeRead.on("close", () => onClosed());
+    pipeRead.on("error", onClosed);
+    pipeWrite.on("error", onClosed);
     pipeRead.on("data", (chunk) => {
       buf += chunk.toString("utf8");
       let idx;
@@ -132,12 +144,14 @@ describe("end-to-end: real extension in an isolated headless Chrome", { skip: sk
     });
     // sessionId is only needed for a flattened Target.attachToTarget session
     // (step 10's options-page target); every other caller omits it.
-    const send = (method, params = {}, sessionId) =>
-      new Promise((resolve, reject) => {
+    const send = (method, params = {}, sessionId) => {
+      if (closedErr) return Promise.reject(closedErr);
+      return new Promise((resolve, reject) => {
         const id = ++seq;
         pending.set(id, { resolve, reject });
         pipeWrite.write(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }) + "\0");
       });
+    };
     return { send };
   }
 
@@ -315,13 +329,13 @@ document.getElementById('file-input').addEventListener('change', function (e) {
     );
 
     mcpTransport = new StdioClientTransport({
-      command: "node",
+      command: process.execPath,
       args: [MCP_SERVER_JS],
       env: { ...process.env, HOME: tempHome },
     });
     mcpClient = new Client({ name: "ocic-e2e", version: "1.0.0" }, { capabilities: {} });
     await mcpClient.connect(mcpTransport);
-  });
+  }, { timeout: 60000 });
 
   after(async () => {
     try {
