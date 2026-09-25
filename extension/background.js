@@ -373,10 +373,30 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 // The MCP group is gone: its last tab closed or left it, or the user ungrouped it. Its tabs are
 // released by their own events above. Forgetting its id, the stored one too, makes the next
 // tabs_context_mcp or tabs_create_mcp create a new group.
+let removedGroupId = null;
 chrome.tabGroups.onRemoved.addListener((group) => whenGroupKnown(() => {
   if (group.id !== tabGroupId) return;
   tabGroupId = null;
+  removedGroupId = group.id;
   chrome.storage.session.remove(TAB_GROUP_ID_KEY).catch(() => {});
+}));
+
+// Moving a group to another window is reported as its removal and a creation with the same id,
+// and the group keeps its tabs. That id is re-adopted: it is the same group, not one found by
+// its title. The group's tabs are un-released, because their leave and join events can come
+// before this one.
+chrome.tabGroups.onCreated.addListener((group) => whenGroupKnown(() => {
+  if (group.id !== removedGroupId || tabGroupId !== null) return;
+  removedGroupId = null;
+  tabGroupId = group.id;
+  chrome.storage.session.set({ [TAB_GROUP_ID_KEY]: group.id }).catch(() => {});
+  chrome.tabs.query({ groupId: group.id }).then((tabs) => {
+    if (tabGroupId !== group.id) return;
+    for (const t of tabs) {
+      releasedTabs.delete(t.id);
+      tabGroupTabs.add(t.id);
+    }
+  }, () => {});
 }));
 
 // Handle user dismissing debugger bar

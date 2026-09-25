@@ -147,6 +147,46 @@ test("a leave that wakes the worker during its startup recovery still releases t
   assert.equal(bg.get("releasedTabs").has(11), true);
 });
 
+// Chrome reports "move group to another window" as the group's removal and a creation with the
+// same id, and the group keeps its tabs. Their leave and join events can come on either side of
+// the creation.
+for (const [label, order] of [
+  ["the tabs rejoin after the group is created again", ["removed", "leave", "created", "join"]],
+  ["the tabs rejoin before the group is created again", ["removed", "leave", "join", "created"]],
+]) {
+  test(`moving the MCP group to another window keeps the group and its tabs usable when ${label}`, async () => {
+    const w = await restartedWorker({ stored: { mcpTabGroupId: 7 }, groups: [{ id: 7, title: "MCP", tabIds: [11, 12] }] });
+    const step = {
+      removed: () => w.bg.chrome.tabGroups.onRemoved.fire({ id: 7 }),
+      created: () => w.bg.chrome.tabGroups.onCreated.fire({ id: 7, title: "MCP" }),
+      leave: () => { for (const id of [11, 12]) { w.tabs[id].groupId = -1; w.bg.chrome.tabs.onUpdated.fire(id, { groupId: -1 }, w.tabs[id]); } },
+      join: () => { for (const id of [11, 12]) { w.tabs[id].groupId = 7; w.bg.chrome.tabs.onUpdated.fire(id, { groupId: 7 }, w.tabs[id]); } },
+    };
+    for (const s of order) step[s]();
+    await flush();
+
+    assert.equal(w.session.mcpTabGroupId, 7, "the stored id is kept");
+    assert.deepEqual([...w.bg.get("releasedTabs")], []);
+    const context = listedTabs(await w.bg.handlers.tabs_context_mcp({}));
+    assert.equal(context.tabGroupId, 7);
+    assert.deepEqual(context.availableTabs.map((t) => t.tabId), [11, 12]);
+    for (const id of [11, 12]) {
+      const shot = await w.bg.handlers.computer({ action: "screenshot", tabId: id });
+      assert.equal("isError" in shot, false, `tab ${id}: ${JSON.stringify(shot)}`);
+    }
+    assert.ok(!w.log.some(([op]) => op === "windows.create" || op === "tabs.group"), "no second group");
+  });
+}
+
+test("a group created with another id is not adopted after the MCP group is removed", async () => {
+  const w = await restartedWorker({ stored: { mcpTabGroupId: 7 }, groups: [{ id: 7, title: "MCP", tabIds: [11] }, { id: 99, title: "MCP", tabIds: [50] }] });
+  w.bg.chrome.tabGroups.onRemoved.fire({ id: 7 });
+  w.bg.chrome.tabGroups.onCreated.fire({ id: 99, title: "MCP" });
+  await flush();
+  assert.equal("mcpTabGroupId" in w.session, false);
+  assert.equal((await w.bg.handlers.get_page_text({ tabId: 50 })).content[0].text, "Tab 50 is not in the MCP group.");
+});
+
 // --- Access follows the tab's live group membership ---
 
 test("a cached tab that is no longer in the MCP group is refused", async () => {
