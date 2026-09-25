@@ -240,11 +240,11 @@ No build step. All files are plain JavaScript. After pulling or editing code:
 | What changed | What to do |
 |---|---|
 | `extension/background.js`, `extension/content.js`, `extension/manifest.json`, anything under `extension/audit/` or `extension/vendor/`, or the `extension/options.*` files | Reload the extension: `brave://extensions` > click the reload icon |
-| `host/*.js` (`native-host.js`, `mcp-server.js`, `bridge-hub.js`, `bridge-client.js`, `bridge-endpoint.js`, `log.js`) | Restart the browser (new native host), then `pkill -f "node.*open-claude-in-chrome/host/mcp-server"` and `/mcp` in each Claude Code session |
+| `host/*.js` (`native-host.js`, `mcp-server.js`, `bridge-hub.js`, `bridge-client.js`, `bridge-endpoint.js`, `log.js`) | Quit the browser completely with Cmd+Q, or reload the extension (either starts a new native host), then `pkill -f "node.*open-claude-in-chrome/host/mcp-server"` and `/mcp` in each Claude Code session |
 | `host/upload-policy.js`, `host/save-to-disk.js` | `pkill -f "node.*open-claude-in-chrome/host/mcp-server"` and `/mcp` in each Claude Code session, no browser restart needed |
-| `install.sh` or native host name changed | Re-run `./install.sh <extension-id>`, restart browser, re-add MCP |
+| `install.sh` or native host name changed | Re-run `./install.sh <extension-id>`, quit the browser completely with Cmd+Q or reload the extension, re-add MCP |
 
-> Old and new versions of the bridge cannot talk to each other, so after changing `native-host.js`, `mcp-server.js`, `bridge-hub.js`, `bridge-client.js`, `bridge-endpoint.js` or `log.js`, refresh **both** sides: restart the browser (spawns a fresh native host) **and** `pkill` + `/mcp` in every session (spawns fresh MCP servers). `log.js` is imported by the native host too, so a change there only reaches `native-host.log` once a fresh native host starts. Reloading the extension also applies any manifest change (a dropped or added permission, a new options page, and so on).
+> Old and new versions of the bridge cannot talk to each other, so after changing `native-host.js`, `mcp-server.js`, `bridge-hub.js`, `bridge-client.js`, `bridge-endpoint.js` or `log.js`, refresh **both** sides: quit the browser completely with Cmd+Q, or reload the extension (either spawns a fresh native host), **and** `pkill` + `/mcp` in every session (spawns fresh MCP servers). Closing every window does not quit a Chrome-based browser. `log.js` is imported by the native host too, so a change there only reaches `native-host.log` once a fresh native host starts. Reloading the extension also applies any manifest change (a dropped or added permission, a new options page, and so on).
 
 ### Quick reset (nuclear option)
 
@@ -311,7 +311,7 @@ The native host creates `~/.config/open-claude-in-chrome/run` with mode `0700` e
 - something other than a socket already sits at the `bridge.sock` path itself
 - the full socket path is too long for a Unix socket (over 103 bytes on macOS, 107 on Linux, which a long home directory path can trigger)
 
-Remove or fix whatever is at that path (or shorten your home directory path), then restart the browser.
+Remove or fix whatever is at that path (or shorten your home directory path), then quit the browser completely with Cmd+Q, or reload the extension.
 
 ### `navigate` refuses `file://` URLs
 
