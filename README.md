@@ -86,7 +86,7 @@ To move an existing install to this version:
 
 1. Pull the latest code.
 2. Reinstall host dependencies: `cd host && npm install && cd ..`.
-3. Fully quit the browser (all windows), then reopen it. An old native host and a new MCP server (or the other way around) cannot talk to each other, so both sides need to restart together.
+3. Quit the browser with Cmd+Q, or at least reload the extension (next step) — closing every window alone does not quit a Chrome-based browser, which keeps running in the background. Either way, both sides need to restart together: an old native host and a new MCP server (or the other way around) cannot talk to each other.
 4. Reload the extension in `chrome://extensions` so it picks up the new `background.js` and `content.js`.
 5. Clear out stale MCP server processes and reconnect each Claude Code session:
    ```bash
@@ -136,7 +136,7 @@ This also links an agent-facing skill describing this fork's tool quirks into `~
 
 ### Step 4: Restart your browser
 
-Close **all** windows and reopen. The browser reads native messaging host configs on startup.
+Quit with **Cmd+Q**, or at least reload the extension in `chrome://extensions` — closing every window alone does not quit a Chrome-based browser, which keeps running in the background. Either way, this is what makes the browser pick up the native messaging host config from Step 3.
 
 ### Step 5: Add to Claude Code
 
@@ -191,7 +191,7 @@ The full 22-tool surface of the official Claude in Chrome. Most are fully implem
 
 ## Uploading and saving files
 
-`file_upload`, including a `file_upload` action nested inside `browser_batch`, only accepts absolute paths inside an allowed upload folder. By default that's `~/Downloads` and `~/Desktop`. Set `fileUploadAllowedDirs` in `~/.config/open-claude-in-chrome/config.json` to use different folders instead, not in addition: once it's set, only the folders you list are allowed, and the refusal names them.
+`file_upload`, including a `file_upload` action nested inside `browser_batch`, only accepts absolute paths inside an allowed upload folder. By default that's `~/Downloads` and `~/Desktop`. Set `fileUploadAllowedDirs` in `~/.config/open-claude-in-chrome/config.json` to use different folders instead, not in addition: once it's set, only the folders you list are allowed, and the refusal names them. This allowlist is the only path by which a local file's bytes can reach the browser at all: `navigate` refuses `file://` URLs outright (see Tool behavior notes below), so there's no way around it by opening a file as a page instead.
 
 ```json
 { "fileUploadAllowedDirs": ["~/Downloads", "~/Projects/shared-uploads"] }
@@ -207,7 +207,9 @@ macOS privacy protection (TCC) covers `~/Downloads` and `~/Desktop`. `save_to_di
 
 A few things about `computer` and `navigate` that aren't obvious from the tool descriptions alone.
 
-**navigate.** A bare host like `example.com` gets `https://` added automatically. These schemes are kept exactly as given: `http:`, `https:`, `file:`, `data:`, `about:`, `chrome:`, `brave:`, `edge:`, `view-source:`, `blob:`, `ftp:`, and `chrome-extension:` for another extension's id. Anything else with a 1-5 letter scheme followed by a slash is treated as a mistyped protocol: that prefix is stripped and `https://` takes its place (`ws://h` becomes `https://h`). A longer or different unknown scheme instead gets `https://` prefixed onto the whole original string (`webcal://h` becomes `https://webcal://h`, `mailto:a@b` becomes `https://mailto:a@b`), so don't rely on an unlisted scheme surviving as written. `javascript:` URLs are refused (use `javascript_tool` instead), and so is navigating to this extension's own pages, even wrapped in `view-source:` or `blob:`. That unwrapping only guards the extension's own pages: a `javascript:` URL hidden behind `view-source:`, for example `view-source:javascript:alert(1)`, is not caught by the `javascript:` refusal itself. Opening a `file://` URL needs "Allow access to file URLs" enabled for this extension in `chrome://extensions`. If it's off, the reply says so.
+**navigate.** A bare host like `example.com` gets `https://` added automatically. These schemes are kept exactly as given: `http:`, `https:`, `file:`, `data:`, `about:`, `chrome:`, `brave:`, `edge:`, `view-source:`, `blob:`, `ftp:`, and `chrome-extension:` for another extension's id. Anything else with a 1-5 letter scheme followed by a slash is treated as a mistyped protocol: that prefix is stripped and `https://` takes its place (`ws://h` becomes `https://h`). A longer or different unknown scheme instead gets `https://` prefixed onto the whole original string (`webcal://h` becomes `https://webcal://h`, `mailto:a@b` becomes `https://mailto:a@b`), so don't rely on an unlisted scheme surviving as written. `javascript:` URLs are refused (use `javascript_tool` instead), and so is navigating to this extension's own pages, even wrapped in `view-source:` or `blob:`. That unwrapping only guards the extension's own pages: a `javascript:` URL hidden behind `view-source:`, for example `view-source:javascript:alert(1)`, is not caught by the `javascript:` refusal itself.
+
+**Local files.** `file:` URLs are blocked outright, also when wrapped in `view-source:` or `blob:`: the reply is `file: URLs are blocked: the agent cannot open local files.` This is by design, not a missing permission: Chrome grants unpacked extensions access to `file://` pages by default, and once granted, a page read (`get_page_text`, `read_page`, a screenshot) would let the agent pull the contents of any file the browser can read, regardless of what `fileUploadAllowedDirs` says. Turning on "Allow access to file URLs" for this extension in `chrome://extensions` does not change this behavior; if you never open file:// pages yourself, you can still turn that switch off there for defense in depth. Every other tool also refuses to act on a tab that's currently showing a `file://` page or one of this extension's own pages: the reply is `Tab <id> shows a local file or this extension's own page, which the agent cannot use.`
 
 **Typing and keys.** `type` presses real keys, with real keydown/keyup events, only for characters on a US keyboard layout (letters, digits, common punctuation). Every other character (umlauts, ß, emoji, CJK) is inserted as text instead, one character at a time, with no key events at all, though the field's value ends up exactly right either way. A line break in the typed text becomes a real line break only when a `textarea` or a contenteditable element is focused. In a single-line `<input>` it's dropped, and the reply notes that. Use the `key` action with `text: "Enter"` to submit a form. Some shifted punctuation can't be built as a `key` combination (for example `shift+1` presses Shift and 1, not `!`). Type that character directly instead.
 
@@ -215,9 +217,9 @@ A few things about `computer` and `navigate` that aren't obvious from the tool d
 
 ## Audit mode
 
-The extension can keep a local, opt-in audit log of what an agent does in the browser, for the user's own oversight. It's off by default. Only the extension's own options page (`chrome://extensions` > Open Claude in Chrome > Details > Extension options) can turn it on or change its retention period (1, 7 or 30 days). No MCP tool can read or change this setting, and it never changes a tool's result or its timing: audit writes happen in the background.
+The extension can keep a local, opt-in audit log of what an agent does in the browser, for the user's own oversight. It's off by default. Only the extension's own options page (`chrome://extensions` > Open Claude in Chrome > Details > Extension options) can turn it on or change its retention period (1, 7 or 30 days). No MCP tool can read or change this setting. An audit failure never changes a tool's result, and audit writes happen in the background — except that the first audited call on a given page can wait up to about 2 seconds while that page's recorder starts.
 
-When it's on, each session's tool calls are recorded as a redacted summary. `type` text and `form_input` values are kept only as a character count, never the value, and a boolean becomes just `checked=`, not its actual state. A `key` action keeps named keys and modifier combos (like `Enter` or `ctrl+a`) as given, since they aren't secrets, but a run of plain character keys is stored only as a count (`[N keys]`), the same protection `type` gets. Any stored URL, including inside an error message, has its query string and fragment removed everywhere. The path stays. `javascript_tool` code is kept up to 500 characters, but the text of any string literal inside it is replaced with `[N chars]`, and so is everything after the first `/` that isn't part of a comment (a division sign or the start of a regex), since telling those apart isn't reliable. `find` queries and file paths (upload paths, URL paths) are kept as given.
+When it's on, each session's tool calls are recorded as a redacted summary. `type` text and `form_input` values are kept only as a character count, never the value, but a boolean form value is kept as `checked=true` or `checked=false`. A `key` action keeps named keys and modifier combos (like `Enter` or `ctrl+a`) as given, since they aren't secrets, but a run of plain character keys is stored only as a count (`[N keys]`), the same protection `type` gets. Any stored URL, including inside an error message, has its query string and fragment removed everywhere. The path stays. `javascript_tool` code is kept up to 500 characters, but the text of any string literal inside it is replaced with `[N chars]`, and so is everything after the first `/` that isn't part of a comment (a division sign or the start of a regex), since telling those apart isn't reliable. `find` queries and file paths (upload paths, URL paths) are kept as given.
 
 Alongside that summary, a masked DOM replay (via rrweb, not a screen recording) of the tabs the session touched masks every input, textarea, select and password value, and any contenteditable text, to asterisks of the same length. Hidden inputs are left out of the replay entirely. A URL captured in the replay itself, the page's own address or a link's href, also has its query and fragment stripped, but ordinary page text and link text are recorded as they are. It doesn't inline canvas content or images, and a page this extension can't script at all (a `chrome://` page, the Web Store) gets no replay. Only tabs in the MCP tab group are ever recorded. Viewing a replay never loads anything over the network: the options page only ever uses its own bundled resources.
 
@@ -239,9 +241,10 @@ No build step. All files are plain JavaScript. After pulling or editing code:
 |---|---|
 | `extension/background.js`, `extension/content.js`, `extension/manifest.json`, anything under `extension/audit/` or `extension/vendor/`, or the `extension/options.*` files | Reload the extension: `brave://extensions` > click the reload icon |
 | `host/*.js` (`native-host.js`, `mcp-server.js`, `bridge-hub.js`, `bridge-client.js`, `bridge-endpoint.js`) | Restart the browser (new native host), then `pkill -f "node.*open-claude-in-chrome/host/mcp-server"` and `/mcp` in each Claude Code session |
+| `host/upload-policy.js`, `host/save-to-disk.js`, `host/log.js` | `pkill -f "node.*open-claude-in-chrome/host/mcp-server"` and `/mcp` in each Claude Code session — no browser restart needed |
 | `install.sh` or native host name changed | Re-run `./install.sh <extension-id>`, restart browser, re-add MCP |
 
-> Old and new versions of the bridge cannot talk to each other, so after changing anything under `host/`, refresh **both** sides: restart the browser (spawns a fresh native host) **and** `pkill` + `/mcp` in every session (spawns fresh MCP servers). Reloading the extension also applies any manifest change (a dropped or added permission, a new options page, and so on).
+> Old and new versions of the bridge cannot talk to each other, so after changing `native-host.js`, `mcp-server.js`, `bridge-hub.js`, `bridge-client.js` or `bridge-endpoint.js`, refresh **both** sides: restart the browser (spawns a fresh native host) **and** `pkill` + `/mcp` in every session (spawns fresh MCP servers). Reloading the extension also applies any manifest change (a dropped or added permission, a new options page, and so on).
 
 ### Quick reset (nuclear option)
 
@@ -304,6 +307,10 @@ The native host creates `~/.config/open-claude-in-chrome/run` with mode `0700` e
 - the full socket path is too long for a Unix socket (over 103 bytes on macOS, 107 on Linux, which a long home directory path can trigger)
 
 Remove or fix whatever is at that path (or shorten your home directory path), then restart the browser.
+
+### `navigate` refuses `file://` URLs
+
+This is by design, not a bug or a missing setting: see Tool behavior notes above. There's no config flag or extension permission that turns it back on, including "Allow access to file URLs" in `chrome://extensions`. If you need to work with a local file in the browser yourself, open it in a regular tab outside the agent's control; the agent can't navigate there, and can't act on a tab that's already showing one.
 
 ### EPERM on `save_to_disk` or `file_upload`
 
