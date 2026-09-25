@@ -10,15 +10,15 @@ Tool-usage notes for this fork's browser automation MCP server (`mcp__open-claud
 ## Tabs and errors
 
 - All agent sessions share one MCP tab group, so you can see and act on other sessions' tabs, even though the `tabs_close_mcp` description says "this session's group". Work only in tabs you created or the user pointed you to.
-- After an extension reload, update or browser restart, the extension does not reuse the old MCP group, even though it is still titled "MCP". The next call that needs a tab creates a new group. Get fresh tab ids with `tabs_context_mcp` (`createIfEmpty: true`) before you use a tab again.
-- A refused or failed call returns an error result (`isError: true`), with the reason in its text. Treat it as a failure. A `browser_batch` stops at the first action that fails: the actions before it ran, the ones after it did not. When the MCP server itself rejects a batch (invalid input, an unknown tool, a nested batch, an upload outside the allowed folders), no action in it ran.
+- After an extension reload, update or browser restart, the extension does not reuse the old MCP group, even though it is still titled "MCP", and a call on one of its tab ids is refused. Only `tabs_context_mcp` with `createIfEmpty: true`, or `tabs_create_mcp`, creates a new group. Do that, and take fresh tab ids from its reply, before you use a tab again.
+- A refused or failed call returns an error result (`isError: true`), with the reason in its text. Treat it as a failure. The one exception is a screenshot whose `save_to_disk` failed. The screenshot was taken, so that reply is a normal result with a `save_to_disk failed: ...` note. A `browser_batch` stops at the first action that fails: the actions before it ran, the ones after it did not. When the MCP server itself rejects a batch (invalid input, an unknown tool, a nested batch, an upload outside the allowed folders), no action in it ran.
 
 ## Files: upload and save
 
 - `file_upload` accepts only paths under `~/Downloads` and `~/Desktop` by default. If the user set `fileUploadAllowedDirs` (`~/.config/open-claude-in-chrome/config.json`), that list *replaces* the defaults, and the refusal names exactly what's allowed now. Save generated files into an allowed folder first. Never edit `config.json` yourself. Ask the user to add a folder. The same check applies to a `file_upload` action nested inside `browser_batch`, per action (two 8 MB uploads in one batch both pass).
 - Combined size limit: 10 MB per `file_upload` action.
 - A broken or invalid allowlist config fails closed: every upload is refused, and the error names the fix. Do not retry the same path hoping it was a fluke.
-- No separate "save_to_disk" tool exists. It's `computer`'s `screenshot`/`zoom` with `save_to_disk: true`, written to `~/Downloads/open-claude-in-chrome/` (files mode 0600). The reply gives the exact path.
+- No separate "save_to_disk" tool exists. It's `computer`'s `screenshot`/`zoom` with `save_to_disk: true`, written to `~/Downloads/open-claude-in-chrome/` (files mode 0600). The reply gives the exact path. If the save fails, the reply still has the screenshot, with a `save_to_disk failed: ...` note instead of the path. It is not an error result, so check for that note before you tell the user the file was saved.
 - macOS privacy protection covers `~/Downloads` and `~/Desktop`. An `EPERM` in a `save_to_disk`/`file_upload` reply means the running app, or for `file_upload` the browser itself, lacks that permission, not a bad path. Tell the user, don't retry or copy the file elsewhere.
 
 ## Clicking and typing

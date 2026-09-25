@@ -87,7 +87,7 @@ To move an existing install to this version:
 1. Pull the latest code.
 2. Reinstall host dependencies: `cd host && npm install && cd ..`.
 3. Quit the browser with Cmd+Q, or at least reload the extension (next step). Closing every window alone does not quit a Chrome-based browser, which keeps running in the background. Either way, both sides need to restart together: an old native host and a new MCP server (or the other way around) cannot talk to each other.
-4. Reload the extension in `chrome://extensions` so it picks up the new `background.js` and `content.js`. After the reload, or after a browser restart, the extension does not reuse the old MCP tab group. The next tool call that needs a tab creates a new group, and you can close the old one by hand (see Troubleshooting).
+4. Reload the extension in `chrome://extensions` so it picks up the new `background.js` and `content.js`. After the reload, or after a browser restart, the extension does not reuse the old MCP tab group, and a call on one of its tab ids is refused. Only the next `tabs_context_mcp` with `createIfEmpty: true`, or a `tabs_create_mcp`, creates a new group. You can close the old group by hand (see Troubleshooting).
 5. Clear out stale MCP server processes and reconnect each Claude Code session:
    ```bash
    pkill -f "node.*open-claude-in-chrome/host/mcp-server"
@@ -144,10 +144,10 @@ Quit with **Cmd+Q**, or at least reload the extension in `chrome://extensions`. 
 claude mcp add open-claude-in-chrome -- node /absolute/path/to/host/mcp-server.js
 ```
 
-Find the absolute path with:
+To print this command for your checkout, run this from the repository root. It puts the path in single quotes, the same way `install.sh` prints it at the end, so a path with spaces or other special characters pastes as is:
 
 ```bash
-echo "node $(pwd)/host/mcp-server.js"
+printf "claude mcp add open-claude-in-chrome -- node '%s'\n" "$(pwd | sed "s/'/'\\\\''/g")/host/mcp-server.js"
 ```
 
 ## Verification
@@ -300,7 +300,7 @@ The MCP server is running, but no native host is serving the bridge socket. Chec
 
 ### A second MCP tab group after a reload or restart
 
-The extension reuses only the tab group it created itself. It remembers that group's id in the browser's session storage, which the browser clears on every extension reload or update and on every browser restart. It never takes over a group because the group is titled "MCP", so a group of your own with that title stays yours. After a reload or restart, the old MCP group is therefore not reused: the next tool call that needs a tab creates a new group. Close the old group by hand once you no longer need its tabs.
+The extension reuses only the tab group it created itself. It remembers that group's id in the browser's session storage, which the browser clears on every extension reload or update and on every browser restart. It never takes over a group because the group is titled "MCP", so a group of your own with that title stays yours. After a reload or restart, the old MCP group is therefore not reused, and a call on one of its tab ids is refused. Only the next `tabs_context_mcp` with `createIfEmpty: true`, or a `tabs_create_mcp`, creates a new group. Close the old group by hand once you no longer need its tabs.
 
 ### Socket permission error
 
