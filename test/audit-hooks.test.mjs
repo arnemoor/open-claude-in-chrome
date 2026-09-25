@@ -6,6 +6,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import vm from "node:vm";
 import { loadBackground } from "./harness/fake-chrome.mjs";
 
 const FIXTURE = path.join(import.meta.dirname, "..", "host", "test", "claude-in-chrome-tools.schema.json");
@@ -395,6 +396,159 @@ test("I5: a tab inside the MCP group still gets a recorder", async () => {
   await flush();
 
   assert.equal(ensureRecorderCalls(bg).length, 4);
+});
+
+// Item 9: a tab's recorder keeps running (and keeps sending batches) after the
+// tab leaves the MCP group — nothing tells the content script to stop. Those
+// batches must stop being stored the moment isTabAllowed(tabId) goes false,
+// and the stale owner must be cleared, not just gated: if the tab later
+// rejoins the group with no new audited call re-establishing ownership, a
+// batch for it must still be dropped, not resumed under the old owner.
+test("item 9: recorder events stop and the owner is cleared once a tab leaves the MCP group", async () => {
+  const fakeStore = makeFakeStore();
+  let insideGroup = true;
+  const bg = await loadBackground({
+    beforeRun: injectFakeStore(fakeStore),
+    overrides: { tabs: { get: async (id) => ({ id, windowId: 1, status: "complete", url: "https://example.test/", groupId: insideGroup ? 7 : -1 }) } },
+  });
+  await flush();
+  await bg.chrome.storage.local.set({ audit: { enabled: true, retentionDays: 7 } });
+
+  bg.deliver({ type: "tool_request", id: "1.s1.1", tool: "gif_creator", args: { tabId: 42 }, session: SESSION });
+  await flush();
+
+  bg.chrome.runtime.onMessage.fire({ type: "ocic_audit_events", events: [{ type: 2 }] }, { id: bg.chrome.runtime.id, tab: { id: 42 }, frameId: 0 }, () => {});
+  await flush();
+  assert.equal(fakeStore.calls.filter((c) => c[0] === "addEvents").length, 1, "still inside the group: the batch is stored");
+
+  insideGroup = false; // the tab leaves the MCP group (dragged out, ungrouped), no new tool call
+  bg.chrome.runtime.onMessage.fire({ type: "ocic_audit_events", events: [{ type: 2 }] }, { id: bg.chrome.runtime.id, tab: { id: 42 }, frameId: 0 }, () => {});
+  await flush();
+  assert.equal(fakeStore.calls.filter((c) => c[0] === "addEvents").length, 1, "left the group: the next batch must be dropped");
+
+  insideGroup = true; // the tab rejoins, but nothing has re-established ownership
+  bg.chrome.runtime.onMessage.fire({ type: "ocic_audit_events", events: [{ type: 2 }] }, { id: bg.chrome.runtime.id, tab: { id: 42 }, frameId: 0 }, () => {});
+  await flush();
+  assert.equal(fakeStore.calls.filter((c) => c[0] === "addEvents").length, 1, "the owner was cleared on leaving, so rejoining alone must not resume storing under the old owner");
+});
+
+// Item 16: a chrome:// page, the Web Store, or any other page that refuses
+// injection makes ensureRecorder pay its full probe (up to 300ms) plus inject
+// (up to 2s) timeout budget on every audited call to that tab, before and
+// after — every call, for as long as the tab stays on that document.
+// Remembers a failed start per (tabId, url) and skips both attempts until a
+// navigation, so the cost is paid once per document, not once per call.
+test("item 16: a failed recorder start is remembered per tab+url and skipped until navigation", async () => {
+  const fakeStore = makeFakeStore();
+  let executeScriptCalls = 0;
+  const bg = await loadBackground({
+    beforeRun: injectFakeStore(fakeStore),
+    overrides: { scripting: { executeScript: async () => { executeScriptCalls++; throw new Error("Cannot access a chrome:// URL"); } } },
+  });
+  await flush();
+  await bg.chrome.storage.local.set({ audit: { enabled: true, retentionDays: 7 } });
+
+  bg.deliver({ type: "tool_request", id: "1.s1.1", tool: "gif_creator", args: { tabId: bg.tabId }, session: SESSION });
+  await flush();
+  const afterFirstCall = executeScriptCalls;
+  assert.ok(afterFirstCall > 0, "expected at least one probe attempt on the first call");
+
+  bg.deliver({ type: "tool_request", id: "1.s1.2", tool: "gif_creator", args: { tabId: bg.tabId }, session: SESSION });
+  await flush();
+  assert.equal(executeScriptCalls, afterFirstCall, "a second call on the same document must make no executeScript call at all");
+
+  bg.chrome.tabs.onUpdated.fire(bg.tabId, { status: "loading" }, {});
+  bg.deliver({ type: "tool_request", id: "1.s1.3", tool: "gif_creator", args: { tabId: bg.tabId }, session: SESSION });
+  await flush();
+  assert.ok(executeScriptCalls > afterFirstCall, "a navigation must re-enable the probe/inject attempt");
+
+  // The tool call itself must still succeed despite the recorder never starting.
+  assert.equal(bg.posted.filter((p) => p.type === "tool_response").length, 3);
+});
+
+// A probe times out on a busy page, or on one not yet at document_idle, and
+// the page's "loading" and URL updates have already fired by then. Remembering
+// that failure would leave the document without a recorder for good.
+test("a probe timeout is not remembered: the next call probes and injects again", async () => {
+  const fakeStore = makeFakeStore();
+  let pageReady = false;
+  let probes = 0;
+  let injects = 0;
+  const bg = await loadBackground({
+    beforeRun: injectFakeStore(fakeStore),
+    overrides: { scripting: { executeScript: async (p) => {
+      if (p.files) { injects++; return []; }
+      probes++;
+      if (!pageReady) return new Promise(() => {}); // never answers, like a page stuck in a long task
+      return [{ result: false }];
+    } } },
+  });
+  await flush();
+  await bg.chrome.storage.local.set({ audit: { enabled: true, retentionDays: 7 } });
+
+  bg.deliver({ type: "tool_request", id: "1.s1.1", tool: "gif_creator", args: { tabId: bg.tabId }, session: SESSION });
+  await flush(800); // the before- and after-hook probes both time out (300ms each)
+  assert.equal(injects, 0);
+  const probesAfterTimeouts = probes;
+
+  pageReady = true; // no onUpdated event: the page just finished its long task
+  bg.deliver({ type: "tool_request", id: "1.s1.2", tool: "gif_creator", args: { tabId: bg.tabId }, session: SESSION });
+  await flush(100);
+  assert.ok(probes > probesAfterTimeouts, "the next call must probe again");
+  assert.ok(injects > 0, "and inject the recorder, since the probe found none");
+});
+
+test("a transient executeScript rejection is not remembered either", async () => {
+  const fakeStore = makeFakeStore();
+  let failures = 1;
+  let injects = 0;
+  const bg = await loadBackground({
+    beforeRun: injectFakeStore(fakeStore),
+    overrides: { scripting: { executeScript: async (p) => {
+      if (failures > 0) { failures--; throw new Error("Frame with ID 0 was removed."); }
+      if (p.files) { injects++; return []; }
+      return [{ result: false }];
+    } } },
+  });
+  await flush();
+  await bg.chrome.storage.local.set({ audit: { enabled: true, retentionDays: 7 } });
+
+  bg.deliver({ type: "tool_request", id: "1.s1.1", tool: "gif_creator", args: { tabId: bg.tabId }, session: SESSION });
+  await flush(100);
+  assert.ok(injects > 0, "the after-hook must try again after a transient rejection in the before-hook");
+});
+
+// A new owner's stream needs its own FullSnapshot to replay from. The probe's
+// func is rebuilt from its source in a separate context, the way Chrome
+// serializes it into the page, so it can use nothing from audit.js's scope.
+test("a tab whose owner changes asks its running recorder for a full snapshot", async () => {
+  const fakeStore = makeFakeStore();
+  const world = vm.createContext({});
+  vm.runInContext(`globalThis.snapshots = 0; globalThis[Symbol.for("ocic.audit.recorder")] = { takeFullSnapshot() { globalThis.snapshots++; } };`, world);
+  const bg = await loadBackground({
+    beforeRun: injectFakeStore(fakeStore),
+    overrides: { scripting: { executeScript: async (p) => {
+      if (p.files) return [];
+      const func = vm.runInContext(`(${p.func.toString()})`, world);
+      return [{ result: func(...(p.args || [])) }];
+    } } },
+  });
+  await flush();
+  await bg.chrome.storage.local.set({ audit: { enabled: true, retentionDays: 7 } });
+  const snapshots = () => vm.runInContext("globalThis.snapshots", world);
+  const call = async (id, session) => {
+    bg.deliver({ type: "tool_request", id, tool: "gif_creator", args: { tabId: 42 }, session });
+    await flush();
+  };
+
+  await call("1.s1.1", SESSION); // no owner yet: s1's stream starts here
+  assert.equal(snapshots(), 1);
+  await call("1.s1.2", SESSION); // same owner: its stream already has a snapshot
+  assert.equal(snapshots(), 1);
+  await call("1.s2.1", { id: "s2", label: "other", cwd: "/Users/x/other", pid: 4343 }); // another session takes over
+  assert.equal(snapshots(), 2);
+  await call("2.s1.1", SESSION); // the same hub session id after a hub restart is a new owner too
+  assert.equal(snapshots(), 3);
 });
 
 // M1: `started` used to be captured after the before-hook but `ms` was computed

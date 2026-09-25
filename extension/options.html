@@ -2,9 +2,9 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<!-- Fix round 1 / I1: a replayed session can reference remote resource URLs
-     (images, stylesheets, @import, backgrounds) recorded from the page it
-     touched. Without this, opening or seeking a replay fetches them from the
+<!-- A replayed session can reference remote resource URLs (images,
+     stylesheets, @import, backgrounds) recorded from the page it touched.
+     Without this, opening or seeking a replay fetches them from the
      extension page, which breaks "nothing is sent anywhere". This must come
      before any resource-loading element below, and the replay iframe inherits
      it. 'unsafe-inline' styles are required by the vendored player. -->

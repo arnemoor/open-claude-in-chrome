@@ -7,14 +7,14 @@ const AUDIT_SUMMARY_CLIP = 300;
 const AUDIT_JS_CODE_CLIP = 500;
 
 // A scheme + "://" + the host/path part, then an optional query or fragment.
-// The host/path part ends at whitespace, a quote, "<", ">", "?" or "#". "("
-// and ")" stay in it (fix round 3, item 3), so a path like "/a(b?token=..."
-// still reaches its own query. A query or fragment ends only at whitespace, a
-// double quote, "<" or ">". A "'" is a legal query character, and ending the
-// token there left the rest of the query in the text (fix round 4, item 1).
-// So a "'" ends a URL in single quotes only when the URL has no query. Good
-// enough to find a URL embedded in a free-text Chrome error message or a page
-// attribute.
+// The host/path part ends at whitespace, a double quote, "<", ">", "?" or
+// "#". "(" and ")" stay in it, so a path like "/a(b?token=..." still reaches
+// its own query, and so does "'", so a path like "/o'brien?token=..." does too
+// — a "'" only ever over-masks, never under-masks, whether it sits in the
+// host/path or (already) in the query or fragment. A query or fragment ends
+// only at whitespace, a double quote, "<" or ">"; a "'" there is a legal query
+// character and never ends the token. Good enough to find a URL embedded in a
+// free-text Chrome error message or a page attribute.
 //
 // Fix round 3, item 2 (new Important): the scheme's own suffix is bounded to
 // {0,31} (any real scheme name is far shorter), not left unbounded. An
@@ -23,7 +23,7 @@ const AUDIT_JS_CODE_CLIP = 500;
 // O(remaining-length) "no ':' found" backtrack at O(n) different starting
 // points — O(n^2) overall. A 100 KB attribute value cost 4.1s; bounding the
 // scheme caps the work at each starting point to a constant, restoring O(n).
-const URL_TOKEN_RE = /\b[a-z][a-z0-9+.-]{0,31}:\/\/[^\s"'<>?#]*(?:[?#][^\s"<>]*)?/gi;
+const URL_TOKEN_RE = /\b[a-z][a-z0-9+.-]{0,31}:\/\/[^\s"<>?#]*(?:[?#][^\s"<>]*)?/gi;
 // A data: URI has no "//" after its scheme, so it never matches URL_TOKEN_RE —
 // scrubbed separately, the same way navigateSummary's own data: rule collapses
 // one to its length instead of leaving it (and whatever it encodes) verbatim.
@@ -31,6 +31,32 @@ const URL_TOKEN_RE = /\b[a-z][a-z0-9+.-]{0,31}:\/\/[^\s"'<>?#]*(?:[?#][^\s"<>]*)
 // marks where it ends: the mask runs from "data:" to the end of the string or
 // attribute value (fail closed, fix round 4, item 3).
 const DATA_URI_RE = /\bdata:[\s\S]*/i;
+
+// CSS text (a style attribute string, a style diff value, or rrweb's own
+// _cssText carrying a whole <style> or inlined stylesheet) mostly holds a
+// data: URI in a url(...) token, whose payload has a real end: the closing
+// quote of url("...") or url('...'), or the ")" of a bare url(...), with "\"
+// escaping the character after it. Masking only that far keeps every rule
+// after a data: icon (a Bootstrap-sized stylesheet lost 83% of its rules to
+// the mask-to-the-end rule of free text). A data: URI can also sit where no
+// such end exists: in a custom property string, image-set("..."), an @import
+// string, or a url( token that never closes. The last branch masks any such
+// data: to the end of the text. Both run in one pass, so a masked
+// "data:[N chars]" is never matched again. Negated character classes, not a
+// lazy [\s\S]*?, keep the scan linear on input that never closes a token.
+const CSS_DATA_URI_RE = /\burl\(\s*(?:"(data:(?:[^"\\]|\\[\s\S])*)"|'(data:(?:[^'\\]|\\[\s\S])*)'|(data:(?:[^\s"'()\\]|\\[\s\S])*))\s*\)|\bdata:[\s\S]*/gi;
+
+function scrubCssText(text, maxLen) {
+  if (typeof text !== "string") return text;
+  let scrubbed = text.replace(CSS_DATA_URI_RE, (m, doubleQuoted, singleQuoted, bare) => {
+    if (doubleQuoted !== undefined) return `url("data:[${doubleQuoted.length} chars]")`;
+    if (singleQuoted !== undefined) return `url('data:[${singleQuoted.length} chars]')`;
+    if (bare !== undefined) return `url(data:[${bare.length} chars])`;
+    return `data:[${m.length} chars]`;
+  });
+  scrubbed = scrubbed.replace(URL_TOKEN_RE, (m) => redactUrl(m));
+  return clipTo(scrubbed, maxLen);
+}
 
 function clipTo(s, max) {
   return typeof max === "number" && s.length > max ? `${s.slice(0, max)}…` : s;
@@ -49,9 +75,18 @@ function scrubUrls(text, maxLen) {
   return clipTo(scrubbed, maxLen);
 }
 
+// A data: URL's whole payload sits in what the try block below otherwise
+// treats as non-secret path/host structure (right for a directory-style URL:
+// only its query/fragment are secret-bearing; wrong for a data: one, whose
+// payload — a recovery code, a 2FA QR-code image — IS the secret). Masked the
+// same way navigate's own data: rule does. The parser also reads some inputs
+// that do not start with "data:" as data: URLs (a tab inside the scheme, a
+// leading control character), so its protocol is checked as well.
 function redactUrl(url) {
+  if (typeof url === "string" && /^\s*data:/i.test(url)) return `data:[${url.length} chars]`;
   try {
     const u = new URL(url);
+    if (u.protocol === "data:") return `data:[${url.length} chars]`;
     const hadSearch = u.search !== "";
     const hadHash = u.hash !== "";
     // Clear credentials/query/fragment on the URL object itself (not by hand-
@@ -85,11 +120,17 @@ function clipDeep(value, max) {
 // I5: a run of `key` calls, one bare printable character at a time, is how the
 // `key` action can type real text while bypassing `type`'s own redaction (see
 // background.js's charDefinition/keyDefinition). Every named key (Enter, Tab,
-// F5, ...) and every modifier combo (ctrl+a, cmd+shift+t) is at least 2
-// characters or contains "+", so a token that is exactly one character with no
-// "+" is unambiguously a bare key press, never a name.
+// F5, ...) is at least 2 characters, so a key part that is exactly one
+// character is a character press, never a name. Shift held with it still types
+// that character (a capital letter, or a shifted symbol), so shift is the one
+// modifier that keeps a token a typed key. Any other modifier (ctrl+a,
+// cmd+shift+t) makes it a shortcut, which stays as-is. Parts are read the way
+// background.js's parseKeyCombo reads them: trimmed, with modifier names in
+// any case.
 function isBareKeyToken(token) {
-  return !token.includes("+") && [...token].length === 1;
+  const parts = token.split("+");
+  const key = parts.pop().trim();
+  return [...key].length === 1 && parts.every((modifier) => modifier.trim().toLowerCase() === "shift");
 }
 
 function keySummary(text) {
@@ -414,20 +455,24 @@ function redactAttributes(shouldMaskValue, attributes) {
   // [value, priority] array for an !important one, or false for a removed
   // property.
   if (typeof attributes.style === "string") {
-    attributes.style = scrubUrls(attributes.style);
+    attributes.style = scrubCssText(attributes.style);
   } else if (attributes.style && typeof attributes.style === "object") {
     for (const [prop, value] of Object.entries(attributes.style)) {
       if (typeof value === "string") {
-        attributes.style[prop] = scrubUrls(value);
+        attributes.style[prop] = scrubCssText(value);
       } else if (Array.isArray(value)) {
         for (let k = 0; k < value.length; k++) {
-          if (typeof value[k] === "string") value[k] = scrubUrls(value[k]);
+          if (typeof value[k] === "string") value[k] = scrubCssText(value[k]);
         }
       }
     }
   }
+  // rrweb carries a <style> or an inlined <link rel=stylesheet>'s whole text
+  // as _cssText — CSS text, not free text, so it gets the same data: handling
+  // as style above, not scrubUrls' plain mask-to-the-end.
+  if (typeof attributes._cssText === "string") attributes._cssText = scrubCssText(attributes._cssText);
   for (const [name, value] of Object.entries(attributes)) {
-    if (name === "value" || name === "srcset" || name === "style" || URL_ATTRS.includes(name)) continue; // already handled above
+    if (name === "value" || name === "srcset" || name === "style" || name === "_cssText" || URL_ATTRS.includes(name)) continue; // already handled above
     if (typeof value === "string") attributes[name] = scrubUrls(value);
   }
 }
@@ -453,7 +498,13 @@ function walkSnapshotNode(node, knownTags) {
 }
 
 // Redacts an rrweb event batch in place before it is relayed or stored:
-// - Meta (type 4): data.href through redactUrl.
+// - Meta (type 4): data.href through redactUrl. A Meta event always starts a
+//   fresh document, the same one its own FullSnapshot is about to describe,
+//   so `knownTags` is cleared here too — not only on the
+//   FullSnapshot below — so a mutation for a reused id that reaches the
+//   walker before that FullSnapshot's own arrival (the two can land in
+//   different batches) is never read against a stale, wrong mapping left
+//   over from the previous document.
 // - FullSnapshot (type 2): every element node, via walkSnapshotNode. A full
 //   snapshot means a fresh document — rrweb's node ids restart from 1 there,
 //   so `knownTags` is cleared first; a stale id from a previous document would
@@ -471,6 +522,7 @@ function redactEvents(events, knownTags) {
   for (const event of events || []) {
     if (!event || typeof event !== "object") continue;
     if (event.type === 4) {
+      knownTags.clear();
       if (event.data && typeof event.data.href === "string") event.data.href = redactUrl(event.data.href);
     } else if (event.type === 2) {
       if (event.data && event.data.node) {

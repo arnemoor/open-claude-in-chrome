@@ -350,3 +350,55 @@ test("the worker-side walker removes URL secrets from every attribute shape real
     assert.deepEqual(markers.filter((m) => walked.includes(m)), []);
   }, { html: WALKER_PAGE });
 });
+
+// data: payloads in CSS outside a url() token, or in one that does not end
+// where a plain match expects: a custom property string, image-set(), an
+// escaped ")" or quote inside url(), and an unterminated url(.
+const CSS_DATA_PAGE = `<!doctype html><title>css data test</title>
+<style>.x{--code:"data:text/plain,SECRETCUSTOM2"} .after{color:blue}</style>
+<div style='--recovery: "data:text/plain,SECRETCUSTOM1"'>a</div>
+<div style='background-image: image-set("data:image/png;base64,SECRETIMGSET1" 1x)'>b</div>
+<div style='background: url(data:text/plain,AB\\)SECRETESC1)'>c</div>
+<div style='background: url("data:text/plain,AB\\")SECRETESC2")'>d</div>
+<div style='background: url("data:text/plain,SECRETUNTERM1'>e</div>
+<div id="m">m</div>`;
+
+test("the worker-side walker masks every CSS data: payload shape real rrweb sends", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  await withRecorderPage(async (page, world) => {
+    await sleep(1300);
+    await page.evaluate(`document.getElementById("m").style.setProperty("--k", '"data:text/plain,SECRETCUSTOMMUT1"')`);
+    await sleep(1500);
+
+    const batches = JSON.parse(await world("JSON.stringify(globalThis.sent)")).map((m) => m.events);
+    const raw = JSON.stringify(batches);
+    const ctx = vm.createContext({ URL });
+    vm.runInContext(REDACT_JS, ctx, { filename: "redact.js" });
+    const redactEvents = vm.runInContext("redactEvents", ctx);
+    const knownTags = new Map();
+    const walked = JSON.stringify(batches.map((events) => redactEvents(events, knownTags)));
+
+    const markers = ["SECRETCUSTOM1", "SECRETCUSTOM2", "SECRETCUSTOMMUT1", "SECRETIMGSET1", "SECRETESC1", "SECRETESC2", "SECRETUNTERM1"];
+    assert.deepEqual(markers.filter((m) => !raw.includes(m)), [], "rrweb must relay every marker raw, or this proves nothing about the walker");
+    assert.deepEqual(markers.filter((m) => walked.includes(m)), []);
+  }, { html: CSS_DATA_PAGE });
+});
+
+// ensureRecorder (audit.js) asks a running recorder for a fresh FullSnapshot
+// when another session takes over the tab. The events buffered before that go
+// out first, so the snapshot starts a batch of its own.
+test("the recorder's takeFullSnapshot flushes its buffer, then emits a fresh Meta and FullSnapshot", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  await withRecorderPage(async (page, world) => {
+    await sleep(1300); // the initial snapshot flushes
+    await world("globalThis.sent = [];");
+    await page.evaluate(`document.getElementById("t").setAttribute("data-before", "1")`);
+    await sleep(100); // the mutation reaches the buffer, well before the 1s flush
+
+    await world(`globalThis[Symbol.for("ocic.audit.recorder")].takeFullSnapshot()`);
+    await sleep(1500);
+
+    const batches = JSON.parse(await world("JSON.stringify(globalThis.sent)")).map((m) => m.events);
+    assert.ok(batches.length >= 2, `expected the buffer and the snapshot in separate batches, got ${batches.length}`);
+    assert.ok(batches[0].every((e) => e.type === 3), `expected only the buffered incremental events in the first batch, got types ${batches[0].map((e) => e.type)}`);
+    assert.deepEqual(batches[1].slice(0, 2).map((e) => e.type), [4, 2]);
+  });
+});

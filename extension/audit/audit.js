@@ -26,6 +26,12 @@
   const tabOwners = new Map(); // tabId -> "<runId>.<session.id>", the last session to act on that tab
   const tabOwnerSetAt = new Map(); // tabId -> Date.now() when tabOwners was last set, for the retry below
   const knownTagsByTab = new Map(); // tabId -> Map(rrweb node id -> lowercase tagName), for redactEvents (I1)
+  const failedRecorderStarts = new Map(); // tabId -> the tab's url when Chrome last refused to script it
+  // Chrome's wording when it refuses to script a page at all: chrome:// and
+  // other browser pages, the Web Store, a host without permission. That holds
+  // for as long as the tab shows the document. A timeout or any other failure
+  // can be temporary (a page busy in a long task, or not yet at document_idle).
+  const PERMANENT_SCRIPTING_ERROR = /cannot be scripted|cannot access|permission/i;
 
   async function settings() {
     const { audit } = await chrome.storage.local.get("audit");
@@ -80,6 +86,14 @@
       tabOwners.delete(tabId);
       tabOwnerSetAt.delete(tabId);
       knownTagsByTab.delete(tabId);
+      failedRecorderStarts.delete(tabId);
+    });
+    // A refused start is remembered only for the document it failed on (see
+    // ensureRecorder) — a navigation (or an in-page URL change) means a fresh
+    // document that deserves its own attempt, so drop the memory of the old
+    // one rather than wait for its url to happen to differ.
+    chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+      if (changeInfo.status === "loading" || changeInfo.url) failedRecorderStarts.delete(tabId);
     });
   }
 
@@ -147,19 +161,42 @@
   // of awaiting it unbounded — matching background.js's own rule for renderer
   // round-trips (readViewport, focusedFieldKind, resize_window all bound theirs
   // the same way, for the same reason).
-  async function ensureRecorder(tabId) {
+  //
+  // A chrome:// page, the Web Store, or any other page that refuses injection
+  // outright would otherwise pay this same probe+inject budget on every
+  // audited call to that tab (before AND after, per wrapHandlers below) for as
+  // long as it stays on that document. Remembers such a refusal keyed by the
+  // tab's own url, and skips straight past both attempts while the tab is
+  // still showing that document — chrome.tabs.onUpdated (init, above) forgets
+  // it on the next navigation. Only a refusal is remembered: a timeout or a
+  // transient error can come after that document's last onUpdated event, so
+  // remembering it would leave the document without a recorder for good.
+  //
+  // `snapshot` asks a recorder already running in the tab for a fresh
+  // FullSnapshot, for a new owner's stream (see wrapHandlers). A recorder
+  // injected here takes its own first snapshot anyway.
+  async function ensureRecorder(tabId, snapshot = false) {
+    let tab;
     try {
       const { enabled } = await settings();
       if (!enabled) return;
+      tab = await chrome.tabs.get(tabId);
+      if (failedRecorderStarts.get(tabId) === tab.url) return;
       const [check] = await withTimeout(
         chrome.scripting.executeScript({
           target: { tabId },
           world: "ISOLATED",
-          func: () => !!globalThis[Symbol.for("ocic.audit.recorder")],
+          // Runs in the page, so it can use nothing from this file's scope.
+          func: (takeSnapshot) => {
+            const recorder = globalThis[Symbol.for("ocic.audit.recorder")];
+            if (recorder && takeSnapshot && typeof recorder.takeFullSnapshot === "function") recorder.takeFullSnapshot();
+            return !!recorder;
+          },
+          args: [snapshot],
         }),
         ENSURE_RECORDER_PROBE_TIMEOUT_MS,
       );
-      if (check?.result) return;
+      if (check?.result) { failedRecorderStarts.delete(tabId); return; }
       await withTimeout(
         chrome.scripting.executeScript({
           target: { tabId },
@@ -168,8 +205,12 @@
         }),
         ENSURE_RECORDER_INJECT_TIMEOUT_MS,
       );
-    } catch {
-      // Best-effort only; see comment above.
+      failedRecorderStarts.delete(tabId);
+    } catch (err) {
+      // Best-effort only; see comment above. `tab` is unset only when
+      // settings()/chrome.tabs.get() itself is what failed (a tab that
+      // closed mid-call, for example) — nothing to key a cache entry on.
+      if (tab && PERMANENT_SCRIPTING_ERROR.test(String(err && err.message))) failedRecorderStarts.set(tabId, tab.url);
     }
   }
 
@@ -184,13 +225,18 @@
         // handlers (gif_creator and other stubs) have no group check of their
         // own to piggyback on, so this is checked independently here.
         const allowed = tabId != null && (await isTabAllowed(tabId));
+        // A stream stored under a new owner needs a FullSnapshot of its own:
+        // the recorder already running in the tab took its snapshot for the
+        // previous owner, or before a gap in which no one owned the tab and
+        // its batches were dropped.
+        const newOwner = allowed && key != null && tabOwners.get(tabId) !== key;
         // M1: before the call (not after recordAction, which used to run only
         // once the whole handler had already returned) — otherwise a recorder
         // batch that arrives mid-call, or from a different session reusing a
         // tab another session last owned, finds no owner yet, or the wrong one.
         if (allowed && key) { tabOwners.set(tabId, key); tabOwnerSetAt.set(tabId, Date.now()); }
         if (key) touchSession(key, ctx.session);
-        if (allowed) await ensureRecorder(tabId);
+        if (allowed) await ensureRecorder(tabId, newOwner);
         const started = Date.now();
         let result;
         try {
@@ -238,6 +284,14 @@
       if (!enabled) return;
       const key = tabOwners.get(tabId);
       if (!key) return; // no owner for this tab: drop
+      // A tab's recorder keeps running (and keeps sending batches) after the
+      // tab itself leaves the MCP group — nothing tells the content script to
+      // stop. Re-check the same gate wrapHandlers used to grant ownership in
+      // the first place, and clear the stale owner rather than merely gating
+      // this one batch: if the tab later rejoins the group with no new
+      // audited call, a batch for it must still be dropped, not resumed under
+      // whichever session owned it before.
+      if (!(await isTabAllowed(tabId))) { tabOwners.delete(tabId); tabOwnerSetAt.delete(tabId); return; }
       await store.open();
       // I4: the owning session's row may be gone (pruned, or deleted from the
       // options page) even though the in-memory tab-ownership map still
