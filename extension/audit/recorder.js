@@ -89,7 +89,15 @@
   // working recorder is already there, with no retry for the rest of the
   // document's life. If record() throws, this line — and the listeners below —
   // are simply never reached, which is what leaves the key unset.
-  globalThis[KEY] = true;
+  globalThis[KEY] = {
+    // Called by ensureRecorder's probe (audit.js) when the tab gets a new
+    // owner, whose stream needs a FullSnapshot of its own. The buffer goes
+    // out first, so the snapshot starts a new batch.
+    takeFullSnapshot() {
+      flush();
+      record.takeFullSnapshot();
+    },
+  };
 
   window.addEventListener("pagehide", flush);
   // M3: a back/forward-cache restore resumes this exact recorder instance (the

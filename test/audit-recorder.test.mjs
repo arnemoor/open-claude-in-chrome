@@ -383,3 +383,22 @@ test("the worker-side walker masks every CSS data: payload shape real rrweb send
   }, { html: CSS_DATA_PAGE });
 });
 
+// ensureRecorder (audit.js) asks a running recorder for a fresh FullSnapshot
+// when another session takes over the tab. The events buffered before that go
+// out first, so the snapshot starts a batch of its own.
+test("the recorder's takeFullSnapshot flushes its buffer, then emits a fresh Meta and FullSnapshot", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  await withRecorderPage(async (page, world) => {
+    await sleep(1300); // the initial snapshot flushes
+    await world("globalThis.sent = [];");
+    await page.evaluate(`document.getElementById("t").setAttribute("data-before", "1")`);
+    await sleep(100); // the mutation reaches the buffer, well before the 1s flush
+
+    await world(`globalThis[Symbol.for("ocic.audit.recorder")].takeFullSnapshot()`);
+    await sleep(1500);
+
+    const batches = JSON.parse(await world("JSON.stringify(globalThis.sent)")).map((m) => m.events);
+    assert.ok(batches.length >= 2, `expected the buffer and the snapshot in separate batches, got ${batches.length}`);
+    assert.ok(batches[0].every((e) => e.type === 3), `expected only the buffered incremental events in the first batch, got types ${batches[0].map((e) => e.type)}`);
+    assert.deepEqual(batches[1].slice(0, 2).map((e) => e.type), [4, 2]);
+  });
+});
