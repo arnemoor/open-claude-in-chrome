@@ -4,7 +4,7 @@ Copy and paste everything below the line into a new Claude Code session that has
 
 ---
 
-You are running an integration test for a Chrome browser automation extension. Your job is to execute every step below and use the specific MCP tool listed for each step. Do NOT skip any tool — every single one must be called at least once.
+You are running an integration test for a Chrome browser automation extension. Your job is to execute every step below and use the specific MCP tool listed for each step. Do NOT skip any tool. Every single one must be called at least once. The one exception is `file_upload`, which this prompt does not call (see the Upload section).
 
 Execute these steps in order:
 
@@ -65,14 +65,13 @@ Execute these steps in order:
 34. Call `select_browser` with deviceId `"test-device-id"` (a stub, so any string works).
 
 ## Upload
-35. Call `computer` with action `screenshot` on TAB_1 with `save_to_disk: true`. Record the saved path as SAVED_PATH.
-36. Call `navigate` to go to `data:text/html,<input type=file>` in TAB_2, replacing whatever was open there before.
-37. Call `find` with query `"file input"` on TAB_2 to get a fresh ref for it.
-38. Call `file_upload` on TAB_2 with `paths: [SAVED_PATH]`, using the ref from step 37.
-39. Call `upload_image` on TAB_1 with the imageId from your first screenshot (step 6), using ref from step 9.
+35. Call `computer` with action `screenshot` on TAB_1 with `save_to_disk: true`.
+36. Call `upload_image` on TAB_1 with the imageId from your first screenshot (step 6), using ref from step 9.
+
+This prompt does not call `file_upload`. The tool needs a file input on a page that the extension can script, and a `data:` page does not work for that. Chrome does not load a `data:` URL that `navigate` opens, and the extension cannot run its content script in a `data:` page. The automated end-to-end check covers `file_upload` instead (test/e2e/e2e.mjs, step 6).
 
 ## Cleanup
-40. Call `tabs_close_mcp` to close TAB_2.
+37. Call `tabs_close_mcp` to close TAB_2.
 
 ## Validation
 
@@ -100,7 +99,7 @@ INTEGRATION TEST RESULTS
 17. switch_browser           : [PASS/FAIL] — step(s) used
 18. list_connected_browsers  : [PASS/FAIL] — step(s) used
 19. select_browser           : [PASS/FAIL] — step(s) used
-20. file_upload              : [PASS/FAIL] — step(s) used
+20. file_upload              : NOT CALLED (covered by test/e2e/e2e.mjs step 6)
 21. upload_image             : [PASS/FAIL] — step(s) used
 22. tabs_close_mcp           : [PASS/FAIL] — step(s) used
 
@@ -119,7 +118,7 @@ Computer actions exercised:
 - left_click_drag: [PASS/FAIL]
 - zoom: [PASS/FAIL]
 
-OVERALL: [PASS if all 22 tools called / FAIL if any missed]
+OVERALL: [PASS if the other 21 tools were called / FAIL if any missed]
 ```
 
 Mark a tool as PASS only if you actually called it and received a response (even if the response was "not implemented" for stub tools). Mark it as FAIL if you skipped it or encountered an error that prevented the call.
