@@ -456,6 +456,22 @@ test("javascript_tool: a plain snippet with no / anywhere keeps its exact code s
   assert.match(s, /^function greet\(name\) \{ return `\[\d+ chars\]`; \}$/);
 });
 
+// Comments are kept as written, so a URL in one still loses its query and
+// fragment, the same as a URL anywhere else in a summary.
+test("javascript_tool: a URL in a // comment loses its query", () => {
+  const { auditSummary } = load();
+  const s = auditSummary("javascript_tool", { text: "// https://x.test/?token=SECRET\nrun()" });
+  assert.doesNotMatch(s, /SECRET/);
+  assert.equal(s, "// https://x.test/?…\nrun()");
+});
+
+test("javascript_tool: a URL in a /* */ comment loses its query and fragment", () => {
+  const { auditSummary } = load();
+  const s = auditSummary("javascript_tool", { text: "/* https://x.test/reset?token=SECRET#frag */ run()" });
+  assert.doesNotMatch(s, /SECRET|frag/);
+  assert.equal(s, "/* https://x.test/reset?…#… */ run()");
+});
+
 // --- file_upload ---
 
 test("file_upload keeps paths, since they are audit-relevant", () => {
@@ -469,6 +485,13 @@ test("file_upload keeps paths, since they are audit-relevant", () => {
 test("find keeps the query", () => {
   const { auditSummary } = load();
   assert.equal(auditSummary("find", { query: "Submit button" }), "query: Submit button");
+});
+
+test("find removes a URL's query and fragment from the query", () => {
+  const { auditSummary } = load();
+  const s = auditSummary("find", { query: "link https://x.test/reset?token=SECRET#frag" });
+  assert.doesNotMatch(s, /SECRET|frag/);
+  assert.equal(s, "query: link https://x.test/reset?…#…");
 });
 
 // --- upload_image ---

@@ -403,10 +403,12 @@ function maskJsStringLiterals(code) {
   return out;
 }
 
+// Comments are kept as written, so the final summary still goes through
+// scrubUrls for a URL inside one.
 function javascriptSummary(args) {
   const code = maskJsStringLiterals(args.text || "");
-  if (code.length <= AUDIT_JS_CODE_CLIP) return code;
-  return `${code.slice(0, AUDIT_JS_CODE_CLIP)} … (+${code.length - AUDIT_JS_CODE_CLIP} chars)`;
+  if (code.length <= AUDIT_JS_CODE_CLIP) return scrubUrls(code);
+  return scrubUrls(`${code.slice(0, AUDIT_JS_CODE_CLIP)} … (+${code.length - AUDIT_JS_CODE_CLIP} chars)`);
 }
 
 function fileUploadSummary(args) {
@@ -651,7 +653,7 @@ function auditSummary(tool, args) {
     case "form_input": return formInputSummary(args);
     case "javascript_tool": return javascriptSummary(args);
     case "file_upload": return fileUploadSummary(args);
-    case "find": return `query: ${args.query}`;
+    case "find": return scrubUrls(`query: ${args.query}`);
     case "upload_image": return uploadImageSummary(args);
     case "browser_batch": return browserBatchSummary(args);
     default: return genericSummary(args);
