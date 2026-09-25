@@ -62,15 +62,17 @@ Execute these steps in order:
 31. Call `shortcuts_execute` on TAB_1 with command `"test"`.
 32. Call `switch_browser`.
 33. Call `list_connected_browsers`.
-34. Call `select_browser` with deviceId `"test-device-id"` (any string; this is a stub).
+34. Call `select_browser` with deviceId `"test-device-id"` (a stub, so any string works).
 
 ## Upload
 35. Call `computer` with action `screenshot` on TAB_1 with `save_to_disk: true`. Record the saved path as SAVED_PATH.
-36. Call `file_upload` on TAB_1 with `paths: [SAVED_PATH]`, using the ref from step 9.
-37. Call `upload_image` on TAB_1 with the imageId from your first screenshot (step 6), using ref from step 9.
+36. Call `navigate` to go to `data:text/html,<input type=file>` in TAB_2, replacing whatever was open there before.
+37. Call `find` with query `"file input"` on TAB_2 to get a fresh ref for it.
+38. Call `file_upload` on TAB_2 with `paths: [SAVED_PATH]`, using the ref from step 37.
+39. Call `upload_image` on TAB_1 with the imageId from your first screenshot (step 6), using ref from step 9.
 
 ## Cleanup
-38. Call `tabs_close_mcp` to close TAB_2.
+40. Call `tabs_close_mcp` to close TAB_2.
 
 ## Validation
 

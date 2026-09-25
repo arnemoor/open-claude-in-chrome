@@ -2,7 +2,7 @@
 // directory only the current user can enter. The directory check replaces the old
 // shared token and protects both directions: other users cannot reach the hub, and a
 // client knows the socket was created by its own user. This rests on HOME and its
-// parent folders not being writable by other users; the bridge's security holds only
+// parent folders not being writable by other users. The bridge's security holds only
 // as long as that's true.
 
 import fs from "node:fs";
