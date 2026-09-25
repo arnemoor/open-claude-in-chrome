@@ -40,6 +40,7 @@ const listSessions = (page) => call(page, "AuditStore.listSessions()");
 const deleteSession = (page, id) => call(page, `AuditStore.deleteSession(${JSON.stringify(id)})`);
 const prune = (page, opts) => call(page, `AuditStore.prune(${JSON.stringify(opts)})`);
 const hasSession = (page, id) => call(page, `AuditStore.hasSession(${JSON.stringify(id)})`);
+const listSessionSummaries = (page) => call(page, "AuditStore.listSessionSummaries()");
 
 test("upsertSession twice keeps one row and updates lastSeen", { skip: !chromeAvailable, timeout: 20000 }, async () => {
   await withStore(async (page) => {
@@ -149,6 +150,56 @@ test("prune deletes old actions and events by their own ts, even under a session
     const { actions, eventsByTab } = await getSession(page, "s1");
     assert.deepEqual(actions.map((a) => a.summary), ["recent"]);
     assert.equal(Object.keys(eventsByTab).length, 0, "the event row (real-time ts, ~100 days before the vantage point) must be pruned");
+  });
+});
+
+// Important 1: options.js's sessions table must not load every session's full
+// recording (tens of MB of rrweb events each) just to show an action count and
+// a tab count. listSessionSummaries gets both without ever touching the
+// "events" store's own event payloads: the action count from the actions
+// store's sessionId index, the tab count from tab ids kept on the session row.
+test("listSessionSummaries reports action and tab counts per session, newest first, without loading events", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  await withStore(async (page) => {
+    await upsert(page, { id: "old", label: "a", cwd: "/a", pid: 1 }, 1000);
+    await addAction(page, { sessionId: "old", ts: 1001, tool: "navigate", tabId: 1, summary: "x", outcome: "ok", ms: 1 });
+
+    await upsert(page, { id: "new", label: "b", cwd: "/b", pid: 2 }, 5000);
+    await addAction(page, { sessionId: "new", ts: 5001, tool: "navigate", tabId: 11, summary: "x", outcome: "ok", ms: 1 });
+    await addAction(page, { sessionId: "new", ts: 5002, tool: "computer", tabId: 11, summary: "y", outcome: "ok", ms: 1 });
+    await addAction(page, { sessionId: "new", ts: 5003, tool: "computer", tabId: 12, summary: "z", outcome: "ok", ms: 1 });
+    await addEvents(page, "new", 11, [{ type: 2, data: {} }]);
+    await addEvents(page, "new", 12, [{ type: 2, data: {} }, { type: 3, data: {} }]);
+
+    const summaries = await listSessionSummaries(page);
+    assert.deepEqual(summaries.map((s) => s.session.id), ["new", "old"]); // newest first, like listSessions
+    assert.equal(summaries[0].actionCount, 3);
+    assert.equal(summaries[0].tabCount, 2);
+    assert.equal(summaries[1].actionCount, 1);
+    assert.equal(summaries[1].tabCount, 0, "no events were ever added for the old session");
+  });
+});
+
+// Item 6: age-based pruning can delete a tab's FullSnapshot row and keep its
+// later incremental rows (their own ts isn't old enough on its own), leaving a
+// stream that starts mid-replay with no base to apply the increments onto.
+// addEvents stamps its row with the real wall clock (its signature takes no
+// ts), so a real sleep separates the two rows in time, the same way the
+// "still active" prune test above does for actions/events under a session.
+test("prune also deletes a tab's trailing incremental-only rows once their own FullSnapshot ages out (item 6)", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  await withStore(async (page) => {
+    await upsert(page, { id: "s1", label: "app", cwd: "/x", pid: 1 }, Date.now());
+    await addEvents(page, "s1", 1, [{ type: 2, data: {} }]); // tab 1's only FullSnapshot
+    await new Promise((r) => setTimeout(r, 500));
+    await addEvents(page, "s1", 1, [{ type: 3, data: {} }]); // a later, incremental-only batch
+    await addEvents(page, "s1", 2, [{ type: 2, data: {} }]); // tab 2: an unrelated, recent stream
+    await upsert(page, { id: "s1", label: "app", cwd: "/x", pid: 1 }, Date.now()); // keep the session itself "active"
+
+    const dayMs = 24 * 60 * 60 * 1000;
+    await prune(page, { retentionDays: 250 / dayMs, maxSessions: 200, now: Date.now() }); // cutoff ~250ms ago
+
+    const { eventsByTab } = await getSession(page, "s1");
+    assert.equal(eventsByTab[1], undefined, "tab 1's surviving row has no FullSnapshot of its own left and must be removed too");
+    assert.equal(eventsByTab[2].length, 1, "tab 2's own recent FullSnapshot is unaffected");
   });
 });
 

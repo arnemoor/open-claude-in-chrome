@@ -95,8 +95,17 @@
 
   async function addEvents(sessionId, tabId, events) {
     const db = await getDb();
-    const tx = db.transaction("events", "readwrite");
+    const tx = db.transaction(["events", "sessions"], "readwrite");
     tx.objectStore("events").add({ sessionId, tabId, ts: Date.now(), events });
+    // Important 1: keeps this tab id on the session row itself, so the
+    // sessions table can show a tab count without ever loading this (or any
+    // other) session's actual event payloads — see listSessionSummaries.
+    const sessionsStore = tx.objectStore("sessions");
+    const session = await reqp(sessionsStore.get(sessionId));
+    if (session) {
+      const tabIds = new Set(session.tabIds || []);
+      if (!tabIds.has(tabId)) sessionsStore.put({ ...session, tabIds: [...tabIds, tabId] });
+    }
     await txDone(tx);
   }
 
@@ -106,6 +115,26 @@
     const all = await reqp(tx.objectStore("sessions").getAll());
     await txDone(tx);
     return all.sort((a, b) => b.lastSeen - a.lastSeen);
+  }
+
+  // Important 1: the sessions table needs an action count and a tab count per
+  // session, not the full recording — this never touches an event row's own
+  // (potentially tens of MB) `events` payload. The action count comes from a
+  // count() on the actions store's sessionId index (no records loaded at
+  // all); the tab count comes straight off the session row's own `tabIds`
+  // (kept up to date by addEvents), not a scan of the events store.
+  async function listSessionSummaries() {
+    const db = await getDb();
+    const tx = db.transaction(["sessions", "actions"], "readonly");
+    const sessions = await reqp(tx.objectStore("sessions").getAll());
+    const actionsIndex = tx.objectStore("actions").index("sessionId");
+    const summaries = await Promise.all(sessions.map(async (session) => ({
+      session,
+      actionCount: await reqp(actionsIndex.count(IDBKeyRange.only(session.id))),
+      tabCount: Array.isArray(session.tabIds) ? session.tabIds.length : 0,
+    })));
+    await txDone(tx);
+    return summaries.sort((a, b) => b.session.lastSeen - a.session.lastSeen);
   }
 
   async function getSession(id) {
@@ -163,6 +192,43 @@
     });
   }
 
+  // Item 6: deleteOlderThan (above) can remove a (session, tab) stream's own
+  // FullSnapshot row while a later row holding only incremental events for
+  // that same tab survives on its own ts — leaving a stream that starts
+  // mid-replay with no base to apply the increments onto. Walks every
+  // surviving row exactly once (same store, same cursor-order guarantee
+  // deleteOlderThan already relies on: autoIncrement keys in insertion order,
+  // insertion order chronological), grouped by (session, tab); once a
+  // stream's earliest surviving row lacks its own FullSnapshot, that row and
+  // every one after it are deleted too, up to (not including) the next row
+  // that has one — or all of them, if none remains.
+  function pruneOrphanedIncrementals(eventsStore) {
+    return new Promise((resolve, reject) => {
+      const streams = new Map(); // "sessionId\u0000tabId" -> [{ primaryKey, hasFullSnapshot }, ...]
+      const req = eventsStore.openCursor();
+      req.onsuccess = () => {
+        const cursor = req.result;
+        if (!cursor) {
+          for (const rows of streams.values()) {
+            for (const row of rows) {
+              if (row.hasFullSnapshot) break; // this row, and everything after it, is a valid stream start
+              eventsStore.delete(row.primaryKey);
+            }
+          }
+          resolve();
+          return;
+        }
+        const row = cursor.value;
+        const streamKey = `${row.sessionId}\u0000${row.tabId}`;
+        let rows = streams.get(streamKey);
+        if (!rows) { rows = []; streams.set(streamKey, rows); }
+        rows.push({ primaryKey: cursor.primaryKey, hasFullSnapshot: Array.isArray(row.events) && row.events.some((e) => e && e.type === 2) });
+        cursor.continue();
+      };
+      req.onerror = () => reject(req.error);
+    });
+  }
+
   async function prune({ retentionDays, maxSessions, now } = {}) {
     const ts = typeof now === "number" ? now : Date.now();
     const all = await listSessions(); // newest first
@@ -185,10 +251,12 @@
       const db = await getDb();
       const tx = db.transaction(["actions", "events"], "readwrite");
       await deleteOlderThan(tx.objectStore("actions"), cutoff);
-      await deleteOlderThan(tx.objectStore("events"), cutoff);
+      const eventsStore = tx.objectStore("events");
+      await deleteOlderThan(eventsStore, cutoff);
+      await pruneOrphanedIncrementals(eventsStore);
       await txDone(tx);
     }
   }
 
-  globalThis.AuditStore = { open, upsertSession, hasSession, addAction, addEvents, listSessions, getSession, deleteSession, prune };
+  globalThis.AuditStore = { open, upsertSession, hasSession, addAction, addEvents, listSessions, listSessionSummaries, getSession, deleteSession, prune };
 })();
