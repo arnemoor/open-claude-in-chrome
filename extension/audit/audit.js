@@ -1,7 +1,7 @@
 // Wraps tool handlers with a best-effort, redacted audit trail. Off by default;
-// only the extension's own options page flips chrome.storage.local's "audit" key
-// (Task 17). No handler here ever changes a tool's own result or error: every
-// store call is caught and logged, never rethrown to the caller.
+// only the extension's own options page flips chrome.storage.local's "audit" key.
+// No handler here ever changes a tool's own result or error: every store call
+// is caught and logged, never rethrown to the caller.
 //
 // Settings are re-read on every call rather than cached, so a toggle from the
 // options page takes effect immediately without a service worker restart.
@@ -19,13 +19,15 @@
   const OWNER_ROW_RETRY_DELAY_MS = 500;
 
   let store = null;
-  // I5 (plan-mandated): which tabs may be recorded at all, e.g. background's own
-  // isInGroup. Defaults to "every tab", so callers that don't pass one (existing
-  // tests, and any future caller) keep today's behaviour.
+  // Which tabs may be recorded at all. background.js passes a predicate that
+  // allows a tab in the MCP group that shows no blocked page (a local file or
+  // this extension's own page) and ignores an open JS dialog, so a dialog never
+  // stops a recording. Defaults to "every tab", so callers that don't pass one
+  // (existing tests, and any future caller) keep today's behaviour.
   let isTabAllowed = async () => true;
   const tabOwners = new Map(); // tabId -> "<runId>.<session.id>", the last session to act on that tab
   const tabOwnerSetAt = new Map(); // tabId -> Date.now() when tabOwners was last set, for the retry below
-  const knownTagsByTab = new Map(); // tabId -> Map(rrweb node id -> lowercase tagName), for redactEvents (I1)
+  const knownTagsByTab = new Map(); // tabId -> Map(rrweb node id -> lowercase tagName, or a text node's marker), for redactEvents
   const failedRecorderStarts = new Map(); // tabId -> the tab's url when Chrome last refused to script it
   // Chrome's wording when it refuses to script a page at all: chrome:// and
   // other browser pages, the Web Store, a host without permission. That holds
@@ -36,14 +38,14 @@
   async function settings() {
     const { audit } = await chrome.storage.local.get("audit");
     const enabled = !!(audit && audit.enabled);
-    // M7: a raw <select> value ("7") or a cleared field (undefined) must not
+    // A raw <select> value ("7") or a cleared field (undefined) must not
     // silently disable age pruning — fall back to the 7-day default instead.
     const rd = Number(audit && audit.retentionDays);
     const retentionDays = Number.isFinite(rd) && rd > 0 ? rd : 7;
     return { enabled, retentionDays };
   }
 
-  // I2: the hub numbers sessions from s1 again in every process (bridge-hub.js's
+  // The hub numbers sessions from s1 again in every process (bridge-hub.js's
   // counter resets on restart), so session.id alone is not a stable identity.
   // ctx.requestId is "<runId>.<session>.<clientId>" and runId is 8 random hex
   // characters per hub process, so "<runId>.<session.id>" never collides
@@ -55,7 +57,7 @@
     return `${runId}.${session.id}`;
   }
 
-  // I3: prune whenever the "audit" key exists at all (enabled or not), so data
+  // Prune whenever the "audit" key exists at all (enabled or not), so data
   // recorded while it was on still gets cleaned up after the user switches it
   // off. Only skip when the key is absent entirely — no opt-in yet means no
   // database, and it keeps the vm tests (no storage at all) quiet.
@@ -79,9 +81,9 @@
     chrome.alarms.onAlarm.addListener((alarm) => {
       if (alarm.name === AUDIT_PRUNE_ALARM) runPrune();
     });
-    // New Minor 3 (fix round 2): tabOwners, tabOwnerSetAt and knownTagsByTab
-    // otherwise grow for as long as the worker stays alive — knownTagsByTab in
-    // particular holds one entry per element, tens of thousands on a large page.
+    // tabOwners, tabOwnerSetAt and knownTagsByTab otherwise grow for as long as
+    // the worker stays alive — knownTagsByTab in particular holds one entry per
+    // element and text node, tens of thousands on a large page.
     chrome.tabs.onRemoved.addListener((tabId) => {
       tabOwners.delete(tabId);
       tabOwnerSetAt.delete(tabId);
@@ -122,8 +124,9 @@
   // Upserts the session row as soon as a call starts (not just when it finishes
   // recording, in recordAction) so that a session's very first-ever action has
   // a row to find almost immediately — closing most of the window in which
-  // onRecorderEvents' hasSession check (I4) could otherwise mistake "not
-  // created yet" for "deleted". Fire-and-forget, same reasoning as M2.
+  // onRecorderEvents' hasSession check could otherwise mistake "not created
+  // yet" for "deleted". Fire-and-forget, for the same reason as safeRecord in
+  // wrapHandlers: a stalled store write must never delay a tool's response.
   async function touchSession(key, session) {
     try {
       const { enabled } = await settings();
@@ -149,13 +152,13 @@
     });
   }
 
-  // Makes sure the tab has a running rrweb recorder (Task 16), injecting
+  // Makes sure the tab has a running rrweb recorder, injecting
   // vendor/rrweb-record.min.js and audit/recorder.js only when one isn't already there.
   // No-op while audit is off. Errors (a chrome:// tab, a tab that just closed, or
-  // I4's own timeout below) are swallowed: recording is best-effort and must
+  // the timeout below) are swallowed: recording is best-effort and must
   // never break the action it wraps.
   //
-  // I4: a page stuck on an open JS dialog (or one that hasn't reached the
+  // A page stuck on an open JS dialog (or one that hasn't reached the
   // default document_idle injection point) never answers
   // chrome.scripting.executeScript, so both calls race a short timeout instead
   // of awaiting it unbounded — matching background.js's own rule for renderer
@@ -220,17 +223,17 @@
       handlers[name] = async function auditWrapped(args, ctx) {
         const tabId = args && args.tabId != null ? args.tabId : null;
         const key = sessionKey(ctx);
-        // I5 (plan-mandated): a tabId the tool itself would refuse (outside the
-        // MCP group) must not get a recorder or become that tab's owner — some
-        // handlers (gif_creator and other stubs) have no group check of their
-        // own to piggyback on, so this is checked independently here.
+        // A tabId the tool itself would refuse (outside the MCP group) must not
+        // get a recorder or become that tab's owner — some handlers
+        // (gif_creator and other stubs) have no group check of their own to
+        // piggyback on, so this is checked independently here.
         const allowed = tabId != null && (await isTabAllowed(tabId));
         // A stream stored under a new owner needs a FullSnapshot of its own:
         // the recorder already running in the tab took its snapshot for the
         // previous owner, or before a gap in which no one owned the tab and
         // its batches were dropped.
         const newOwner = allowed && key != null && tabOwners.get(tabId) !== key;
-        // M1: before the call (not after recordAction, which used to run only
+        // Before the call (not after recordAction, which used to run only
         // once the whole handler had already returned) — otherwise a recorder
         // batch that arrives mid-call, or from a different session reusing a
         // tab another session last owned, finds no owner yet, or the wrong one.
@@ -242,12 +245,12 @@
         try {
           result = await original(args, ctx);
         } catch (err) {
-          // M1: computed before the after-hook below, which — per I4 — is not
-          // awaited, so a slow or timed-out ensureRecorder call never inflates
-          // the tool's own recorded duration.
+          // Computed before the after-hook below, which is not awaited (see
+          // ensureRecorder), so a slow or timed-out ensureRecorder call never
+          // inflates the tool's own recorded duration.
           const ms = Date.now() - started;
           if (allowed) ensureRecorder(tabId);
-          // M2: fire-and-forget — safeRecord never rejects (its own try/catch
+          // Fire-and-forget — safeRecord never rejects (its own try/catch
           // guarantees that), and a stalled store write must never delay the
           // tool's actual response to the host.
           safeRecord(name, args, ctx, `error: ${scrubUrls(String(err.message), AUDIT_ERROR_CLIP)}`, ms);
@@ -262,7 +265,7 @@
     return handlers;
   }
 
-  // New Minor 2 (fix round 2): the owner is set synchronously in wrapHandlers,
+  // The owner is set synchronously in wrapHandlers,
   // but touchSession's row write is fire-and-forget and can still be in
   // flight. A batch landing in that narrow window used to fail hasSession, get
   // dropped, and delete the tab's owner — dropping every later batch for that
@@ -293,12 +296,12 @@
       // whichever session owned it before.
       if (!(await isTabAllowed(tabId))) { tabOwners.delete(tabId); tabOwnerSetAt.delete(tabId); return; }
       await store.open();
-      // I4: the owning session's row may be gone (pruned, or deleted from the
+      // The owning session's row may be gone (pruned, or deleted from the
       // options page) even though the in-memory tab-ownership map still
       // remembers it — don't resurrect an orphan row, and forget the mapping
       // so it isn't rechecked on every future batch for this tab.
       if (!(await hasSessionWithRetry(tabId, key))) { tabOwners.delete(tabId); return; }
-      // I1/I2: redact hidden-input/cleared-value leftovers and URL-bearing
+      // Redact hidden-input/cleared-value leftovers and URL-bearing
       // attributes before they are ever written to disk, in the worker, so a
       // recorder in any document cannot bypass it. knownTags is kept per tab
       // across batches — see redact.js's redactEvents for why.

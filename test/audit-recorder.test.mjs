@@ -383,6 +383,50 @@ test("the worker-side walker masks every CSS data: payload shape real rrweb send
   }, { html: CSS_DATA_PAGE });
 });
 
+// Two CSS shapes reach the walker outside any element attribute. A <style>
+// element's text changes after the snapshot when a script rewrites its text
+// node (a `texts` entry) or appends one (an `adds` text node). An adopted
+// stylesheet travels as an AdoptedStyleSheet event (source 15), with the
+// first full snapshot and with every later one.
+const STYLE_TEXT_PAGE = `<!doctype html><title>style text test</title>
+<style id="t">.t0{color:red}</style><style id="n"></style><div id="m">m</div>`;
+
+test("the worker-side walker scrubs the <style> text and adopted stylesheets real rrweb sends", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  await withRecorderPage(async (page, world) => {
+    await page.evaluate(`(() => {
+      const a = new CSSStyleSheet();
+      a.replaceSync(".a3 { background: url(data:text/plain,SECRETADOPT3); } .q3 { background: url(https://h.test/i.png?token=SECRETADOPTQ3); }");
+      document.adoptedStyleSheets = [a];
+    })()`);
+    await world(RECORDER_JS); // started after the page adopted a sheet, so the first snapshot carries it
+    await sleep(1300);
+    await page.evaluate(`(() => {
+      document.getElementById("t").firstChild.data = ".t1 { background: url(data:text/plain,SECRETTEXTMUT1); } .t2 { background: url(https://h.test/y.png?token=SECRETTEXTQ1); }";
+      document.getElementById("n").appendChild(document.createTextNode(".n1 { background: url(data:text/plain,SECRETNEWTEXT1); }"));
+      const b = new CSSStyleSheet();
+      b.replaceSync(".a2 { background: url(data:text/plain,SECRETADOPT2); } .q2 { background: url(https://h.test/i.png?token=SECRETADOPTQ2); }");
+      document.adoptedStyleSheets = [...document.adoptedStyleSheets, b];
+    })()`);
+    await sleep(200);
+    await world(`globalThis[Symbol.for("ocic.audit.recorder")].takeFullSnapshot()`);
+    await sleep(1500);
+
+    const batches = JSON.parse(await world("JSON.stringify(globalThis.sent)")).map((m) => m.events);
+    const raw = JSON.stringify(batches);
+    const ctx = vm.createContext({ URL });
+    vm.runInContext(REDACT_JS, ctx, { filename: "redact.js" });
+    const redactEvents = vm.runInContext("redactEvents", ctx);
+    const knownTags = new Map();
+    const walked = JSON.stringify(batches.map((events) => redactEvents(events, knownTags)));
+
+    const sources = new Set(batches.flat().filter((e) => e.type === 3).map((e) => e.data.source));
+    assert.ok(sources.has(15), "rrweb must send the adopted stylesheets as source 15 events");
+    const markers = ["SECRETADOPT3", "SECRETADOPTQ3", "SECRETTEXTMUT1", "SECRETTEXTQ1", "SECRETNEWTEXT1", "SECRETADOPT2", "SECRETADOPTQ2"];
+    assert.deepEqual(markers.filter((m) => !raw.includes(m)), [], "rrweb must relay every marker raw, or this proves nothing about the walker");
+    assert.deepEqual(markers.filter((m) => walked.includes(m)), []);
+  }, { html: STYLE_TEXT_PAGE, skipRecorderEval: true });
+});
+
 // ensureRecorder (audit.js) asks a running recorder for a fresh FullSnapshot
 // when another session takes over the tab. The events buffered before that go
 // out first, so the snapshot starts a batch of its own.

@@ -90,7 +90,7 @@ export class BridgeClient {
         this._pending.delete(id);
         clearTimeout(entry.timer);
         // Drop this request's own waiter instead of leaving it (and its args)
-        // queued in _connectWaiters until the next welcome (M6).
+        // queued in _connectWaiters until the next welcome.
         const idx = this._connectWaiters.indexOf(waiter);
         if (idx !== -1) this._connectWaiters.splice(idx, 1);
         let message = NOT_CONNECTED;
@@ -157,7 +157,7 @@ export class BridgeClient {
 
   _scheduleRetry() {
     if (this._closed || this._retryTimer) return;
-    // While any request is still waiting out its grace window (M4), retry at
+    // While any request is still waiting out its grace window, retry at
     // retryMinMs instead of the grown backoff: a hub that appears late in a
     // 5s grace must not be missed because the backoff had already spread out
     // toward retryMaxMs from earlier, unrelated failures.

@@ -21,9 +21,9 @@ const screenshotStore = new Map(); // imageId -> base64
 const openDialogs = new Map(); // tabId -> message, while a JS dialog (alert/confirm/prompt/beforeunload) blocks the page
 const pendingCdpRejects = new Map(); // tabId -> Set<reject>, one entry per in-flight rawCdp call on that tab
 
-// Thrown to reject every pending rawCdp call on a tab the instant its dialog opens (round 2 item
-// 2), instead of letting each one run out its own CDP_TIMEOUT_MS: a dialog freezes the renderer,
-// so an in-flight command (e.g. the click that opened it) is stuck until the user closes it
+// Thrown to reject every pending rawCdp call on a tab the instant its dialog opens, instead of
+// letting each one run out its own CDP_TIMEOUT_MS: a dialog freezes the renderer, so an
+// in-flight command (e.g. the click that opened it) is stuck until the user closes it
 // regardless of how it's reported. dialogMessage lets a caller (e.g. a click action) report that
 // its own action already happened before the dialog interrupted the rest.
 class DialogOpenedDuringCall extends Error {
@@ -215,6 +215,7 @@ async function tabAccessError(tabId, { allowBlockedUrl = false, allowDialog = fa
 
 // --- CDP helpers ---
 const CDP_TIMEOUT_MS = 30000;
+const PRE_ATTACH_BUDGET_MS = 2000; // how long navigate waits for its attach before it navigates anyway
 const attaching = new Map(); // tabId -> in-flight attach promise, shared by parallel callers
 
 function rawCdp(tabId, method, params = {}, timeoutMs = CDP_TIMEOUT_MS) {
@@ -695,11 +696,11 @@ function pointerReply(verb, coordinate, hit, scrolled, notes) {
   return text;
 }
 
-// Runs a click dispatch, then replies normally — unless a JS dialog opened mid-dispatch (round 2
-// item 2, e.g. an onclick handler calling confirm()): the click itself already happened before
-// the dialog interrupted whatever was left of it, so this says so instead of surfacing the raw
-// internal error or (rawCdp already rejects those calls immediately, see item 2) waiting out a
-// timeout for what a dialog has already frozen.
+// Runs a click dispatch, then replies normally — unless a JS dialog opened mid-dispatch (e.g. an
+// onclick handler calling confirm()): the click itself already happened before the dialog
+// interrupted whatever was left of it, so this says so instead of surfacing the raw internal
+// error or waiting out a timeout for what a dialog has already frozen (rawCdp rejects those
+// calls the moment the dialog opens, see DialogOpenedDuringCall).
 async function dispatchPointerAction(verb, coordinate, hit, scrolled, notes, run) {
   try {
     await run();
@@ -839,13 +840,15 @@ const toolHandlers = {
         return { content: [{ type: "text", text: "Could not create or find the MCP tab group." }] };
       }
     }
-    const tab = await chrome.tabs.create({ windowId: groupTabs[0].windowId, active: true });
+    // about:blank, not the default New Tab Page: that is a chrome:// page, which refuses the
+    // debugger attach below.
+    const tab = await chrome.tabs.create({ windowId: groupTabs[0].windowId, active: true, url: "about:blank" });
     await chrome.tabs.group({ tabIds: [tab.id], groupId: tabGroupId });
     tabGroupTabs.add(tab.id);
     // Attach the fresh tab now, not on whatever tool call happens to touch it first: a dialog
     // that opens before the tab is ever attached is never seen, and every CDP call then hangs
-    // for the full 30s until the user closes it (round 2 item 1, probe F). Best-effort: some
-    // pages (e.g. chrome://) refuse debugger attach outright, and tab creation must still work.
+    // for the full 30s until the user closes it. Best-effort: tab creation must still work if
+    // the attach fails.
     try { await ensureAttached(tab.id); } catch {}
     const tabs = await chrome.tabs.query({ groupId: tabGroupId });
     const result = formatTabContext(tabs);
@@ -870,11 +873,17 @@ const toolHandlers = {
     if (tabError) return { content: [{ type: "text", text: tabError }] };
 
     // Attach before navigating, not after: otherwise a page that opens a dialog on load is
-    // never seen (round 2 item 1, probe F) — every CDP call then hangs for the full 30s until
-    // the user closes it. Best-effort: some pages (e.g. chrome://) refuse debugger attach
-    // outright, and navigate must still work on those, as it did before this fix (never
-    // attaching at all).
-    try { await ensureAttached(tabId); } catch {}
+    // never seen, and every CDP call then hangs for the full 30s until the user closes it.
+    // Best-effort: some pages (e.g. chrome://) refuse debugger attach outright, and navigate
+    // must still work on those. The wait is bounded: a dialog this extension never saw can
+    // freeze the tab, the attach then hangs, and navigating away is how the agent gets that
+    // tab back. After the budget, the attach goes on in the background.
+    let preAttachTimer;
+    await Promise.race([
+      ensureAttached(tabId).catch(() => {}),
+      new Promise((resolve) => { preAttachTimer = setTimeout(resolve, PRE_ATTACH_BUDGET_MS); }),
+    ]);
+    clearTimeout(preAttachTimer);
 
     if (url === "back") {
       await chrome.tabs.goBack(tabId);
@@ -1583,9 +1592,9 @@ async function handleToolRequest(id, tool, args, session) {
 // tab's id, and onRecorderEvents itself drops events for a tab with no owner.
 // sender.id must match our own extension id and sender.tab must be set, so only our
 // injected recorder.js — not some other message — reaches Audit.onRecorderEvents.
-// M6: sender.id is always our own for anything reaching onMessage (no
+// sender.id is always our own for anything reaching onMessage (no
 // externally_connectable in the manifest), so on its own it is a weak gate — this
-// extension's own pages (e.g. Task 17's options.html opened in a tab) pass it and
+// extension's own pages (e.g. options.html opened in a tab) pass it and
 // sender.tab too. frameId must be the top frame (injection always targets frame
 // 0), and origin must not be one of the extension's own pages.
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {

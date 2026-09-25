@@ -43,7 +43,7 @@
   }
 
   // Captured once, at start, rather than read from globalThis.rrwebRecord at
-  // event time (New Minor 1, fix round 2): a second, redundant injection into a
+  // event time: a second, redundant injection into a
   // document that already records (two concurrent audited calls each deciding
   // "not present yet" before either's injection lands, now that the after-hook
   // isn't awaited) re-evaluates the vendor bundle and replaces that global with
@@ -60,12 +60,12 @@
     // editors, chat boxes) and a textarea's original, cleared-by-script text (which
     // rrweb serializes as a plain child text node once the live value is empty, not
     // an attribute — the same gap maskAllInputs itself has for other cleared fields,
-    // closed for those by the walker instead, see I1 below) hold text as DOM text, so
+    // closed for those by the walker instead, see blockSelector below) hold text as DOM text, so
     // mask them too. Each selector matches the host element itself: rrweb checks the
     // element and, for mutations, every ancestor via closest(), so nested text and
     // text typed straight into an empty host are both covered.
     maskTextSelector: '[contenteditable]:not([contenteditable="false"]), textarea',
-    // I1: maskAllInputs only overwrites `value` with the masked live value when
+    // maskAllInputs only overwrites `value` with the masked live value when
     // that value is non-empty, so a hidden input's raw HTML value attribute
     // (a CSRF token, one set by a script, one present in markup) would
     // otherwise go out unmasked. Blocking it drops its attributes down to
@@ -82,7 +82,7 @@
     sampling: { mousemove: 100, scroll: 150, input: "last" },
   });
 
-  // M5: mark this document as "has a recorder" only after record() actually
+  // Mark this document as "has a recorder" only after record() actually
   // succeeded. Setting it first (as an earlier version of this file did) would
   // let a transient failure here (rrwebRecord missing, an internal rrweb
   // error) permanently poison ensureRecorder's presence probe into believing a
@@ -100,7 +100,7 @@
   };
 
   window.addEventListener("pagehide", flush);
-  // M3: a back/forward-cache restore resumes this exact recorder instance (the
+  // A back/forward-cache restore resumes this exact recorder instance (the
   // page's JS state, including this closure, survives bfcache) with no new
   // full snapshot on its own, so the stored stream would otherwise jump
   // straight from an earlier page's snapshot to this one's increments, with no

@@ -131,21 +131,22 @@ esac
 # Prints the PHYSICAL absolute path to the shared .git directory for the
 # repository containing $1 (the same result for every worktree of one
 # repository), or nothing if $1 doesn't exist or isn't inside a git
-# repository. Always resolved with `pwd -P`, not bash's own logical `pwd`:
-# comparing two logical paths can disagree on whether they're the same
-# directory when only one of them was reached through a symlink (e.g. /tmp
-# vs. /private/tmp on macOS), even though `cd` itself always lands on the
-# real one either way.
+# repository. Resolved with `cd -P` and `pwd -P`, never bash's logical
+# defaults. A logical `pwd` can print two different paths for one directory
+# (/tmp and /private/tmp on macOS). A logical `cd` applies ".." to the path
+# as written, so after a symlinked directory (for example a ~/.claude/skills
+# that links into a dotfiles checkout) it can land somewhere other than
+# where the OS resolves the same path.
 repo_common_dir() {
   local dir="$1" common
   [ -d "$dir" ] || return 0
   common=$(git -C "$dir" rev-parse --git-common-dir 2>/dev/null) || return 0
-  (cd "$dir" && cd "$common" 2>/dev/null && pwd -P)
+  (cd -P "$dir" && cd -P "$common" 2>/dev/null && pwd -P)
 }
 
 # Prints the physical form of $1 (an absolute path that may not exist).
 # Resolves symlinks and any .. segments through the longest existing
-# ancestor directory (with `cd`/`pwd -P`, same as repo_common_dir above),
+# ancestor directory (with `cd -P` and `pwd -P`, as in repo_common_dir above),
 # then appends the remaining, not-yet-existing tail components unchanged.
 # A dangling symlink's target has no real filesystem entry left to resolve
 # by the usual means, but its existing ancestors still need to be physical
@@ -156,7 +157,7 @@ physical_path() {
     tail="$(basename "$dir")${tail:+/$tail}"
     dir="$(dirname "$dir")"
   done
-  dir="$(cd "$dir" && pwd -P)" || { printf '%s\n' "$target"; return; }
+  dir="$(cd -P "$dir" && pwd -P)" || { printf '%s\n' "$target"; return; }
   if [ -n "$tail" ]; then printf '%s/%s\n' "$dir" "$tail"; else printf '%s\n' "$dir"; fi
 }
 
@@ -192,7 +193,7 @@ if [ -d "$CLAUDE_SKILLS_DIR" ]; then
       # Physically resolved on both sides: a lexical prefix match would both
       # miss a relative target's ".." segments and wrongly accept an absolute
       # target that escapes the repo through its own "..", e.g.
-      # <repo>/../elsewhere/... (M9 a, b).
+      # <repo>/../elsewhere/...
       REPO_ROOT=$(dirname "$NEW_COMMON")
       OLD_TARGET_PHYS=$(physical_path "$OLD_TARGET_ABS")
       case "$OLD_TARGET_PHYS" in

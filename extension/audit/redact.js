@@ -16,10 +16,10 @@ const AUDIT_JS_CODE_CLIP = 500;
 // character and never ends the token. Good enough to find a URL embedded in a
 // free-text Chrome error message or a page attribute.
 //
-// Fix round 3, item 2 (new Important): the scheme's own suffix is bounded to
-// {0,31} (any real scheme name is far shorter), not left unbounded. An
-// unbounded `[a-z0-9+.-]*` here, combined with \b matching at every letter in
-// a long alternating run like "a.a.a...", made the regex engine retry an
+// The scheme's own suffix is bounded to {0,31} (any real scheme name is far
+// shorter), not left unbounded. An unbounded `[a-z0-9+.-]*` here, combined
+// with \b matching at every letter in a long alternating run like
+// "a.a.a...", made the regex engine retry an
 // O(remaining-length) "no ':' found" backtrack at O(n) different starting
 // points — O(n^2) overall. A 100 KB attribute value cost 4.1s; bounding the
 // scheme caps the work at each starting point to a constant, restoring O(n).
@@ -29,22 +29,30 @@ const URL_TOKEN_RE = /\b[a-z][a-z0-9+.-]{0,31}:\/\/[^\s"<>?#]*(?:[?#][^\s"<>]*)?
 // one to its length instead of leaving it (and whatever it encodes) verbatim.
 // Its payload can hold any character (markup, spaces, quotes), so no character
 // marks where it ends: the mask runs from "data:" to the end of the string or
-// attribute value (fail closed, fix round 4, item 3).
+// attribute value (fail closed).
 const DATA_URI_RE = /\bdata:[\s\S]*/i;
 
-// CSS text (a style attribute string, a style diff value, or rrweb's own
-// _cssText carrying a whole <style> or inlined stylesheet) mostly holds a
-// data: URI in a url(...) token, whose payload has a real end: the closing
-// quote of url("...") or url('...'), or the ")" of a bare url(...), with "\"
-// escaping the character after it. Masking only that far keeps every rule
-// after a data: icon (a Bootstrap-sized stylesheet lost 83% of its rules to
-// the mask-to-the-end rule of free text). A data: URI can also sit where no
-// such end exists: in a custom property string, image-set("..."), an @import
+// CSS text (a style attribute string, a style diff value, rrweb's own
+// _cssText carrying a whole <style> or inlined stylesheet, a <style>
+// element's text, or an adopted stylesheet's rule) mostly holds a data: URI
+// in a url(...) token, whose payload has a real end: the closing quote of
+// url("...") or url('...'), or the ")" of a bare url(...), with "\" escaping
+// the character after it. Masking only that far keeps every rule after a
+// data: icon (a Bootstrap-sized stylesheet lost 83% of its rules to the
+// mask-to-the-end rule of free text). A data: URI can also sit where no such
+// end is known: in a custom property string, image-set("..."), an @import
 // string, or a url( token that never closes. The last branch masks any such
-// data: to the end of the text. Both run in one pass, so a masked
-// "data:[N chars]" is never matched again. Negated character classes, not a
-// lazy [\s\S]*?, keep the scan linear on input that never closes a token.
-const CSS_DATA_URI_RE = /\burl\(\s*(?:"(data:(?:[^"\\]|\\[\s\S])*)"|'(data:(?:[^'\\]|\\[\s\S])*)'|(data:(?:[^\s"'()\\]|\\[\s\S])*))\s*\)|\bdata:[\s\S]*/gi;
+// data: to the end of the text, but only where a URI can start. Right after a
+// letter, a digit, "_", ".", "#" or "-", "data:" is part of a selector or a
+// property name (.no-data::before, table.data:hover, --chart-data:1), so the
+// rules after it stay. A quoted data: with no comma and no "\" before the
+// string's closing quote holds no payload either: a data: URL needs a comma
+// before its payload, and only a CSS escape could encode one. Such a string,
+// like content:"data: 5", is masked only up to its closing quote. All
+// branches run in one pass, so a masked "data:[N chars]" is never matched
+// again. Negated character classes, not a lazy [\s\S]*?, keep the scan linear
+// on input that never closes a token.
+const CSS_DATA_URI_RE = /\burl\(\s*(?:"(data:(?:[^"\\]|\\[\s\S])*)"|'(data:(?:[^'\\]|\\[\s\S])*)'|(data:(?:[^\s"'()\\]|\\[\s\S])*))\s*\)|(?<=")data:[^"\\,]*(?=")|(?<=')data:[^'\\,]*(?=')|(?<![\w.#-])data:[\s\S]*/gi;
 
 function scrubCssText(text, maxLen) {
   if (typeof text !== "string") return text;
@@ -64,8 +72,8 @@ function clipTo(s, max) {
 
 // Replaces every URL-like token (and every data: URI) in free text with its
 // redacted form, then (optionally) clips the result. Used for error/outcome
-// text (I1), the generic fallback's string values (M9), and now every rrweb
-// attribute value the walker sees (I2) — anywhere a secret could ride in as a
+// text, the generic fallback's string values, and every rrweb attribute
+// value the walker sees — anywhere a secret could ride in as a
 // query string, fragment or data: payload without the text itself being a
 // dedicated URL field.
 function scrubUrls(text, maxLen) {
@@ -117,7 +125,7 @@ function clipDeep(value, max) {
   return value;
 }
 
-// I5: a run of `key` calls, one bare printable character at a time, is how the
+// A run of `key` calls, one bare printable character at a time, is how the
 // `key` action can type real text while bypassing `type`'s own redaction (see
 // background.js's charDefinition/keyDefinition). Every named key (Enter, Tab,
 // F5, ...) is at least 2 characters, so a key part that is exactly one
@@ -165,7 +173,7 @@ function computerSummary(args) {
       s += ` ${args.scroll_direction || "down"} ${args.scroll_amount ?? 3}`;
       break;
     case "zoom":
-      // M4: a malformed region (not an array) must not throw — the action is
+      // A malformed region (not an array) must not throw — the action is
       // still recorded, just without the region detail.
       if (Array.isArray(args.region)) s += ` region [${args.region.join(", ")}]`;
       break;
@@ -175,13 +183,13 @@ function computerSummary(args) {
 
 // Mirrors the navigate handler's own scheme-less normalization (background.js)
 // so the audit summary reflects the URL it will actually navigate to, not a
-// literal reading of whatever the caller passed (M4). Named distinctly from
-// background.js's own like-named helper (fix round 3, item 5): redact.js is a
-// classic script sharing the worker's global scope with everything else
-// importScripts loads, and on the integration branch (Task 12) background.js
-// declares its own `normalizeNavigateUrl(input, ownExtensionId)` — importScripts
-// runs after background.js's own declarations are hoisted, so the identically-
-// named function here silently replaced it and broke navigate.
+// literal reading of whatever the caller passed. Named distinctly from
+// background.js's own like-named helper: redact.js is a classic script sharing
+// the worker's global scope with everything else importScripts loads, and
+// background.js declares its own `normalizeNavigateUrl(input, ownExtensionId)`
+// — importScripts runs after background.js's own declarations are hoisted, so
+// an identically-named function here would silently replace it and break
+// navigate.
 function auditNavigateTarget(url) {
   if (/^https?:\/\//i.test(url) || url.startsWith("about:") || url.startsWith("chrome:") || url.startsWith("brave:")) return url;
   return `https://${url.replace(/^[a-z]{1,5}:\/+/i, "")}`;
@@ -190,7 +198,7 @@ function auditNavigateTarget(url) {
 function navigateSummary(args) {
   const { url } = args;
   if (url === "back" || url === "forward") return url;
-  // M3: match case-insensitively and after trimming ("DATA:...", " data:...").
+  // Match case-insensitively and after trimming ("DATA:...", " data:...").
   if (typeof url === "string" && /^\s*data:/i.test(url)) return `data:[${url.length} chars]`;
   return redactUrl(auditNavigateTarget(url));
 }
@@ -202,7 +210,7 @@ function formInputSummary(args) {
   return `${ref} value [${String(value).length} chars]`;
 }
 
-// I5: replaces the contents of every '...', "..." and `...` literal with
+// Replaces the contents of every '...', "..." and `...` literal with
 // [N chars], while leaving comments and surrounding code untouched. A template
 // literal's whole span (backtick to its own matching backtick) is masked as
 // one unit, including any nested ${...} substitutions — those are walked (via
@@ -211,15 +219,15 @@ function formInputSummary(args) {
 // template inside the substitution. Comments (// and /* */) are skipped as
 // comments, not scanned for quotes, so a quote inside one no longer
 // desynchronizes the scanner onto a later, real secret. A // comment ends at
-// any JavaScript line terminator (fix round 4, item 4): LF, CR, U+2028 or
+// any JavaScript line terminator: LF, CR, U+2028 or
 // U+2029, not only at LF, or the code after a CR would pass as comment text.
 //
-// Fix round 3, item 1 (binding): earlier drafts also tried to guess whether a
-// "/" opened a regex literal or was a division operator, by the token before
-// it. That heuristic itself leaked real secrets — 13 of 61 adversarial inputs
-// in re-review, the main family a postfix "++"/"--" right before a "/" (e.g.
-// `done++ / total`), which was misjudged as a regex opener and swallowed
-// everything up to a LATER, unrelated "/" inside a real string, un-masking it.
+// Earlier drafts also tried to guess whether a "/" opened a regex literal or
+// was a division operator, by the token before it. That heuristic itself
+// leaked real secrets on adversarial inputs, most often through a postfix
+// "++"/"--" right before a "/" (e.g. `done++ / total`), which was misjudged
+// as a regex opener and swallowed everything up to a LATER, unrelated "/"
+// inside a real string, un-masking it.
 // The rule now: outside a string, a template or a comment, ANY "/" that isn't
 // "//" or "/*" ends the kept part — everything from that "/" to the end of
 // input becomes one [N chars] span. This over-masks a real regex or division,
@@ -252,7 +260,7 @@ function lineCommentEnd(code, i) {
 // search fails closed (returns n, "never closed") from there, same as running
 // out of input while any level is still open.
 //
-// The cap counts template frames only (fix round 4, item 6). A level pushes
+// The cap counts template frames only. A level pushes
 // two frames, its template and the substitution it is nested in, so a cap on
 // the stack length failed closed from level 51. The stack still stays bounded:
 // a substitution frame is only ever pushed onto a template frame.
@@ -357,7 +365,7 @@ function maskJsStringLiterals(code) {
       if (!closed) return out;
       i = end + 1;
     } else if (ch === "/") {
-      // Item 1's binding rule: stop guessing whether this is a regex or a
+      // Never guess whether this is a regex or a
       // division — either way we cannot safely keep parsing past it, so
       // everything from here to the end of input becomes one opaque span.
       out += `[${n - i} chars]`;
@@ -381,7 +389,7 @@ function fileUploadSummary(args) {
   return `${args.ref} paths: ${paths.join(", ")}`;
 }
 
-// M4: upload_image can target a ref or a coordinate; show whichever was given
+// upload_image can target a ref or a coordinate; show whichever was given
 // instead of the literal word "undefined" when there is no ref.
 function uploadImageSummary(args) {
   const target = args.ref ? args.ref : Array.isArray(args.coordinate) ? `at (${args.coordinate[0]}, ${args.coordinate[1]})` : "";
@@ -400,46 +408,85 @@ function genericSummary(args) {
   return json;
 }
 
-// --- rrweb event redaction (I1/I2), run in the worker (Audit.onRecorderEvents)
+// --- rrweb event redaction, run in the worker (Audit.onRecorderEvents)
 // before a recorder batch is stored, so a recorder in any document cannot pass
 // through a raw secret regardless of what it actually sent. ---
 
-// I2: attributes that carry a URL, wherever they appear (any tag) — checked by
+// Attributes that carry a URL, wherever they appear (any tag) — checked by
 // name only, since the attribute name alone identifies it as URL-bearing.
 const URL_ATTRS = ["href", "src", "action", "formaction", "poster"];
 
 // "url descriptor, url descriptor, ..." — redact each URL, keep its descriptor
 // (a width like "480w" or a density like "2x") untouched.
+//
+// A data: URL's payload holds a comma, and can hold a whole URL of its own
+// ("data:text/plain,https://x.test/SECRET 1x"), so splitting such a value at
+// its commas would keep part of the payload as if it were a URL. A value that
+// holds "data:" is read the way the HTML srcset parser reads it instead: a
+// candidate's URL runs to the next whitespace, commas included, and its
+// descriptors run to the next comma. A data: URL is masked whole. Its
+// descriptors stay only when they are real descriptors. Anything else after
+// it may be more of the payload, so the mask then runs to the end of the
+// value (fail closed).
+const SRCSET_DESCRIPTORS_RE = /^\d+(?:\.\d+)?[wxh](?:\s+\d+(?:\.\d+)?[wxh])*$/i;
+
 function redactSrcset(value) {
-  return value.split(",").map((part) => {
-    const trimmed = part.trim();
-    const spaceIdx = trimmed.indexOf(" ");
-    if (spaceIdx === -1) return redactUrl(trimmed);
-    return redactUrl(trimmed.slice(0, spaceIdx)) + trimmed.slice(spaceIdx);
-  }).join(", ");
+  if (!/data:/i.test(value)) {
+    return value.split(",").map((part) => {
+      const trimmed = part.trim();
+      const spaceIdx = trimmed.indexOf(" ");
+      if (spaceIdx === -1) return redactUrl(trimmed);
+      return redactUrl(trimmed.slice(0, spaceIdx)) + trimmed.slice(spaceIdx);
+    }).join(", ");
+  }
+  const isSpace = (ch) => ch === " " || ch === "\t" || ch === "\n" || ch === "\r" || ch === "\f";
+  const out = [];
+  let i = 0;
+  while (i < value.length) {
+    while (i < value.length && (isSpace(value[i]) || value[i] === ",")) i++;
+    if (i >= value.length) break;
+    const start = i;
+    while (i < value.length && !isSpace(value[i])) i++;
+    let end = i;
+    let descriptors = "";
+    if (value[end - 1] === ",") {
+      while (end > start && value[end - 1] === ",") end--; // a URL's trailing commas end its candidate
+    } else {
+      const comma = value.indexOf(",", i);
+      const stop = comma === -1 ? value.length : comma;
+      descriptors = value.slice(i, stop).trim();
+      i = stop;
+    }
+    const redacted = redactUrl(value.slice(start, end));
+    if (redacted.startsWith("data:[") && descriptors !== "" && !SRCSET_DESCRIPTORS_RE.test(descriptors)) {
+      out.push(`data:[${value.length - start} chars]`);
+      break;
+    }
+    out.push(descriptors ? `${redacted} ${descriptors}` : redacted);
+  }
+  return out.join(", ");
 }
 
-// I1: masks input/textarea `value` attributes with `*` of the same length,
+// Masks input/textarea `value` attributes with `*` of the same length,
 // when `shouldMaskValue` is true. In a full snapshot or an `adds` entry the
 // tag is always directly known, so the caller passes it positively (input or
 // textarea only — an <option>'s value is page content, not a typed secret).
-// For an attribute mutation, the caller instead fails closed (controller
-// ruling, fix round 2): an id the walker does not recognize at all — which
-// happens for real after a worker restart (the tag map lives only in memory)
-// or any batch dropped before reaching the walker — is masked too, accepting
-// that a button's or meter's value gets masked as a rare, acceptable cost. A
-// tag *positively* known to be something else stays untouched either way.
-// I2 (pulled in): every other string attribute is also run through scrubUrls,
-// since a URL can ride in as free text on an attribute that isn't one of the
-// dedicated URL_ATTRS (e.g. a <meta property="og:url" content="...?token=...">).
+// For an attribute mutation, the caller instead fails closed: an id the
+// walker does not recognize at all — which happens for real after a worker
+// restart (the tag map lives only in memory) or any batch dropped before
+// reaching the walker — is masked too, accepting that a button's or meter's
+// value gets masked as a rare, acceptable cost. A tag *positively* known to be
+// something else stays untouched either way. Every other string attribute is
+// also run through scrubUrls, since a URL can ride in as free text on an
+// attribute that isn't one of the dedicated URL_ATTRS (e.g. a
+// <meta property="og:url" content="...?token=...">).
 function redactAttributes(shouldMaskValue, attributes) {
   if (!attributes || typeof attributes !== "object") return;
   if (typeof attributes.value === "string") {
-    // Fix round 3, item 4 (pulled): a value the controller's ruling keeps
-    // (an <option>'s or a <button>'s — page content, not a typed secret) can
-    // still carry a URL's query as its own text (e.g. an <option value="https:
-    // //...?token=...">) — scrub that even though the value itself isn't
-    // asterisk-masked.
+    // A value that is kept rather than masked (an <option>'s or a <button>'s —
+    // page content, not a typed secret) can still carry a URL's query as its
+    // own text (e.g. an <option value="https://...?token=...">) — scrub that
+    // even though the value itself isn't asterisk-masked.
     if (shouldMaskValue) attributes.value = "*".repeat(attributes.value.length);
     else attributes.value = scrubUrls(attributes.value);
   }
@@ -448,7 +495,7 @@ function redactAttributes(shouldMaskValue, attributes) {
   }
   if (typeof attributes.srcset === "string") attributes.srcset = redactSrcset(attributes.srcset);
   // A signed image URL's query can ride in a style value in any shape rrweb
-  // sends (fix round 4, item 2). A style is a string in a snapshot, and in a
+  // sends. A style is a string in a snapshot, and in a
   // mutation whose diff would be longer than the whole value (the usual case
   // for el.style.x = ... on an element without an inline style). Otherwise it
   // is a diff object, CSS property -> new value, where a value is a string, a
@@ -481,19 +528,35 @@ function isMaskableValueTag(tagName) {
   return tagName === "input" || tagName === "textarea";
 }
 
+// knownTags values for text nodes. Tag names never start with "#".
+const AUDIT_STYLE_TEXT = "#style-text";
+const AUDIT_PLAIN_TEXT = "#text";
+
 // Walks a snapshot (or newly-added) node and its descendants: records each
-// element's rrweb id -> lowercase tagName into `knownTags` (so a later,
-// separate mutation event on the same id can be classified) and redacts it
-// in place.
-function walkSnapshotNode(node, knownTags) {
+// node's rrweb id into `knownTags` (so a later, separate mutation event on the
+// same id can be classified) and redacts it in place. An element maps to its
+// lowercase tagName. A text node maps to AUDIT_STYLE_TEXT when its parent is
+// a <style> element, or when the walker does not know its parent (fail
+// closed), and to AUDIT_PLAIN_TEXT otherwise. A style text node holds CSS, so
+// its text goes through the CSS scrubber. `parentTag` is the parent's
+// knownTags value: undefined for a parent the walker never saw (an `adds`
+// entry after a worker restart, or after a dropped batch), and "#document"
+// under a document node.
+function walkSnapshotNode(node, knownTags, parentTag) {
   if (!node || typeof node !== "object") return;
+  let childParentTag = "#document";
   if (node.type === 2 /* Element */ && typeof node.tagName === "string") {
     const tagName = node.tagName.toLowerCase();
     if (node.id != null) knownTags.set(node.id, tagName);
     redactAttributes(isMaskableValueTag(tagName), node.attributes);
+    childParentTag = tagName;
+  } else if (node.type === 3 /* Text */) {
+    const styleText = parentTag === undefined || parentTag === "style";
+    if (node.id != null) knownTags.set(node.id, styleText ? AUDIT_STYLE_TEXT : AUDIT_PLAIN_TEXT);
+    if (styleText && typeof node.textContent === "string") node.textContent = scrubCssText(node.textContent);
   }
   if (Array.isArray(node.childNodes)) {
-    for (const child of node.childNodes) walkSnapshotNode(child, knownTags);
+    for (const child of node.childNodes) walkSnapshotNode(child, knownTags, childParentTag);
   }
 }
 
@@ -511,12 +574,18 @@ function walkSnapshotNode(node, knownTags) {
 //   otherwise be not just useless but actively wrong (id 9 could now be a
 //   <div> instead of the <input> it used to be).
 // - IncrementalSnapshot Mutation (type 3, source 0): each `adds` node via
-//   walkSnapshotNode, and each `attributes` entry via knownTags — masking
-//   (controller ruling) unless the id is *positively* known to be something
-//   other than input/textarea, so an id the walker has never seen fails
-//   closed instead of passing a raw value through. A node's defining
-//   snapshot/add can land in an earlier batch than a later mutation on it —
-//   the caller keeps `knownTags` across calls for that reason.
+//   walkSnapshotNode, under its parent's knownTags value. Each `texts` entry
+//   (a text node's new text, the way a script rewrites a <style>) goes through
+//   the CSS scrubber unless its id is known to be plain text, so a style text
+//   node and an id the walker has never seen both fail closed. Each
+//   `attributes` entry via knownTags — masking unless the id is *positively*
+//   known to be something other than input/textarea, so an id the walker has
+//   never seen fails closed instead of passing a raw value through. A node's
+//   defining snapshot/add can land in an earlier batch than a later mutation
+//   on it — the caller keeps `knownTags` across calls for that reason.
+// - IncrementalSnapshot AdoptedStyleSheet (type 3, source 15): the rules of
+//   each stylesheet the page adopted, sent with every full snapshot, through
+//   the CSS scrubber.
 // Returns `events` (mutated in place) for convenient chaining.
 function redactEvents(events, knownTags) {
   for (const event of events || []) {
@@ -530,10 +599,19 @@ function redactEvents(events, knownTags) {
         walkSnapshotNode(event.data.node, knownTags);
       }
     } else if (event.type === 3 && event.data && event.data.source === 0) {
-      for (const add of event.data.adds || []) walkSnapshotNode(add.node, knownTags);
+      for (const add of event.data.adds || []) walkSnapshotNode(add.node, knownTags, knownTags.get(add.parentId));
+      for (const text of event.data.texts || []) {
+        if (text && typeof text.value === "string" && knownTags.get(text.id) !== AUDIT_PLAIN_TEXT) text.value = scrubCssText(text.value);
+      }
       for (const mutation of event.data.attributes || []) {
         const tagName = knownTags.get(mutation.id);
         redactAttributes(tagName === undefined || isMaskableValueTag(tagName), mutation.attributes);
+      }
+    } else if (event.type === 3 && event.data && event.data.source === 15) {
+      for (const sheet of event.data.styles || []) {
+        for (const rule of (sheet && sheet.rules) || []) {
+          if (rule && typeof rule.rule === "string") rule.rule = scrubCssText(rule.rule);
+        }
       }
     }
   }
