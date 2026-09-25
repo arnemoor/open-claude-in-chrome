@@ -920,6 +920,68 @@ test("CSS text: two data: url() tokens are each masked, keeping the rules betwee
   assert.equal(scrubbed, ".a{background:url(data:[16 chars])}.mid{x:y}.b{background:url('data:[16 chars]')}.after{x:y}");
 });
 
+// Minified CSS has no whitespace to end a URL's query, so a query mask that
+// runs to the next whitespace took every rule after an absolute url() with it.
+// A url(...) token ends at its closing ")" (bare) or its closing quote.
+const MINIFIED_SHEET = ".a{background:url(https://cdn.test/a.png?t=S)}.b{color:red}.c{color:#00f}.d{margin:0}";
+const MINIFIED_SHEET_SCRUBBED = ".a{background:url(https://cdn.test/a.png?…)}.b{color:red}.c{color:#00f}.d{margin:0}";
+
+test("CSS text: a bare absolute url() in a minified <style> text keeps every rule after it", () => {
+  const { redactEvents } = load();
+  const events = styleSnapshot({}, [{ type: 3, textContent: MINIFIED_SHEET, id: 3 }]);
+  redactEvents(events, new Map());
+  const scrubbed = events[0].data.node.childNodes[0].childNodes[0].textContent;
+  assert.doesNotMatch(scrubbed, /t=S/);
+  assert.equal(scrubbed, MINIFIED_SHEET_SCRUBBED);
+});
+
+test("CSS text: a bare absolute url() keeps the rules after it in _cssText, a style mutation and an adopted sheet", () => {
+  assert.equal(walkCss("_cssText", MINIFIED_SHEET), MINIFIED_SHEET_SCRUBBED);
+  const { redactEvents } = load();
+  const knownTags = new Map();
+  redactEvents(styleSnapshot({}, [{ type: 3, textContent: "", id: 3 }]), knownTags);
+  const changed = textMutation(3, MINIFIED_SHEET);
+  redactEvents(changed, knownTags);
+  assert.equal(changed[0].data.texts[0].value, MINIFIED_SHEET_SCRUBBED);
+  const adopted = [{ type: 3, data: { source: 15, id: 1, styleIds: [1], styles: [{ styleId: 1, rules: [{ rule: MINIFIED_SHEET, index: 0 }] }] } }];
+  redactEvents(adopted, new Map());
+  assert.equal(adopted[0].data.styles[0].rules[0].rule, MINIFIED_SHEET_SCRUBBED);
+});
+
+test("CSS text: a single-quoted absolute url() ends at its closing quote", () => {
+  assert.equal(
+    walkCss("_cssText", ".a{background:url('https://cdn.test/a.png?t=S')}.b{color:red}"),
+    ".a{background:url('https://cdn.test/a.png?…')}.b{color:red}",
+  );
+});
+
+test("CSS text: whitespace inside a bare url() is kept around the redacted URL", () => {
+  assert.equal(
+    walkCss("style", "background:url( https://cdn.test/a.png?t=S );color:red"),
+    "background:url( https://cdn.test/a.png?… );color:red",
+  );
+});
+
+// A CSS escape keeps a quote or a ")" inside the url() token, so the query
+// runs on past it.
+test("CSS text: an escaped quote or ) inside an absolute url() is part of its masked query", () => {
+  assert.equal(
+    walkCss("_cssText", '.a{background:url("https://cdn.test/a.png?t=\\"ESCQ1")}.b{color:red}'),
+    '.a{background:url("https://cdn.test/a.png?…")}.b{color:red}',
+  );
+  assert.equal(
+    walkCss("_cssText", ".a{background:url(https://cdn.test/a.png?t=\\)ESCP1)}.b{color:red}"),
+    ".a{background:url(https://cdn.test/a.png?…)}.b{color:red}",
+  );
+});
+
+// A url( that never closes has no known end, so its query is still masked to
+// the next whitespace (fail closed).
+test("CSS text: an absolute url( that never closes is masked to the next whitespace", () => {
+  const scrubbed = walkCss("_cssText", ".a{background:url(https://cdn.test/a.png?t=S;}.b{color:red} .c{color:blue}");
+  assert.equal(scrubbed, ".a{background:url(https://cdn.test/a.png?… .c{color:blue}");
+});
+
 // The re-review timed a lazy [\s\S]*? with a backreference at 96 s for 1 MB of
 // unclosed url("data:. These are that input and the rest of its family: url(
 // tokens that never close the way the bounded match expects.
@@ -971,6 +1033,29 @@ const CSS_WORD_WORST_CASES = [
 ];
 for (const [label, text] of CSS_WORD_WORST_CASES) {
   test(`CSS text: 1 MB of ${JSON.stringify(label)} is scrubbed in under 200 ms`, () => {
+    const start = performance.now();
+    walkCss("_cssText", text);
+    const elapsed = performance.now() - start;
+    assert.ok(elapsed < 200, `expected under 200ms, took ${elapsed.toFixed(0)}ms`);
+  });
+}
+
+// url(...) tokens around an absolute URL that close late, never close, or
+// hold a long run of whitespace.
+const CSS_URL_WORST_CASES = [
+  ["url( then 1 MB of spaces", `url(${" ".repeat(1_000_000)}`],
+  ["url( then 1 MB of spaces and )", `url(${" ".repeat(1_000_000)})`],
+  ["url(https://a then 1 MB of spaces", `url(https://a${" ".repeat(1_000_000)}`],
+  ['"url( " repeated', "url( ".repeat(200000)],
+  ['"url(https://a" repeated', "url(https://a".repeat(76924)],
+  ['"url(\\"https://a" repeated', 'url("https://a'.repeat(71429)],
+  ['"url(\'https://a" repeated', "url('https://a".repeat(71429)],
+  ['"url(\\"https://a" then 1 MB of url(\'', `url("https://a${"url('".repeat(200000)}`],
+  ['"url(https://a/?q)" repeated', "url(https://a/?q)".repeat(58824)],
+  ['"url(\\\\" repeated', "url(\\".repeat(200000)],
+];
+for (const [label, text] of CSS_URL_WORST_CASES) {
+  test(`CSS text: 1 MB of ${label} is scrubbed in under 200 ms`, () => {
     const start = performance.now();
     walkCss("_cssText", text);
     const elapsed = performance.now() - start;
@@ -1239,10 +1324,9 @@ function styleSnapshot(styleAttributes, styleChildren) {
   ] } } }];
 }
 
-// A URL's query mask runs to the next whitespace (see URL_TOKEN_RE), so the
-// rule after the https URL is kept here by the space before it.
+// A URL's query mask ends at the closing ")" of its url(...) token.
 const STYLE_CSS = ".t1{background:url(data:text/plain,SECRETSTYLETEXT1)} .t2{background:url(https://h.test/y.png?token=SECRETSTYLETEXTQ1)} .after{color:blue}";
-const STYLE_CSS_SCRUBBED = ".t1{background:url(data:[32 chars])} .t2{background:url(https://h.test/y.png?… .after{color:blue}";
+const STYLE_CSS_SCRUBBED = ".t1{background:url(data:[32 chars])} .t2{background:url(https://h.test/y.png?…)} .after{color:blue}";
 
 function textMutation(id, value) {
   return [{ type: 3, data: { source: 0, texts: [{ id, value }], adds: [], removes: [], attributes: [] } }];
@@ -1306,7 +1390,7 @@ test("redactEvents: an adopted stylesheet's rules are scrubbed as CSS", () => {
     { rule: ".q{background:url(https://h.test/i.png?token=SECRETADOPTQ1)}", index: 1 },
   ] }] } }];
   redactEvents(events, new Map());
-  assert.deepEqual(events[0].data.styles[0].rules.map((r) => r.rule), [".a{background:url(data:[28 chars])}", ".q{background:url(https://h.test/i.png?…"]);
+  assert.deepEqual(events[0].data.styles[0].rules.map((r) => r.rule), [".a{background:url(data:[28 chars])}", ".q{background:url(https://h.test/i.png?…)}"]);
 });
 
 test("redactEvents returns the same array it was given, for convenient chaining", () => {

@@ -54,6 +54,26 @@ const DATA_URI_RE = /\bdata:[\s\S]*/i;
 // on input that never closes a token.
 const CSS_DATA_URI_RE = /\burl\(\s*(?:"(data:(?:[^"\\]|\\[\s\S])*)"|'(data:(?:[^'\\]|\\[\s\S])*)'|(data:(?:[^\s"'()\\]|\\[\s\S])*))\s*\)|(?<=")data:[^"\\,]*(?=")|(?<=')data:[^'\\,]*(?=')|(?<![\w.#-])data:[\s\S]*/gi;
 
+// A URL in CSS text, found in one pass. First a whole url(...) token: its
+// payload ends at the closing quote of url("...") or url('...'), or at the ")"
+// of a bare url(...), and "\" escapes the character after it. Failing that,
+// any other URL token (in a string, a custom property, or a url( that never
+// closes) is redacted as free text, to the next whitespace. Minified CSS has
+// no whitespace after a url(), so the free-text mask alone removed every rule
+// after one. A bare payload needs at least one character: with an empty one,
+// the whitespace before and after it could split a long run of spaces in
+// quadratically many ways.
+const CSS_URL_RE = new RegExp(`${/(\burl\(\s*)(?:"((?:[^"\\]|\\[\s\S])*)"|'((?:[^'\\]|\\[\s\S])*)'|((?:[^\s"'()\\]|\\[\s\S])+))(\s*\))/.source}|${URL_TOKEN_RE.source}`, "gi");
+const CSS_URL_SCHEME_RE = /^[a-z][a-z0-9+.-]{0,31}:\/\//i;
+
+// A url() payload that is an absolute URL is redacted as one URL, so a space
+// or an escaped quote in its query cannot end the mask early. Any other
+// payload (a relative URL, a data: mask) only has the URLs inside it redacted.
+function redactCssUrlPayload(payload) {
+  if (CSS_URL_SCHEME_RE.test(payload)) return redactUrl(payload);
+  return payload.replace(URL_TOKEN_RE, (m) => redactUrl(m));
+}
+
 function scrubCssText(text, maxLen) {
   if (typeof text !== "string") return text;
   let scrubbed = text.replace(CSS_DATA_URI_RE, (m, doubleQuoted, singleQuoted, bare) => {
@@ -62,7 +82,12 @@ function scrubCssText(text, maxLen) {
     if (bare !== undefined) return `url(data:[${bare.length} chars])`;
     return `data:[${m.length} chars]`;
   });
-  scrubbed = scrubbed.replace(URL_TOKEN_RE, (m) => redactUrl(m));
+  scrubbed = scrubbed.replace(CSS_URL_RE, (m, open, doubleQuoted, singleQuoted, bare, close) => {
+    if (open === undefined) return redactUrl(m);
+    if (doubleQuoted !== undefined) return `${open}"${redactCssUrlPayload(doubleQuoted)}"${close}`;
+    if (singleQuoted !== undefined) return `${open}'${redactCssUrlPayload(singleQuoted)}'${close}`;
+    return `${open}${redactCssUrlPayload(bare)}${close}`;
+  });
   return clipTo(scrubbed, maxLen);
 }
 
