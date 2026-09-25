@@ -859,6 +859,32 @@ for (const [label, name, text, secret] of CSS_DATA_OUTSIDE_URL_CASES) {
   });
 }
 
+// "data:" can also be part of a selector, a property name or a plain CSS
+// string. None of those is a data: URI, so the rules after it must stay. A
+// quoted "data:" with no comma before its closing quote is masked only up to
+// that quote.
+const CSS_DATA_WORD_CASES = [
+  ["a class name before a pseudo-element", '.no-data::before{content:"No data"}', '.no-data::before{content:"No data"}'],
+  ["a class name before a pseudo-class", "table.data:hover{color:red}", "table.data:hover{color:red}"],
+  ["a custom property name", ".a{--chart-data:1}", ".a{--chart-data:1}"],
+  ["a word that ends in data", ".metadata:hover{color:red}", ".metadata:hover{color:red}"],
+  ["a double-quoted string with no comma", '.a::before{content:"data: 5"}', '.a::before{content:"data:[7 chars]"}'],
+  ["a single-quoted string with no comma", ".a::before{content:'data: 5'}", ".a::before{content:'data:[7 chars]'}"],
+];
+for (const [label, css, expected] of CSS_DATA_WORD_CASES) {
+  test(`CSS text: data: in ${label} keeps the rules after it`, () => {
+    assert.equal(walkCss("_cssText", `${css}.after{color:blue}`), `${expected}.after{color:blue}`);
+  });
+}
+
+// A CSS escape can encode a comma, so a quoted data: that holds one is still
+// masked to the end, the same as a quoted data: with a plain comma.
+test("CSS text: a quoted data: whose comma is a CSS escape is masked to the end of the text", () => {
+  const scrubbed = walkCss("_cssText", '.x{--k:"data:text/plain\\2c SECRETESCCOMMA1"}.after{color:blue}');
+  assert.doesNotMatch(scrubbed, /SECRETESCCOMMA1/);
+  assert.match(scrubbed, /data:\[\d+ chars\]$/);
+});
+
 // CSS does not allow a space in a bare url(), so this one is masked to the end.
 test("CSS text: a bare url(data:...) with a space in its payload is masked", () => {
   assert.doesNotMatch(walkCss("style", "background: url(data:text/plain,a SECRETSPACE1) no-repeat"), /SECRETSPACE1/);
@@ -928,6 +954,29 @@ test("CSS text: a 1 MB stylesheet with many closed data: icons is scrubbed in un
   assert.equal(scrubbed.split(".navbar{position:relative}").length - 1, Math.ceil(1_000_000 / unit.length));
   assert.doesNotMatch(scrubbed, /iVBORw0|%3csvg/);
 });
+
+// The quoted-string and "data: word" rules start a match at new positions:
+// many of them, one long string that never closes, and every word shape.
+const CSS_WORD_WORST_CASES = [
+  ['"data:', '"data:'.repeat(166667)],
+  ["'data:", "'data:".repeat(166667)],
+  ['"data:a', '"data:a'.repeat(142858)],
+  [`"data:'data:`, `"data:'data:`.repeat(83334)],
+  ['"data: then 1 MB of a', `"data:${"a".repeat(1_000_000)}`],
+  ['"data:, then 1 MB of a', `"data:,${"a".repeat(1_000_000)}`],
+  [".data:", ".data:".repeat(166667)],
+  ["-data:", "-data:".repeat(166667)],
+  ["adata:", "adata:".repeat(166667)],
+  ['content:"data: 5";', 'content:"data: 5";'.repeat(55556)],
+];
+for (const [label, text] of CSS_WORD_WORST_CASES) {
+  test(`CSS text: 1 MB of ${JSON.stringify(label)} is scrubbed in under 200 ms`, () => {
+    const start = performance.now();
+    walkCss("_cssText", text);
+    const elapsed = performance.now() - start;
+    assert.ok(elapsed < 200, `expected under 200ms, took ${elapsed.toFixed(0)}ms`);
+  });
+}
 
 // Fix round 4, item 1: the quote-in-query regression as the walker meets it,
 // on a data-* attribute in a snapshot and in a later setAttribute mutation.
@@ -1129,6 +1178,135 @@ test("I2: each URL inside a srcset is redacted, keeping the width/density descri
   const srcset = events[0].data.node.childNodes[0].attributes.srcset;
   assert.doesNotMatch(srcset, /tok=/);
   assert.equal(srcset, "https://x.test/a.png?… 1x, https://x.test/b.png?… 2x");
+});
+
+// A data: URL's payload holds a comma and can hold a whole URL. Split at its
+// commas first, the payload's URL was kept like any other, origin and path
+// included.
+test("redactEvents: a srcset data: candidate whose payload is a URL is masked whole, keeping its descriptor", () => {
+  const url = "data:text/plain,https://x.test/SRCSETURLPATH1";
+  assert.equal(walkCss("srcset", `${url} 1x`), `data:[${url.length} chars] 1x`);
+});
+
+test("redactEvents: the other candidates of a srcset with a data: candidate are still redacted", () => {
+  const url = "data:image/png;base64,iVBORQRCODE1==";
+  assert.equal(
+    walkCss("srcset", `https://x.test/a.png?t=SRCSETQ1 1x, ${url} 2x, https://x.test/b.png 480w`),
+    `https://x.test/a.png?… 1x, data:[${url.length} chars] 2x, https://x.test/b.png 480w`,
+  );
+});
+
+// The srcset parser ends a URL at whitespace, not at a comma: a comma right
+// before whitespace ends the candidate, and one inside a run of non-whitespace
+// is part of the URL, so all of that run is masked.
+test("redactEvents: a srcset data: candidate at the end, or ended by a comma, is masked whole", () => {
+  const url = "data:text/plain,https://x.test/SRCSETLAST1";
+  assert.equal(walkCss("srcset", `https://x.test/a.png 1x, ${url}`), `https://x.test/a.png 1x, data:[${url.length} chars]`);
+  assert.equal(walkCss("srcset", `${url}, https://x.test/b.png 2x`), `data:[${url.length} chars], https://x.test/b.png 2x`);
+  const run = `${url},https://x.test/b.png`;
+  assert.equal(walkCss("srcset", `${run} 2x`), `data:[${run.length} chars] 2x`);
+});
+
+// Text after a data: URL that is no descriptor may be more of its payload
+// (the srcset parser ends a URL at whitespace), so it is masked too.
+test("redactEvents: text after a srcset data: URL that is not a descriptor is masked to the end of the value", () => {
+  const value = "data:text/plain,a SRCSETSPACE1 1x, https://x.test/b.png 2x";
+  assert.equal(walkCss("srcset", value), `data:[${value.length} chars]`);
+});
+
+const SRCSET_WORST_CASES = [
+  ['"data:,a 1x, " repeated', "data:,a 1x, ".repeat(83334)],
+  ["data: then 1 MB of commas", `data:${",".repeat(1_000_000)}`],
+  ["data: then 1 MB of spaces", `data:${" ".repeat(1_000_000)}`],
+  ["1 MB of commas, then data:", `x${",".repeat(1_000_000)} data:,a`],
+];
+for (const [label, value] of SRCSET_WORST_CASES) {
+  test(`redactEvents: a 1 MB srcset of ${label} is scrubbed in under 200 ms`, () => {
+    const start = performance.now();
+    walkCss("srcset", value);
+    const elapsed = performance.now() - start;
+    assert.ok(elapsed < 200, `expected under 200ms, took ${elapsed.toFixed(0)}ms`);
+  });
+}
+
+// --- redactEvents: CSS outside element attributes, in a <style> element's
+// text and in adopted stylesheets. ---
+
+function styleSnapshot(styleAttributes, styleChildren) {
+  return [{ type: 2, data: { node: { type: 0, id: 1, childNodes: [
+    { type: 2, tagName: "style", attributes: styleAttributes, id: 2, childNodes: styleChildren },
+    { type: 2, tagName: "p", attributes: {}, id: 4, childNodes: [{ type: 3, textContent: "plain", id: 5 }] },
+  ] } } }];
+}
+
+// A URL's query mask runs to the next whitespace (see URL_TOKEN_RE), so the
+// rule after the https URL is kept here by the space before it.
+const STYLE_CSS = ".t1{background:url(data:text/plain,SECRETSTYLETEXT1)} .t2{background:url(https://h.test/y.png?token=SECRETSTYLETEXTQ1)} .after{color:blue}";
+const STYLE_CSS_SCRUBBED = ".t1{background:url(data:[32 chars])} .t2{background:url(https://h.test/y.png?… .after{color:blue}";
+
+function textMutation(id, value) {
+  return [{ type: 3, data: { source: 0, texts: [{ id, value }], adds: [], removes: [], attributes: [] } }];
+}
+
+test("redactEvents: a text mutation on a <style> element's text node is scrubbed as CSS", () => {
+  const { redactEvents } = load();
+  const knownTags = new Map();
+  redactEvents(styleSnapshot({ _cssText: ".t0{color:red}" }, [{ type: 3, textContent: "", id: 3 }]), knownTags);
+  const events = textMutation(3, STYLE_CSS);
+  redactEvents(events, knownTags);
+  assert.equal(events[0].data.texts[0].value, STYLE_CSS_SCRUBBED);
+});
+
+test("redactEvents: a text node added to a <style> element is scrubbed as CSS, and so is a later change to it", () => {
+  const { redactEvents } = load();
+  const knownTags = new Map();
+  redactEvents(styleSnapshot({}, []), knownTags);
+  const added = [{ type: 3, data: { source: 0, texts: [], removes: [], attributes: [], adds: [{ parentId: 2, nextId: null, node: { type: 3, textContent: STYLE_CSS, id: 6 } }] } }];
+  redactEvents(added, knownTags);
+  assert.equal(added[0].data.adds[0].node.textContent, STYLE_CSS_SCRUBBED);
+  const changed = textMutation(6, STYLE_CSS);
+  redactEvents(changed, knownTags);
+  assert.equal(changed[0].data.texts[0].value, STYLE_CSS_SCRUBBED);
+});
+
+test("redactEvents: a <style> text node that carries its own text in a full snapshot is scrubbed as CSS", () => {
+  const { redactEvents } = load();
+  const events = styleSnapshot({}, [{ type: 3, textContent: STYLE_CSS, id: 3 }]);
+  redactEvents(events, new Map());
+  assert.equal(events[0].data.node.childNodes[0].childNodes[0].textContent, STYLE_CSS_SCRUBBED);
+});
+
+// A worker restart empties the tag map, and a dropped batch can hide a node's
+// add, so a text id the walker never saw may be a <style>'s: fail closed.
+test("redactEvents: a text mutation or an added text node the walker cannot place is scrubbed as CSS", () => {
+  const { redactEvents } = load();
+  const knownTags = new Map();
+  const changed = textMutation(40, STYLE_CSS);
+  redactEvents(changed, knownTags);
+  assert.equal(changed[0].data.texts[0].value, STYLE_CSS_SCRUBBED);
+  const added = [{ type: 3, data: { source: 0, texts: [], removes: [], attributes: [], adds: [{ parentId: 41, nextId: null, node: { type: 3, textContent: STYLE_CSS, id: 42 } }] } }];
+  redactEvents(added, knownTags);
+  assert.equal(added[0].data.adds[0].node.textContent, STYLE_CSS_SCRUBBED);
+});
+
+test("redactEvents: a text mutation on known plain text is left as it is", () => {
+  const { redactEvents } = load();
+  const knownTags = new Map();
+  redactEvents(styleSnapshot({ _cssText: ".t0{color:red}" }, [{ type: 3, textContent: "", id: 3 }]), knownTags);
+  const text = "Sensor data: 5, see https://x.test/a?b=1";
+  const events = textMutation(5, text);
+  redactEvents(events, knownTags);
+  assert.equal(events[0].data.texts[0].value, text);
+});
+
+test("redactEvents: an adopted stylesheet's rules are scrubbed as CSS", () => {
+  const { redactEvents } = load();
+  const events = [{ type: 3, data: { source: 15, id: 1, styleIds: [1], styles: [{ styleId: 1, rules: [
+    { rule: ".a{background:url(data:text/plain,SECRETADOPT1)}", index: 0 },
+    { rule: ".q{background:url(https://h.test/i.png?token=SECRETADOPTQ1)}", index: 1 },
+  ] }] } }];
+  redactEvents(events, new Map());
+  assert.deepEqual(events[0].data.styles[0].rules.map((r) => r.rule), [".a{background:url(data:[28 chars])}", ".q{background:url(https://h.test/i.png?…"]);
 });
 
 test("redactEvents returns the same array it was given, for convenient chaining", () => {
