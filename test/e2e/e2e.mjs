@@ -16,6 +16,7 @@ import assert from "node:assert/strict";
 import { spawn, execSync } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
+import os from "node:os";
 import path from "node:path";
 // test/e2e/ has no node_modules of its own (only host/ vendors the MCP SDK),
 // so the client SDK is imported by relative path into host/node_modules
@@ -129,13 +130,26 @@ describe("end-to-end: real extension in an isolated headless Chrome", { skip: sk
         }
       }
     });
-    const send = (method, params = {}) =>
+    // sessionId is only needed for a flattened Target.attachToTarget session
+    // (step 10's options-page target); every other caller omits it.
+    const send = (method, params = {}, sessionId) =>
       new Promise((resolve, reject) => {
         const id = ++seq;
         pending.set(id, { resolve, reject });
-        pipeWrite.write(JSON.stringify({ id, method, params }) + "\0");
+        pipeWrite.write(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }) + "\0");
       });
     return { send };
+  }
+
+  // Runs `expression` in a specific CDP-attached page (step 10's options-page
+  // target), via the browser-level pipe `send` and that page's flattened
+  // sessionId. Throws the page's own exception message instead of swallowing it.
+  async function evalInPage(cdpSend, sessionId, expression, { awaitPromise = false } = {}) {
+    const r = await cdpSend("Runtime.evaluate", { expression, returnByValue: true, awaitPromise }, sessionId);
+    if (r.exceptionDetails) {
+      throw new Error(r.exceptionDetails.exception?.description || r.exceptionDetails.text || JSON.stringify(r.exceptionDetails));
+    }
+    return r.result.value;
   }
 
   // --- local HTTP test pages ----------------------------------------------
@@ -163,6 +177,13 @@ document.getElementById('file-input').addEventListener('change', function (e) {
 </script>
 </body></html>`;
 
+  // Step 10 (audit mode): the query carries a token that must never reach
+  // stored audit data, and the input is where the typed secret lands.
+  const AUDIT_HTML = `<!doctype html><html><head><title>OCIC E2E Audit</title></head><body>
+<h1>Audit</h1>
+<input type="text" id="secret-input" autofocus>
+</body></html>`;
+
   function startTestServer() {
     return new Promise((resolve) => {
       const server = http.createServer((req, res) => {
@@ -179,6 +200,8 @@ document.getElementById('file-input').addEventListener('change', function (e) {
           reply(res, FORM_HTML);
         } else if (u.pathname === "/upload") {
           reply(res, UPLOAD_HTML);
+        } else if (u.pathname === "/audit") {
+          reply(res, AUDIT_HTML);
         } else {
           reply(res, HOME_HTML);
         }
@@ -195,7 +218,7 @@ document.getElementById('file-input').addEventListener('change', function (e) {
   // --- shared state, built up in before() ----------------------------------
 
   let tempHome, profile, testServer, base, chromeProc, mcpClient, mcpTransport;
-  let extensionId, nativeHostPid, tabId;
+  let extensionId, nativeHostPid, tabId, cdpSend; // cdpSend: step 10 reuses the browser-level CDP pipe
   let setupError = null; // set only for the documented "loadUnpacked impossible" fallback
 
   before(async () => {
@@ -225,13 +248,13 @@ document.getElementById('file-input').addEventListener('change', function (e) {
     chromeProc.stdio[2].on("data", (c) => {
       chromeStderr += c.toString("utf8");
     });
-    const send = makePipeTransport(chromeProc.stdio[3], chromeProc.stdio[4]).send;
+    cdpSend = makePipeTransport(chromeProc.stdio[3], chromeProc.stdio[4]).send;
 
     await sleep(500); // let the CDP pipe come up before the first command
-    await send("Browser.getVersion");
+    await cdpSend("Browser.getVersion");
 
     try {
-      const result = await send("Extensions.loadUnpacked", { path: EXTENSION_DIR });
+      const result = await cdpSend("Extensions.loadUnpacked", { path: EXTENSION_DIR });
       extensionId = result.id;
     } catch (err) {
       setupError =
@@ -533,5 +556,89 @@ document.getElementById('file-input').addEventListener('change', function (e) {
     // resettle) — so "not replayed" holds structurally, not just by luck.
     const after9 = lastLogEvent(logPath, "start");
     assert.ok(after9 && after9.pid !== killPid, `expected a new native-host pid after the kill, still saw ${killPid}`);
+  });
+
+  it("10. audit mode: session appears in the options page with a redacted action list", { timeout: 30000 }, async (t) => {
+    if (setupError) return t.skip(setupError);
+
+    const TOKEN_TYPED = "E2ESECRETTYPED";
+    const TOKEN_QUERY = "E2ESECRETQ";
+    const realDownloads = path.join(os.homedir(), "Downloads");
+    const listAuditFiles = () =>
+      fs.existsSync(realDownloads)
+        ? new Set(fs.readdirSync(realDownloads).filter((f) => /^audit-session-.*\.json$/.test(f)))
+        : new Set();
+    const auditFilesBefore = listAuditFiles();
+
+    // Deny downloads for the whole browser before the options page is even
+    // opened (per the brief): an export attempt anywhere below must not be
+    // able to write into any real folder either.
+    await cdpSend("Browser.setDownloadBehavior", { behavior: "deny" });
+
+    // The harness drives Chrome directly for this one page: the agent tools
+    // have no way to open an extension's own options page.
+    const { targetId } = await cdpSend("Target.createTarget", { url: `chrome-extension://${extensionId}/options.html` });
+    const { sessionId } = await cdpSend("Target.attachToTarget", { targetId, flatten: true });
+    await cdpSend("Page.enable", {}, sessionId);
+    await cdpSend("Runtime.enable", {}, sessionId);
+    const pEval = (expression, opts) => evalInPage(cdpSend, sessionId, expression, opts);
+
+    await waitFor(() => pEval("document.getElementById('audit-enabled') !== null"), { timeoutMs: 10000, intervalMs: 200 });
+
+    // "Prefer the real checkbox": a real .click() toggles it and fires the
+    // page's own "change" listener, which is what actually persists the setting
+    // (chrome.storage.local audit: { enabled: true, retentionDays: 7 }, 7 being
+    // the <select>'s own default option).
+    await pEval("document.getElementById('audit-enabled').click()");
+    await waitFor(
+      async () => {
+        const stored = await pEval("chrome.storage.local.get('audit').then(r => JSON.stringify(r.audit || null))", { awaitPromise: true });
+        return stored && stored.includes('"enabled":true') ? stored : null;
+      },
+      { timeoutMs: 10000, intervalMs: 200 },
+    );
+
+    // Through the normal MCP path: three real actions on the MCP tab, one
+    // carrying a secret in the URL query, one typing a secret.
+    await mcpClient.callTool({ name: "navigate", arguments: { url: `${base}/audit?token=${TOKEN_QUERY}`, tabId } });
+    await mcpClient.callTool({ name: "computer", arguments: { action: "type", text: TOKEN_TYPED, tabId } });
+    await mcpClient.callTool({ name: "computer", arguments: { action: "screenshot", tabId } });
+
+    // renderSessions() only runs at load, so the session just created above
+    // needs a reload to show up in the table.
+    await cdpSend("Page.reload", {}, sessionId);
+    await waitFor(() => pEval("document.getElementById('audit-enabled') !== null"), { timeoutMs: 10000, intervalMs: 200 });
+
+    const expectedLabel = path.basename(WORKTREE);
+    await waitFor(() => pEval("document.querySelector('#sessions-body button') !== null"), { timeoutMs: 10000, intervalMs: 300 });
+    const rowLabel = await pEval("document.querySelector('#sessions-body button').textContent");
+    assert.equal(rowLabel, expectedLabel, `expected the session row's label to be the client's label`);
+
+    // Open the new session through the real UI: click its label button.
+    await pEval("document.querySelector('#sessions-body button').click()");
+    await waitFor(() => pEval("document.getElementById('session-detail').hidden === false"), { timeoutMs: 10000, intervalMs: 200 });
+
+    // Read the store the same way the page itself just did (showSessionDetail
+    // sets this exact module-level variable from AuditStore.getSession(id))
+    // rather than re-deriving the session id ourselves.
+    const sessionJson = await pEval("JSON.stringify(currentSession)");
+    const full = JSON.parse(sessionJson);
+    assert.ok(full && full.session, `expected currentSession to be populated: ${sessionJson}`);
+    assert.ok(full.actions.some((a) => a.tool === "navigate"), `expected a navigate action: ${sessionJson}`);
+    assert.ok(
+      full.actions.some((a) => a.summary === `type [${TOKEN_TYPED.length} chars]`),
+      `expected a "type [${TOKEN_TYPED.length} chars]" summary: ${sessionJson}`,
+    );
+    assert.ok(full.actions.some((a) => a.summary === "screenshot"), `expected a screenshot action: ${sessionJson}`);
+
+    // No stored action or event contains either secret.
+    assert.ok(!sessionJson.includes(TOKEN_TYPED), `stored audit data must never contain the typed secret: ${sessionJson}`);
+    assert.ok(!sessionJson.includes(TOKEN_QUERY), `stored audit data must never contain the URL token: ${sessionJson}`);
+
+    const hasPlayer = await pEval("document.getElementById('player-container').children.length > 0");
+    assert.ok(hasPlayer, "expected the replay player to be mounted in #player-container");
+
+    const newFiles = [...listAuditFiles()].filter((f) => !auditFilesBefore.has(f));
+    assert.deepEqual(newFiles, [], `expected no new audit-session-*.json in ${realDownloads}, found: ${newFiles.join(", ")}`);
   });
 });
