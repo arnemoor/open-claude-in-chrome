@@ -30,7 +30,7 @@ function td(text) {
 }
 
 // The label cell holds a real <button>, not just a click handler on the <tr>,
-// so keyboard users can reach and open a session too (M8).
+// so keyboard users can reach and open a session too.
 function labelCell(session) {
   const cell = document.createElement("td");
   const button = document.createElement("button");
@@ -68,7 +68,7 @@ function clearPlayerNotice() {
 // before AuditStore is opened), and each control's loaded value is applied
 // only if the user hasn't already changed that same control — so a click
 // during the read is written immediately and is never reverted once the read
-// resolves (M3).
+// resolves.
 
 async function saveSettings() {
   await chrome.storage.local.set({
@@ -88,19 +88,26 @@ async function initSettings() {
   if (!userChangedRetention) {
     // A stored value the select doesn't offer would otherwise leave the select
     // on some other option, and the next save would silently write that instead
-    // of the value actually shown (M7).
+    // of the value actually shown.
     retentionSelect.value = String(VALID_RETENTIONS.includes(retentionDays) ? retentionDays : DEFAULT_SETTINGS.retentionDays);
   }
+  // N6: a change to ONE control before this read resolved was saved together
+  // with the OTHER control's still-unset markup default (the switch off, or
+  // retention "1 day") — clobbering it in storage even though the DOM above
+  // now shows the right value for it. Now that both controls hold their real
+  // values (the user's own change, and the stored value just applied for the
+  // one they didn't touch), save once more so storage matches what is shown.
+  if (userChangedEnabled || userChangedRetention) await saveSettings();
 }
 
 // --- Sessions table ---
 
 async function renderSessions() {
-  const sessions = await AuditStore.listSessions(); // already newest first
-  const rows = await Promise.all(sessions.map(async (session) => {
-    const { actions, eventsByTab } = await AuditStore.getSession(session.id);
-    return { session, actionCount: actions.length, tabCount: Object.keys(eventsByTab).length };
-  }));
+  // Important 1: a per-row getSession() would load every session's full
+  // recording (tens of MB of rrweb events each) just to count actions and
+  // tabs — listSessionSummaries gets both without ever touching an event
+  // row's own events payload.
+  const rows = await AuditStore.listSessionSummaries(); // already newest first
 
   sessionsBody.textContent = "";
   sessionsEmpty.hidden = rows.length > 0;
@@ -113,7 +120,7 @@ async function renderSessions() {
     );
     // The row looks clickable (options.css), so make the rest of it act that
     // way too — except where the click already landed on the label's own
-    // button, which handles it itself (N5).
+    // button, which handles it itself.
     tr.addEventListener("click", (event) => {
       if (event.target.closest("button")) return;
       showSessionDetail(session.id);
@@ -128,7 +135,7 @@ async function showSessionDetail(id) {
   clearNotice();
   // Hide any previously-shown detail immediately, and unbind Delete/Export,
   // so neither can act on a stale session while this one loads — whether the
-  // load succeeds, finds nothing, or rejects (I2, N3).
+  // load succeeds, finds nothing, or rejects.
   detailSection.hidden = true;
   currentSession = null;
   deleteButton.onclick = null;
@@ -190,27 +197,73 @@ function destroyPlayer() {
   playerContainer.textContent = "";
 }
 
+// Item 5: these still open a real network connection to their recorded href
+// when the player rebuilds them into the replay DOM — unlike a stylesheet,
+// image or background fetch, the page CSP does not govern them.
+const BLOCKED_LINK_RELS = new Set(["preconnect", "dns-prefetch", "prefetch", "preload", "prerender"]);
+
+function isBlockedLinkNode(node) {
+  if (!node || node.type !== 2 || typeof node.tagName !== "string" || node.tagName.toLowerCase() !== "link") return false;
+  const rel = node.attributes && typeof node.attributes.rel === "string" ? node.attributes.rel : "";
+  return rel.toLowerCase().split(/\s+/).some((token) => BLOCKED_LINK_RELS.has(token));
+}
+
+// Removes blocked <link> nodes from a snapshot (or added) node tree in place.
+function stripBlockedLinks(node) {
+  if (!node || typeof node !== "object" || !Array.isArray(node.childNodes)) return;
+  node.childNodes = node.childNodes.filter((child) => !isBlockedLinkNode(child));
+  for (const child of node.childNodes) stripBlockedLinks(child);
+}
+
+// Strips blocked link nodes from every FullSnapshot and mutation-add in an
+// events array, in place — covers a recording stored before this fix too.
+function stripBlockedLinksFromEvents(events) {
+  for (const event of events || []) {
+    if (!event || typeof event !== "object") continue;
+    if (event.type === 2 && event.data && event.data.node) {
+      stripBlockedLinks(event.data.node);
+    } else if (event.type === 3 && event.data && event.data.source === 0) {
+      event.data.adds = (event.data.adds || []).filter((add) => !isBlockedLinkNode(add.node));
+      for (const add of event.data.adds) stripBlockedLinks(add.node);
+    }
+  }
+  return events;
+}
+
 function renderPlayer(tabId) {
   destroyPlayer();
   clearPlayerNotice();
 
   const events = tabId != null ? currentSession.eventsByTab[tabId] : undefined;
+  if (!events || events.length === 0) return;
+
+  // Item 5: age-based pruning (or a batch dropped before it was ever stored)
+  // can leave a tab's stream with no FullSnapshot of its own to replay from —
+  // covers a recording stored before store.js's own prune fix closed this for
+  // new ones, too.
+  if (!events.some((e) => e && e.type === 2)) {
+    showPlayerNotice("Replay unavailable: the start of this recording was deleted by retention.");
+    return;
+  }
+
+  stripBlockedLinksFromEvents(events);
+
   // rrweb-player also refuses fewer than 2 events (a lone Meta or FullSnapshot
   // can't be replayed), so skip constructing it below that.
-  if (!events || events.length < 2) return;
+  if (events.length < 2) return;
 
   try {
     // The vendored UMD bundle exposes window.rrwebPlayer as { Player, default
     // }, both the same class — not the class itself (see vendor/README.md).
     // Pass the container's own width so the player fits the page column
-    // instead of overflowing it with its own default width (M9).
+    // instead of overflowing it with its own default width.
     currentPlayer = new rrwebPlayer.default({
       target: playerContainer,
       props: { events, autoPlay: false, width: playerContainer.clientWidth || undefined },
     });
   } catch (err) {
     // Malformed stored events (for example a corrupted recording) must not
-    // break the rest of the detail view — the actions list stays usable (I2).
+    // break the rest of the detail view — the actions list stays usable.
     // A failed construction can still have mounted a partial .rr-player (the
     // player builds its DOM scaffold before it processes the events array),
     // so clear it instead of leaving that behind.
@@ -230,16 +283,27 @@ function seekToAction(action) {
     tabSelect.value = String(action.tabId);
     renderPlayer(action.tabId);
   }
-  if (currentPlayer) currentPlayer.goto(action.ts - tabEvents[0].timestamp);
+  // Item 4: retried batches can arrive (and be stored) out of order, so the
+  // first element isn't reliably the earliest event — seek from the true
+  // minimum timestamp instead of assuming array order. A loop, not
+  // Math.min(...tabEvents...), since a large recording's events array can
+  // exceed the engine's argument-spread limit.
+  let firstEventTs = tabEvents[0].timestamp;
+  for (const e of tabEvents) if (e.timestamp < firstEventTs) firstEventTs = e.timestamp;
+  if (currentPlayer) currentPlayer.goto(action.ts - firstEventTs);
 }
 
 // Builds a detached <a download>, clicks it, and revokes its Blob URL shortly
-// after (M5) — options.html keeps a plain, always-focusable <button> instead
-// of a live export link (N2). Each call uses its own local url/anchor, so
-// concurrent clicks can't race each other's revoke.
-function exportSession(id) {
-  if (!currentSession || !currentSession.session || currentSession.session.id !== id) return;
-  const blob = new Blob([JSON.stringify(currentSession)], { type: "application/json" });
+// after — options.html keeps a plain, always-focusable <button> instead of a
+// live export link. Each call uses its own local url/anchor, so concurrent
+// clicks can't race each other's revoke.
+async function exportSession(id) {
+  // Item 3: load a fresh copy at click time — currentSession is the copy
+  // loaded when the detail was opened, and the session can keep recording
+  // (and adding to that copy in storage) while its detail stays open.
+  const data = await AuditStore.getSession(id);
+  if (!data.session || data.session.id !== id) return;
+  const blob = new Blob([JSON.stringify(data)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
@@ -249,7 +313,13 @@ function exportSession(id) {
 }
 
 async function deleteCurrentSession(id) {
-  await AuditStore.deleteSession(id);
+  try {
+    await AuditStore.deleteSession(id);
+  } catch (err) {
+    // Item 3: a failed delete must not throw uncaught or silently do nothing.
+    showNotice("Could not delete this session.");
+    return;
+  }
   if (currentSession && currentSession.session && currentSession.session.id === id) {
     destroyPlayer();
     clearPlayerNotice();
@@ -269,12 +339,12 @@ async function auditDbExists() {
     const dbs = await indexedDB.databases();
     return dbs.some((d) => d.name === "ocic-audit"); // must match store.js's AUDIT_DB_NAME
   } catch (err) {
-    return true; // enumeration failed: fall back to opening, same as the missing-API branch (N4)
+    return true; // enumeration failed: fall back to opening, same as the missing-API branch
   }
 }
 
 async function init() {
-  await initSettings(); // wire the switch and select before anything that can block or fail (M3)
+  await initSettings(); // wire the switch and select before anything that can block or fail
   if (await auditDbExists()) {
     try {
       await AuditStore.open();
@@ -284,8 +354,8 @@ async function init() {
       sessionsEmpty.hidden = false;
     }
   } else {
-    // Never create the database just by visiting the page (M4) — a plain
-    // visit with audit never enabled has nothing recorded to show anyway.
+    // Never create the database just by visiting the page — a plain visit
+    // with audit never enabled has nothing recorded to show anyway.
     sessionsEmpty.hidden = false;
   }
 }
