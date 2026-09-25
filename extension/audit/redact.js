@@ -33,6 +33,24 @@ const URL_TOKEN_RE = /\b[a-z][a-z0-9+.-]{0,31}:\/\/[^\s"<>?#]*(?:[?#][^\s"<>]*)?
 // attribute value (fail closed, fix round 4, item 3).
 const DATA_URI_RE = /\bdata:[\s\S]*/i;
 
+// Item 13: inside CSS text (a style attribute string, a style diff value, or
+// rrweb's own _cssText carrying a whole <style>/<link rel=stylesheet>), a
+// data: URI only ever appears inside a url(...) token — CSS has no other
+// syntax for embedding one. That gives the payload a real end: the matching
+// quote for a quoted url("...")/url('...'), or the closing ")" for a bare
+// url(...). Masking only that far — instead of scrubUrls' own "to the end of
+// the whole string" rule, needed because free text has no such marker — keeps
+// every CSS rule that follows the data: URI instead of losing it (a
+// Bootstrap-sized stylesheet lost 83% of its rules under the free-text rule).
+const CSS_DATA_URI_RE = /\burl\(\s*(["']?)(data:[\s\S]*?)\1\s*\)/gi;
+
+function scrubCssText(text, maxLen) {
+  if (typeof text !== "string") return text;
+  let scrubbed = text.replace(CSS_DATA_URI_RE, (m, quote, payload) => `url(${quote}data:[${payload.length} chars]${quote})`);
+  scrubbed = scrubbed.replace(URL_TOKEN_RE, (m) => redactUrl(m));
+  return clipTo(scrubbed, maxLen);
+}
+
 function clipTo(s, max) {
   return typeof max === "number" && s.length > max ? `${s.slice(0, max)}…` : s;
 }
@@ -50,7 +68,14 @@ function scrubUrls(text, maxLen) {
   return clipTo(scrubbed, maxLen);
 }
 
+// Item 14: a data: URL's whole payload sits in what the try block below
+// otherwise treats as non-secret path/host structure (right for a
+// directory-style URL: only its query/fragment are secret-bearing; wrong
+// for a data: one, whose payload — a recovery code, a 2FA QR-code image —
+// IS the secret). Masked the same way navigate's own data: rule does,
+// before ever reaching the URL parser below.
 function redactUrl(url) {
+  if (typeof url === "string" && /^\s*data:/i.test(url)) return `data:[${url.length} chars]`;
   try {
     const u = new URL(url);
     const hadSearch = u.search !== "";
@@ -422,20 +447,24 @@ function redactAttributes(shouldMaskValue, attributes) {
   // [value, priority] array for an !important one, or false for a removed
   // property.
   if (typeof attributes.style === "string") {
-    attributes.style = scrubUrls(attributes.style);
+    attributes.style = scrubCssText(attributes.style);
   } else if (attributes.style && typeof attributes.style === "object") {
     for (const [prop, value] of Object.entries(attributes.style)) {
       if (typeof value === "string") {
-        attributes.style[prop] = scrubUrls(value);
+        attributes.style[prop] = scrubCssText(value);
       } else if (Array.isArray(value)) {
         for (let k = 0; k < value.length; k++) {
-          if (typeof value[k] === "string") value[k] = scrubUrls(value[k]);
+          if (typeof value[k] === "string") value[k] = scrubCssText(value[k]);
         }
       }
     }
   }
+  // Item 13: rrweb carries a <style> or an inlined <link rel=stylesheet>'s
+  // whole text as _cssText — CSS text, not free text, so it gets the same
+  // bounded data: handling as style above, not scrubUrls' mask-to-the-end.
+  if (typeof attributes._cssText === "string") attributes._cssText = scrubCssText(attributes._cssText);
   for (const [name, value] of Object.entries(attributes)) {
-    if (name === "value" || name === "srcset" || name === "style" || URL_ATTRS.includes(name)) continue; // already handled above
+    if (name === "value" || name === "srcset" || name === "style" || name === "_cssText" || URL_ATTRS.includes(name)) continue; // already handled above
     if (typeof value === "string") attributes[name] = scrubUrls(value);
   }
 }

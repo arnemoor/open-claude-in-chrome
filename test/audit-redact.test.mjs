@@ -168,6 +168,22 @@ test("redactUrl reports unparsable input without echoing it", () => {
   assert.equal(redactUrl(undefined), "[unparseable url]");
 });
 
+// Item 14: a data: URL's whole payload sits in what this function otherwise
+// treats as non-secret path/host structure (right for a directory-style URL,
+// wrong here — the payload itself is the secret: a recovery-code link, a
+// 2FA QR-code image). Masked the same way navigate's own data: rule does.
+test("redactUrl masks a data: URL's whole payload, the same way navigate's own data: rule does", () => {
+  const { redactUrl } = load();
+  const url = "data:text/plain,RECOVERY-CODE-HREF1";
+  assert.equal(redactUrl(url), `data:[${url.length} chars]`);
+});
+
+test("redactUrl recognizes a data: URL case-insensitively and after leading whitespace", () => {
+  const { redactUrl } = load();
+  const url = "  DATA:text/plain,RECOVERY-CODE-HREF2";
+  assert.equal(redactUrl(url), `data:[${url.length} chars]`);
+});
+
 // --- form_input ---
 
 test("form_input never leaks a string value, e.g. a credit card number", () => {
@@ -518,7 +534,12 @@ test("scrubUrls: a ' inside a query or fragment does not end the URL token", () 
   assert.equal(scrubUrls("https://x.test/p#state=a'APOSF1"), "https://x.test/p#…");
 });
 
-test("scrubUrls: a ' still ends a URL before any query, e.g. a URL in single quotes", () => {
+// Item 15: with item 7's fix, a "'" no longer ends a URL token at all — not
+// even this URL's own wrapping quote. The output is still unaffected: a bare
+// URL (no query) redacts to itself, so absorbing one extra "'" into the match
+// changes nothing visible. Kept as a regression guard, description corrected
+// (it used to claim the apostrophe itself was the reason the output held).
+test("scrubUrls: a URL wrapped in single quotes is unaffected, even though the closing quote is now part of the matched token", () => {
   const { scrubUrls } = load();
   assert.equal(scrubUrls("open 'https://x.test/p' now"), "open 'https://x.test/p' now");
 });
@@ -717,6 +738,65 @@ test("redactEvents: an !important style diff ([value, priority]) is scrubbed, ke
   assert.deepEqual(events[0].data.attributes[0].attributes.style, { "background-image": ['url("https://x.test/i.png?…")', "important"], color: false });
 });
 
+// Item 13: rrweb carries a <style>/<link rel=stylesheet>'s whole text as
+// _cssText, and the same data: payload can appear inline in a style string
+// or diff value too. scrubUrls' own mask-to-the-end rule (needed for free
+// text, which has no reliable end marker) loses every CSS rule after the
+// first data: URI when applied to CSS text — Bootstrap kept only 17% of its
+// rules this way. Inside CSS, a url(...) token bounds the payload instead:
+// the matching quote for a quoted url(), or the closing ")" for a bare one.
+test("item 13: _cssText masks a data: URI only up to its own url(...) token, keeping every rule after it", () => {
+  const { redactEvents } = load();
+  const css = ".icon-before { color: red; } .icon { background: url(data:image/svg+xml;base64,AAAABBBBCCCCSECRET==); } .navbar-after { display: flex; }";
+  const events = [{ type: 2, data: { node: { type: 0, id: 1, childNodes: [{ type: 2, tagName: "style", attributes: { _cssText: css }, id: 2, childNodes: [] }] } } }];
+  redactEvents(events, new Map());
+  const scrubbed = events[0].data.node.childNodes[0].attributes._cssText;
+  assert.doesNotMatch(scrubbed, /AAAABBBBCCCCSECRET/);
+  assert.match(scrubbed, /\.icon-before \{ color: red; \}/);
+  assert.match(scrubbed, /\.navbar-after \{ display: flex; \}/, "a rule after the data: URI must survive, not be swallowed by a mask-to-the-end rule");
+});
+
+test("item 13: a quoted data: URI in _cssText is masked up to its closing quote, not the end of the stylesheet", () => {
+  const { redactEvents } = load();
+  const css = '.a { background: url("data:image/svg+xml;base64,QUOTEDSECRET1=="); } .b { color: blue; }';
+  const events = [{ type: 2, data: { node: { type: 0, id: 1, childNodes: [{ type: 2, tagName: "style", attributes: { _cssText: css }, id: 2, childNodes: [] }] } } }];
+  redactEvents(events, new Map());
+  const scrubbed = events[0].data.node.childNodes[0].attributes._cssText;
+  assert.doesNotMatch(scrubbed, /QUOTEDSECRET1/);
+  assert.match(scrubbed, /\.b \{ color: blue; \}/);
+});
+
+test("item 13: a style attribute string masks a data: URI only up to its own url(...) token", () => {
+  const { redactEvents } = load();
+  const style = "background: url(data:image/png;base64,STYLESECRET1==); border: 1px solid red;";
+  const events = [{ type: 2, data: { node: { type: 0, id: 1, childNodes: [{ type: 2, tagName: "div", attributes: { style }, id: 2, childNodes: [] }] } } }];
+  redactEvents(events, new Map());
+  const scrubbed = events[0].data.node.childNodes[0].attributes.style;
+  assert.doesNotMatch(scrubbed, /STYLESECRET1/);
+  assert.match(scrubbed, /border: 1px solid red;$/);
+});
+
+test("item 13: a style diff object's data: URI is masked only up to its own url(...) token, keeping the closing paren", () => {
+  const { redactEvents } = load();
+  const events = [{ type: 3, data: { source: 0, texts: [], removes: [], adds: [], attributes: [{ id: 6, attributes: { style: { "background-image": "url(data:image/png;base64,DIFFSECRET1==)", color: "blue" } } }] } }];
+  redactEvents(events, new Map());
+  const style = events[0].data.attributes[0].attributes.style;
+  assert.doesNotMatch(JSON.stringify(style), /DIFFSECRET1/);
+  assert.match(style["background-image"], /^url\(data:\[\d+ chars\]\)$/, "the url(...) token's own closing paren must survive, not be swallowed by a mask-to-the-end rule");
+  assert.equal(style.color, "blue");
+});
+
+// A real https:// URL (not a data: one) inside CSS still gets the ordinary
+// query/fragment redaction, in both the CSS-aware and generic paths.
+test("item 13: a plain https: URL inside _cssText still has its query redacted", () => {
+  const { redactEvents } = load();
+  const css = ".a { background: url(https://cdn.x.test/font.woff?token=CSSFONT1); }";
+  const events = [{ type: 2, data: { node: { type: 0, id: 1, childNodes: [{ type: 2, tagName: "style", attributes: { _cssText: css }, id: 2, childNodes: [] }] } } }];
+  redactEvents(events, new Map());
+  const scrubbed = events[0].data.node.childNodes[0].attributes._cssText;
+  assert.doesNotMatch(scrubbed, /token=CSSFONT1/);
+});
+
 // Fix round 4, item 1: the quote-in-query regression as the walker meets it,
 // on a data-* attribute in a snapshot and in a later setAttribute mutation.
 test("redactEvents: a URL with a ' in its query is scrubbed from a data-x attribute in a snapshot and in a mutation", () => {
@@ -848,6 +928,40 @@ test("I2: a Meta event's href is redacted of its query and fragment", () => {
   redactEvents(events, new Map());
   assert.doesNotMatch(JSON.stringify(events), /SECRETQ|SECRETF/);
   assert.equal(events[0].data.href, "http://127.0.0.1:9/a?…#…");
+});
+
+// Item 14: a data: Meta href (a data: page's own address) is masked, not left
+// raw the way redactUrl otherwise left every data: URL before this fix.
+test("item 14: a Meta event's data: href is masked, not left raw", () => {
+  const { redactEvents } = load();
+  const events = [{ type: 4, data: { href: "data:text/html,<h1>2FA-SECRET-META1</h1>" } }];
+  redactEvents(events, new Map());
+  assert.doesNotMatch(JSON.stringify(events), /2FA-SECRET-META1/);
+});
+
+// Item 14: a "download your recovery codes" href, or a 2FA QR-code image
+// src, is a realistic secret carried as a data: URL in exactly these
+// URL_ATTRS — redactUrl's own fix (above) must reach here too.
+test("item 14: an href with a data: payload is masked, not left raw", () => {
+  const { redactEvents } = load();
+  const events = [{
+    type: 2,
+    data: { node: { type: 0, id: 1, childNodes: [{ type: 2, tagName: "a", attributes: { href: "data:text/plain,RECOVERY-CODE-HREF2", download: "codes.txt" }, id: 2, childNodes: [] }] } },
+  }];
+  redactEvents(events, new Map());
+  const attrs = events[0].data.node.childNodes[0].attributes;
+  assert.doesNotMatch(attrs.href, /RECOVERY-CODE-HREF2/);
+  assert.equal(attrs.download, "codes.txt", "an unrelated attribute is untouched");
+});
+
+test("item 14: a data: src (a 2FA QR-code image, for example) is masked, not left raw", () => {
+  const { redactEvents } = load();
+  const events = [{
+    type: 2,
+    data: { node: { type: 0, id: 1, childNodes: [{ type: 2, tagName: "img", attributes: { src: "data:image/png;base64,QRCODESECRET1==" }, id: 2, childNodes: [] }] } },
+  }];
+  redactEvents(events, new Map());
+  assert.doesNotMatch(JSON.stringify(events), /QRCODESECRET1/);
 });
 
 test("I2: href/src/action/formaction/poster attributes are redacted in a full snapshot", () => {
