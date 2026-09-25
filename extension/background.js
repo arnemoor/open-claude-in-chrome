@@ -20,6 +20,8 @@ const networkRequests = new Map(); // tabId -> [{url, method, status, type, time
 const screenshotStore = new Map(); // imageId -> base64
 const openDialogs = new Map(); // tabId -> message, while a JS dialog (alert/confirm/prompt/beforeunload) blocks the page
 const pendingCdpRejects = new Map(); // tabId -> Set<reject>, one entry per in-flight rawCdp call on that tab
+const releasedTabs = new Set(); // tabIds that left the MCP group: no CDP command reaches them until they are back
+let groupRecoverySettled = false; // set once the startup recovery has restored tabGroupId, or found nothing to restore
 
 // Thrown to reject every pending rawCdp call on a tab the instant its dialog opens, instead of
 // letting each one run out its own CDP_TIMEOUT_MS: a dialog freezes the renderer, so an
@@ -30,6 +32,9 @@ class DialogOpenedDuringCall extends Error {
   constructor(message) {
     super(`A JavaScript dialog opened during this call ("${message}").`);
     this.dialogMessage = message;
+    // The message is page text that the call's own input can produce (a page that alerts the
+    // typed code), so audit stores this fixed text instead of it.
+    Audit.markInputFree(this, "A JavaScript dialog opened during this call.");
   }
 }
 
@@ -109,7 +114,13 @@ function firstDelivery(id) {
 }
 
 // --- Tab group management ---
+// The id of the group this extension created, kept in session storage: that survives a service
+// worker restart, but not a browser restart or an extension reload, after which group ids no
+// longer mean the same group.
+const TAB_GROUP_ID_KEY = "mcpTabGroupId";
+
 async function ensureTabGroup(createIfEmpty) {
+  await tabGroupRecovery;
   // Check if our tab group still exists
   if (tabGroupId !== null) {
     try {
@@ -135,6 +146,10 @@ async function ensureTabGroup(createIfEmpty) {
   await chrome.tabGroups.update(groupId, { title: "MCP", color: "blue" });
   tabGroupId = groupId;
   tabGroupTabs = new Set([tab.id]);
+  // Chrome can report the tab's new group before tabGroupId holds its id, and that event
+  // released the tab as one that joined some other group.
+  releasedTabs.delete(tab.id);
+  await chrome.storage.session.set({ [TAB_GROUP_ID_KEY]: groupId });
 }
 
 function formatTabContext(tabs) {
@@ -167,7 +182,7 @@ function formatTabContext(tabs) {
 // Single check used by every tool handler that takes a tabId: not in the MCP group, showing a
 // local file or this extension's own page (also reached via back/forward, or a tab dragged into
 // the group by hand — see isBlockedUrl below), or blocked behind an open JS dialog. Returns null
-// when tabId is fine to use, or the exact refusal text to show the agent otherwise.
+// when tabId is fine to use, or the refusal reply to send otherwise (see inputFreeError).
 //   allowBlockedUrl: skip the file:/own-origin check (tabs_close_mcp only — closing such a tab
 //     doesn't read or act on it, so it's harmless, and it's the agent's only way to clean one up).
 //   allowDialog: skip the open-dialog check, for tools that don't need the page to be responsive
@@ -175,39 +190,31 @@ function formatTabContext(tabs) {
 //     resize_window — window.get/update are browser-level and readViewport already degrades to
 //     null within its own short budget instead of hanging).
 async function tabAccessError(tabId, { allowBlockedUrl = false, allowDialog = false } = {}) {
-  // Always check live state — in-memory tabGroupTabs can be stale after service worker restart
+  await tabGroupRecovery;
   let tab;
   try {
     tab = await chrome.tabs.get(tabId);
   } catch {
-    return `Tab ${tabId} is not in the MCP group.`;
+    return inputFreeError(`Tab ${tabId} is not in the MCP group.`);
   }
 
-  let inGroup;
-  if (tab.groupId !== -1) {
-    // Recover tabGroupId if we lost it (service worker restart)
-    if (tabGroupId === null) {
-      try {
-        const group = await chrome.tabGroups.get(tab.groupId);
-        if (group.title === "MCP") {
-          tabGroupId = group.id;
-          const groupTabs = await chrome.tabs.query({ groupId: tabGroupId });
-          tabGroupTabs = new Set(groupTabs.map((t) => t.id));
-        }
-      } catch {}
-    }
-    inGroup = tab.groupId === tabGroupId;
-  } else {
-    inGroup = tabGroupTabs.has(tabId);
-  }
-  if (!inGroup) return `Tab ${tabId} is not in the MCP group.`;
+  // Only the tab's live groupId counts, never the tabGroupTabs cache: a tab the user dragged out
+  // of the group, or popped into its own window, has groupId -1 at once, before any event has
+  // updated the cache. A released tab stays refused until Chrome reports it back in the group,
+  // also when this read of its groupId was answered just before the leave event arrived.
+  if (tab.groupId !== tabGroupId || releasedTabs.has(tabId)) return inputFreeError(`Tab ${tabId} is not in the MCP group.`);
 
   if (!allowBlockedUrl && isBlockedUrl(tab.url, chrome.runtime.id)) {
-    return `Tab ${tabId} shows a local file or this extension's own page, which the agent cannot use.`;
+    return inputFreeError(`Tab ${tabId} shows a local file or this extension's own page, which the agent cannot use.`);
   }
 
   if (!allowDialog && openDialogs.has(tabId)) {
-    return `A JavaScript dialog is open on this tab ("${openDialogs.get(tabId)}"). It blocks the page until the user closes it.`;
+    // Audit stores the refusal without the dialog's message, for the same reason as
+    // DialogOpenedDuringCall.
+    return inputFreeError(
+      `A JavaScript dialog is open on this tab ("${openDialogs.get(tabId)}"). It blocks the page until the user closes it.`,
+      "A JavaScript dialog is open on this tab. It blocks the page until the user closes it.",
+    );
   }
 
   return null;
@@ -221,7 +228,7 @@ const attaching = new Map(); // tabId -> in-flight attach promise, shared by par
 function rawCdp(tabId, method, params = {}, timeoutMs = CDP_TIMEOUT_MS) {
   let timer;
   const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`CDP ${method} timed out after ${timeoutMs / 1000}s`)), timeoutMs);
+    timer = setTimeout(() => reject(Audit.markInputFree(new Error(`CDP ${method} timed out after ${timeoutMs / 1000}s`))), timeoutMs);
   });
   // Raced alongside the command itself: if a dialog opens on this tab before it settles, reject
   // right away instead of waiting out timeoutMs for what a dialog has already frozen.
@@ -239,6 +246,8 @@ function rawCdp(tabId, method, params = {}, timeoutMs = CDP_TIMEOUT_MS) {
 }
 
 async function ensureAttached(tabId) {
+  // A call still in flight when its tab left the MCP group sends that tab nothing more.
+  if (releasedTabs.has(tabId)) throw Audit.markInputFree(new Error(`Tab ${tabId} is not in the MCP group.`));
   if (attachedTabs.has(tabId)) return;
   let pending = attaching.get(tabId);
   if (!pending) {
@@ -261,7 +270,10 @@ async function ensureAttached(tabId) {
       // joins mid-flight (below) never runs a command before it, and a failed pin never leaves
       // attachedTabs pointing at a tab whose debugger session we just tore down.
       attachedTabs.set(tabId, { enabledDomains: new Set(["Page"]) });
-    })().finally(() => {
+    })().catch((err) => {
+      // None of these commands carries tool input, so audit may store the failure text.
+      throw Audit.markInputFree(err);
+    }).finally(() => {
       // Guard against deleting a NEWER attempt: if the tab got detached and re-attached while
       // this attempt was still in flight, `attaching` may already hold someone else's promise.
       if (attaching.get(tabId) === pending) attaching.delete(tabId);
@@ -306,19 +318,86 @@ async function readViewport(tabId, timeoutMs = 2000) {
   }
 }
 
-// Clean up when tab is closed
-chrome.tabs.onRemoved.addListener((tabId) => {
+// Drops everything held for a tab the tools may no longer use (it closed, or it left the MCP
+// group): its debugger session, console and network buffers, dialog state and audit owner. A
+// debugger attach still in flight is detached once it completes, unless the tab is back in the
+// group by then.
+function forgetTab(tabId) {
   tabGroupTabs.delete(tabId);
   if (attachedTabs.has(tabId)) {
-    try { chrome.debugger.detach({ tabId }); } catch {}
     attachedTabs.delete(tabId);
+    chrome.debugger.detach({ tabId }).catch(() => {});
   }
+  const pendingAttach = attaching.get(tabId);
   attaching.delete(tabId);
+  if (pendingAttach) pendingAttach.then(() => { if (releasedTabs.has(tabId)) forgetTab(tabId); }, () => {});
   consoleMessages.delete(tabId);
   networkRequests.delete(tabId);
   openDialogs.delete(tabId);
   pendingCdpRejects.delete(tabId);
+  Audit.dropOwner(tabId);
+}
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  releasedTabs.delete(tabId);
+  forgetTab(tabId);
 });
+
+// Group events are read against tabGroupId, which the startup recovery restores: before it has
+// settled, the rejoin event that woke a stopped worker would read as a leave. Events in that
+// window run once it has, in their order. Later ones run at once.
+function whenGroupKnown(handle) {
+  if (groupRecoverySettled) handle();
+  else tabGroupRecovery.then(handle);
+}
+
+// A tab that leaves the MCP group (dragged out, popped into its own window, moved to another
+// group, or ungrouped) is released at once, on top of tabAccessError refusing it by its live
+// groupId. Any other groupId counts, not only tabs in tabGroupTabs: another call's
+// tabs_context_mcp can refresh that cache before this event arrives. tabs.onRemoved keeps
+// releasedTabs bounded by the open tabs. A tab dragged into the group is tracked like one
+// created there.
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (!("groupId" in changeInfo)) return;
+  whenGroupKnown(() => {
+    if (tabGroupId !== null && changeInfo.groupId === tabGroupId) {
+      releasedTabs.delete(tabId);
+      tabGroupTabs.add(tabId);
+      return;
+    }
+    releasedTabs.add(tabId);
+    forgetTab(tabId);
+  });
+});
+
+// The MCP group is gone: its last tab closed or left it, or the user ungrouped it. Its tabs are
+// released by their own events above. Forgetting its id, the stored one too, makes the next
+// tabs_context_mcp or tabs_create_mcp create a new group.
+let removedGroupId = null;
+chrome.tabGroups.onRemoved.addListener((group) => whenGroupKnown(() => {
+  if (group.id !== tabGroupId) return;
+  tabGroupId = null;
+  removedGroupId = group.id;
+  chrome.storage.session.remove(TAB_GROUP_ID_KEY).catch(() => {});
+}));
+
+// Moving a group to another window is reported as its removal and a creation with the same id,
+// and the group keeps its tabs. That id is re-adopted: it is the same group, not one found by
+// its title. The group's tabs are un-released, because their leave and join events can come
+// before this one.
+chrome.tabGroups.onCreated.addListener((group) => whenGroupKnown(() => {
+  if (group.id !== removedGroupId || tabGroupId !== null) return;
+  removedGroupId = null;
+  tabGroupId = group.id;
+  chrome.storage.session.set({ [TAB_GROUP_ID_KEY]: group.id }).catch(() => {});
+  chrome.tabs.query({ groupId: group.id }).then((tabs) => {
+    if (tabGroupId !== group.id) return;
+    for (const t of tabs) {
+      releasedTabs.delete(t.id);
+      tabGroupTabs.add(t.id);
+    }
+  }, () => {});
+}));
 
 // Handle user dismissing debugger bar
 chrome.debugger.onDetach.addListener((source, reason) => {
@@ -611,7 +690,8 @@ async function sendContentMessage(tabId, message, timeoutMs = CONTENT_MESSAGE_TI
   const timeout = new Promise((_, reject) => {
     timer = setTimeout(() => reject(new Error(`The page did not respond within ${timeoutMs / 1000} s (it may be busy or showing a dialog). The action may still complete.`)), timeoutMs);
   });
-  return Promise.race([attempt, timeout]).finally(() => clearTimeout(timer));
+  // A messaging or injection failure, or the timeout, never quotes the message it carried.
+  return Promise.race([attempt, timeout]).catch((err) => { throw Audit.markInputFree(err); }).finally(() => clearTimeout(timer));
 }
 
 // --- Screenshot helper ---
@@ -714,7 +794,8 @@ async function dispatchPointerAction(verb, coordinate, hit, scrolled, notes, run
 }
 
 // Normalizes a navigate URL, keeping explicit schemes intact instead of forcing everything
-// through the http(s) rewrite. Returns { url } on success or { error } to report to the agent.
+// through the http(s) rewrite. Returns { url } on success or { error } to report to the agent,
+// with inputFree: true when the error text quotes none of the input (see inputFreeError).
 const NAVIGATE_SCHEME_RE = /^([a-z][a-z0-9+.-]*):/i;
 const BROKEN_PROTOCOL_RE = /^[a-z]{1,5}:\/+/i;
 const KEEP_AS_IS_SCHEMES = new Set([
@@ -774,7 +855,7 @@ function normalizeNavigateUrl(input, ownExtensionId) {
   if (schemeMatch) {
     const scheme = schemeMatch[1].toLowerCase();
     if (scheme === "javascript") {
-      return { error: "javascript: URLs are not allowed. Use javascript_tool to run code." };
+      return { error: "javascript: URLs are not allowed. Use javascript_tool to run code.", inputFree: true };
     }
     if (!KEEP_AS_IS_SCHEMES.has(scheme)) {
       // Not a recognized scheme: either a broken protocol prefix (e.g. "hps://") to strip,
@@ -795,25 +876,50 @@ function normalizeNavigateUrl(input, ownExtensionId) {
 
   const inner = unwrapViewSourceOrBlob(parsed);
   if (inner === null) {
-    return { error: "Too many nested view-source:/blob: wrappers." };
+    return { error: "Too many nested view-source:/blob: wrappers.", inputFree: true };
   }
 
   // Unpacked extensions get file: access by default, so this would otherwise let the agent
   // read any local file (navigate there, then get_page_text) regardless of the upload
   // allowlist.
   if (inner.protocol === "file:") {
-    return { error: "file: URLs are blocked: the agent cannot open local files." };
+    return { error: "file: URLs are blocked: the agent cannot open local files.", inputFree: true };
   }
 
   // See isBlockedUrl above for the host-canonicalization caveat this compare relies on.
   if (inner.protocol === "chrome-extension:" && inner.hostname.toLowerCase() === ownExtensionId) {
-    return { error: "This extension's own pages cannot be opened by the agent." };
+    return { error: "This extension's own pages cannot be opened by the agent.", inputFree: true };
   }
 
   return { url };
 }
 
 // --- Tool handlers ---
+
+// A reply that reports a refusal or a failure. isError lets the MCP client, and browser_batch,
+// tell it from a success without reading its text.
+function errorResult(text) {
+  return { content: [{ type: "text", text }], isError: true };
+}
+
+// The same, for a text that holds none of the call's input: a shared refusal, or a fixed text
+// with at most arguments the audit summary shows. Only a call whose summary hides input
+// (summaryHidesInput in audit/redact.js) looks at the mark: audit stores its error text only
+// when it is marked, and "error (text withheld)" otherwise. The reply is the same either way.
+// An auditText is stored instead of text for every tool: text quotes page text that the call's
+// own input can produce (a JavaScript dialog's message).
+function inputFreeError(text, auditText) {
+  return Audit.markInputFree(errorResult(text), auditText);
+}
+
+// Marks result, whose text quotes err's message as quote(err.message), the way err is marked:
+// with quote() of the fixed text audit stores instead of the message, as input-free, or not at
+// all.
+function markQuotedError(result, err, quote) {
+  const auditText = Audit.auditTextFor(err, err.message);
+  return auditText === null ? result : Audit.markInputFree(result, quote(auditText));
+}
+
 const toolHandlers = {
   async tabs_context_mcp(args) {
     await ensureTabGroup(args.createIfEmpty);
@@ -837,7 +943,7 @@ const toolHandlers = {
       await ensureTabGroup(true);
       groupTabs = await chrome.tabs.query({ groupId: tabGroupId });
       if (groupTabs.length === 0) {
-        return { content: [{ type: "text", text: "Could not create or find the MCP tab group." }] };
+        return errorResult("Could not create or find the MCP tab group.");
       }
     }
     // about:blank, not the default New Tab Page: that is a chrome:// page, which refuses the
@@ -859,7 +965,7 @@ const toolHandlers = {
   async tabs_close_mcp(args) {
     const { tabId } = args;
     const tabError = await tabAccessError(tabId, { allowBlockedUrl: true, allowDialog: true });
-    if (tabError) return { content: [{ type: "text", text: tabError }] };
+    if (tabError) return tabError;
     // chrome.tabs.onRemoved cleans up our per-tab state (attached debugger,
     // console/network buffers). Chrome auto-removes the tab group when its last
     // tab is closed, so no extra group teardown is needed here.
@@ -870,7 +976,7 @@ const toolHandlers = {
   async navigate(args) {
     const { url, tabId } = args;
     const tabError = await tabAccessError(tabId, { allowDialog: true });
-    if (tabError) return { content: [{ type: "text", text: tabError }] };
+    if (tabError) return tabError;
 
     // Attach before navigating, not after: otherwise a page that opens a dialog on load is
     // never seen, and every CDP call then hangs for the full 30s until the user closes it.
@@ -892,14 +998,14 @@ const toolHandlers = {
     } else {
       const normalized = normalizeNavigateUrl(url, chrome.runtime.id);
       if (normalized.error) {
-        return { content: [{ type: "text", text: normalized.error }] };
+        return normalized.inputFree ? inputFreeError(normalized.error) : errorResult(normalized.error);
       }
       try {
         await chrome.tabs.update(tabId, { url: normalized.url });
       } catch (err) {
         let message = err.message;
         if (!message.endsWith(".")) message += ".";
-        return { content: [{ type: "text", text: `Could not navigate to ${normalized.url}: ${message}` }] };
+        return errorResult(`Could not navigate to ${normalized.url}: ${message}`);
       }
     }
 
@@ -926,7 +1032,7 @@ const toolHandlers = {
     // land on a local file or this extension's own page — refuse instead of reporting its title.
     const tab = await chrome.tabs.get(tabId);
     if (isBlockedUrl(tab.url, chrome.runtime.id)) {
-      return { content: [{ type: "text", text: `Tab ${tabId} shows a local file or this extension's own page, which the agent cannot use.` }] };
+      return inputFreeError(`Tab ${tabId} shows a local file or this extension's own page, which the agent cannot use.`);
     }
 
     const tabs = await chrome.tabs.query({ groupId: tabGroupId });
@@ -942,7 +1048,7 @@ const toolHandlers = {
   async computer(args) {
     const { action, tabId } = args;
     const tabError = await tabAccessError(tabId);
-    if (tabError) return { content: [{ type: "text", text: tabError }] };
+    if (tabError) return tabError;
 
     let coordinate = args.coordinate;
     // Click actions and hover accept either a ref or a coordinate: a ref is resolved (and
@@ -959,7 +1065,7 @@ const toolHandlers = {
     if (refResolvesToCoordinate && args.ref && !coordinate) {
       const resp = await sendContentMessage(tabId, { type: "getRefTarget", ref: args.ref });
       const target = resp?.result;
-      if (!target || target.error) return { content: [{ type: "text", text: target?.error || `Could not resolve ref "${args.ref}".` }] };
+      if (!target || target.error) return errorResult(target?.error || `Could not resolve ref "${args.ref}".`);
       coordinate = [target.x, target.y];
       // Captured regardless of action: left_click_drag needs to know a ref scroll happened
       // even though it doesn't report hit/notes the way a click does (see its case below).
@@ -981,10 +1087,10 @@ const toolHandlers = {
         probe = null;
       }
       if (probe?.error) {
-        return { content: [{ type: "text", text: probe.error }] };
+        return errorResult(probe.error);
       }
       if (probe?.inViewport === false) {
-        return { content: [{ type: "text", text: `Coordinate (${coordinate[0]}, ${coordinate[1]}) is outside the viewport (${probe.viewport || ""}). Scroll first or use a ref.` }] };
+        return errorResult(`Coordinate (${coordinate[0]}, ${coordinate[1]}) is outside the viewport (${probe.viewport || ""}). Scroll first or use a ref.`);
       }
       if (probe) {
         hit = probe.hit;
@@ -1010,38 +1116,38 @@ const toolHandlers = {
       }
 
       case "left_click": {
-        if (!coordinate) return { content: [{ type: "text", text: "coordinate is required for left_click" }] };
+        if (!coordinate) return errorResult("coordinate is required for left_click");
         const text = await dispatchPointerAction("Clicked", coordinate, hit, scrolled, notes, () => mouseClick(tabId, coordinate[0], coordinate[1], { modifiers }));
         return { content: [{ type: "text", text }] };
       }
 
       case "right_click": {
-        if (!coordinate) return { content: [{ type: "text", text: "coordinate is required for right_click" }] };
+        if (!coordinate) return errorResult("coordinate is required for right_click");
         const text = await dispatchPointerAction("Right-clicked", coordinate, hit, scrolled, notes, () => mouseClick(tabId, coordinate[0], coordinate[1], { button: "right", modifiers }));
         return { content: [{ type: "text", text }] };
       }
 
       case "double_click": {
-        if (!coordinate) return { content: [{ type: "text", text: "coordinate is required for double_click" }] };
+        if (!coordinate) return errorResult("coordinate is required for double_click");
         const text = await dispatchPointerAction("Double-clicked", coordinate, hit, scrolled, notes, () => mouseClick(tabId, coordinate[0], coordinate[1], { clickCount: 2, modifiers }));
         return { content: [{ type: "text", text }] };
       }
 
       case "triple_click": {
-        if (!coordinate) return { content: [{ type: "text", text: "coordinate is required for triple_click" }] };
+        if (!coordinate) return errorResult("coordinate is required for triple_click");
         const text = await dispatchPointerAction("Triple-clicked", coordinate, hit, scrolled, notes, () => mouseClick(tabId, coordinate[0], coordinate[1], { clickCount: 3, modifiers }));
         return { content: [{ type: "text", text }] };
       }
 
       case "hover": {
-        if (!coordinate) return { content: [{ type: "text", text: "coordinate is required for hover" }] };
+        if (!coordinate) return errorResult("coordinate is required for hover");
         await dispatchMouse(tabId, "mouseMoved", coordinate[0], coordinate[1], { modifiers });
         await sleep(200);
         return { content: [{ type: "text", text: pointerReply("Hovered", coordinate, hit, scrolled, notes) }] };
       }
 
       case "type": {
-        if (!args.text) return { content: [{ type: "text", text: "text is required for type action" }] };
+        if (!args.text) return inputFreeError("text is required for type action");
         await ensureAttached(tabId);
         // "\r\n" and a lone "\r" both mean one line break. Per-character insertion of an
         // un-normalized "\r\n" would otherwise land as two in a multiline field.
@@ -1076,14 +1182,14 @@ const toolHandlers = {
       }
 
       case "key": {
-        if (!args.text) return { content: [{ type: "text", text: "text is required for key action" }] };
+        if (!args.text) return inputFreeError("text is required for key action");
         await ensureAttached(tabId);
         const repeat = Math.min(args.repeat || 1, 100);
         let combos;
         try {
           combos = args.text.split(" ").filter(Boolean).map(parseKeyCombo);
         } catch (err) {
-          return { content: [{ type: "text", text: err.message }] };
+          return errorResult(err.message);
         }
         for (let r = 0; r < repeat; r++) {
           for (const { def, modifiers: keyMods } of combos) {
@@ -1095,7 +1201,7 @@ const toolHandlers = {
       }
 
       case "scroll": {
-        if (!coordinate) return { content: [{ type: "text", text: "coordinate is required for scroll" }] };
+        if (!coordinate) return errorResult("coordinate is required for scroll");
         const dir = args.scroll_direction || "down";
         const amount = Math.min(args.scroll_amount || 3, 10);
         const deltaX = dir === "left" ? -amount * 100 : dir === "right" ? amount * 100 : 0;
@@ -1119,12 +1225,12 @@ const toolHandlers = {
       }
 
       case "scroll_to": {
-        if (!coordinate && !args.ref) return { content: [{ type: "text", text: "coordinate or ref is required for scroll_to" }] };
+        if (!coordinate && !args.ref) return errorResult("coordinate or ref is required for scroll_to");
         if (args.ref) {
           const resp = await sendContentMessage(tabId, { type: "scrollToRef", ref: args.ref });
           const target = resp?.result;
-          if (!target || target.error) return { content: [{ type: "text", text: target?.error || `Could not resolve ref "${args.ref}".` }] };
-          if (!target.inViewport) return { content: [{ type: "text", text: `Scrolled toward ${args.ref} but it is still outside the viewport at (${target.x}, ${target.y}).` }] };
+          if (!target || target.error) return errorResult(target?.error || `Could not resolve ref "${args.ref}".`);
+          if (!target.inViewport) return errorResult(`Scrolled toward ${args.ref} but it is still outside the viewport at (${target.x}, ${target.y}).`);
           return { content: [{ type: "text", text: `Scrolled ${args.ref} into view at (${target.x}, ${target.y}).` }] };
         }
         await cdp(tabId, "Runtime.evaluate", { expression: `window.scrollTo(${coordinate[0]}, ${coordinate[1]})` });
@@ -1140,13 +1246,13 @@ const toolHandlers = {
 
       case "left_click_drag": {
         if (!args.start_coordinate || !coordinate) {
-          return { content: [{ type: "text", text: "start_coordinate and coordinate are required for left_click_drag" }] };
+          return errorResult("start_coordinate and coordinate are required for left_click_drag");
         }
         // start_coordinate was read from a screenshot taken before resolving the ref. If that
         // resolution had to scroll the page, everything the caller saw (including
         // start_coordinate) is now stale — dragging from it would start in the wrong place.
         if (args.ref && scrolled) {
-          return { content: [{ type: "text", text: `Scrolled ${args.ref} into view, so start_coordinate is stale. Take a new screenshot and retry the drag.` }] };
+          return errorResult(`Scrolled ${args.ref} into view, so start_coordinate is stale. Take a new screenshot and retry the drag.`);
         }
         const [sx, sy] = args.start_coordinate;
         const [ex, ey] = coordinate;
@@ -1168,7 +1274,7 @@ const toolHandlers = {
 
       case "zoom": {
         if (!args.region || args.region.length !== 4) {
-          return { content: [{ type: "text", text: "region [x0, y0, x1, y1] is required for zoom" }] };
+          return errorResult("region [x0, y0, x1, y1] is required for zoom");
         }
         // Return the full screenshot with the region noted; the caller can crop
         // to it. Screenshots are JPEG (see takeScreenshot), so label them as such.
@@ -1184,14 +1290,14 @@ const toolHandlers = {
       }
 
       default:
-        return { content: [{ type: "text", text: `Unknown computer action: ${action}` }] };
+        return errorResult(`Unknown computer action: ${action}`);
     }
   },
 
   async read_page(args) {
     const { tabId } = args;
     const tabError = await tabAccessError(tabId);
-    if (tabError) return { content: [{ type: "text", text: tabError }] };
+    if (tabError) return tabError;
 
     const resp = await sendContentMessage(tabId, {
       type: "generateAccessibilityTree",
@@ -1203,9 +1309,12 @@ const toolHandlers = {
       },
     });
 
-    if (resp?.result?.error) return { content: [{ type: "text", text: resp.result.error }] };
+    if (resp?.result?.error) return errorResult(resp.result.error);
+    if (resp?.result == null) return errorResult("Error: Could not generate accessibility tree");
 
-    let tree = resp?.result || "Error: Could not generate accessibility tree";
+    // An empty tree (about:blank, an empty body, filter "interactive" on a page with only text)
+    // is a status answer, like find's "No elements found", not a failure.
+    let tree = resp.result || (args.filter === "interactive" ? "No interactive elements found." : "No elements found.");
     // Append viewport dimensions so Claude knows the coordinate space
     const vp = await readViewport(tabId);
     if (vp) tree += `\n\nViewport: ${vp.width}x${vp.height}`;
@@ -1215,11 +1324,11 @@ const toolHandlers = {
   async get_page_text(args) {
     const { tabId } = args;
     const tabError = await tabAccessError(tabId);
-    if (tabError) return { content: [{ type: "text", text: tabError }] };
+    if (tabError) return tabError;
 
     const resp = await sendContentMessage(tabId, { type: "getPageText" });
-    if (resp?.result?.error) return { content: [{ type: "text", text: resp.result.error }] };
-    if (!resp?.result) return { content: [{ type: "text", text: "Error: Could not extract page text" }] };
+    if (resp?.result?.error) return errorResult(resp.result.error);
+    if (!resp?.result) return errorResult("Error: Could not extract page text");
 
     try {
       const data = JSON.parse(resp.result);
@@ -1239,10 +1348,10 @@ const toolHandlers = {
   async find(args) {
     const { query, tabId } = args;
     const tabError = await tabAccessError(tabId);
-    if (tabError) return { content: [{ type: "text", text: tabError }] };
+    if (tabError) return tabError;
 
     const resp = await sendContentMessage(tabId, { type: "findElements", query });
-    if (resp?.result?.error) return { content: [{ type: "text", text: resp.result.error }] };
+    if (resp?.result?.error) return errorResult(resp.result.error);
     const results = resp?.result || [];
 
     if (results.length === 0) {
@@ -1262,19 +1371,19 @@ const toolHandlers = {
   async form_input(args) {
     const { ref, value, tabId } = args;
     const tabError = await tabAccessError(tabId);
-    if (tabError) return { content: [{ type: "text", text: tabError }] };
+    if (tabError) return tabError;
 
     const resp = await sendContentMessage(tabId, { type: "setFormValue", ref, value });
     const result = resp?.result;
 
-    if (result?.error) return { content: [{ type: "text", text: `Error: ${result.error}` }] };
+    if (result?.error) return errorResult(`Error: ${result.error}`);
     return { content: [{ type: "text", text: `Set ${ref} to "${value}". Result: ${JSON.stringify(result)}` }] };
   },
 
   async javascript_tool(args) {
     const { text, tabId } = args;
     const tabError = await tabAccessError(tabId);
-    if (tabError) return { content: [{ type: "text", text: tabError }] };
+    if (tabError) return tabError;
 
     await ensureAttached(tabId);
     try {
@@ -1288,9 +1397,10 @@ const toolHandlers = {
       }, 55000);
 
       if (result.exceptionDetails) {
-        return {
-          content: [{ type: "text", text: `Error: ${result.exceptionDetails.text || JSON.stringify(result.exceptionDetails)}` }],
-        };
+        // The exception's description names its type and message, where the text is only
+        // "Uncaught".
+        const { exception, text: summary } = result.exceptionDetails;
+        return errorResult(`Error: ${exception?.description || summary || JSON.stringify(result.exceptionDetails)}`);
       }
 
       const val = result.result;
@@ -1299,14 +1409,14 @@ const toolHandlers = {
         content: [{ type: "text", text: val.value !== undefined ? JSON.stringify(val.value) : val.description || String(val) }],
       };
     } catch (e) {
-      return { content: [{ type: "text", text: `Error: ${e.message}` }] };
+      return markQuotedError(errorResult(`Error: ${e.message}`), e, (message) => `Error: ${message}`);
     }
   },
 
   async read_console_messages(args) {
     const { tabId, pattern, limit = 100, onlyErrors, clear } = args;
     const tabError = await tabAccessError(tabId);
-    if (tabError) return { content: [{ type: "text", text: tabError }] };
+    if (tabError) return tabError;
 
     // Ensure console domain is enabled
     await ensureAttached(tabId);
@@ -1349,7 +1459,7 @@ const toolHandlers = {
   async read_network_requests(args) {
     const { tabId, urlPattern, limit = 100, clear } = args;
     const tabError = await tabAccessError(tabId);
-    if (tabError) return { content: [{ type: "text", text: tabError }] };
+    if (tabError) return tabError;
 
     // Ensure network domain is enabled
     await ensureAttached(tabId);
@@ -1381,7 +1491,7 @@ const toolHandlers = {
   async resize_window(args) {
     const { width, height, tabId } = args;
     const tabError = await tabAccessError(tabId, { allowDialog: true });
-    if (tabError) return { content: [{ type: "text", text: tabError }] };
+    if (tabError) return tabError;
 
     const tab = await chrome.tabs.get(tabId);
     const windowId = tab.windowId;
@@ -1427,37 +1537,42 @@ const toolHandlers = {
 
   // Run a sequence of tool actions in order and aggregate their content blocks
   // (text and images interleave naturally). Each action is { name, input } and
-  // dispatches through the same toolHandlers map as a normal request. Stops on
-  // the first action that throws; nested browser_batch is rejected.
+  // dispatches through the same toolHandlers map as a normal request. Stops at
+  // the first action that throws or replies with isError, so nothing after a
+  // failed step runs, and the batch's own reply then carries isError too.
+  // Nested browser_batch is rejected.
   async browser_batch(args, ctx) {
     const actions = Array.isArray(args.actions) ? args.actions : [];
     if (actions.length === 0) {
-      return { content: [{ type: "text", text: "browser_batch requires a non-empty 'actions' array." }] };
+      return inputFreeError("browser_batch requires a non-empty 'actions' array.");
     }
 
     const content = [];
+    // Audit stores the batch's last line. It names the action and quotes no input, except a
+    // thrown action's message, which audit treats the way that error is marked.
+    const fail = (text) => {
+      content.push({ type: "text", text });
+      return Audit.markInputFree({ content, isError: true });
+    };
     for (let i = 0; i < actions.length; i++) {
       const name = actions[i]?.name;
       const input = actions[i]?.input || {};
 
-      if (name === "browser_batch") {
-        content.push({ type: "text", text: `Action ${i + 1}: nested browser_batch is not allowed.` });
-        break;
-      }
+      if (name === "browser_batch") return fail(`Action ${i + 1}: nested browser_batch is not allowed.`);
       const handler = toolHandlers[name];
-      if (!handler) {
-        content.push({ type: "text", text: `Action ${i + 1}: unknown tool "${name}".` });
-        break;
-      }
+      if (!handler) return fail(`Action ${i + 1}: unknown tool "${name}".`);
 
       content.push({ type: "text", text: `--- Action ${i + 1}/${actions.length}: ${name} ---` });
+      let result;
       try {
-        const result = await handler(input, ctx);
-        if (result?.content) content.push(...result.content);
+        result = await handler(input, ctx);
       } catch (err) {
-        content.push({ type: "text", text: `Action ${i + 1} (${name}) failed: ${err.message}` });
-        break;
+        const line = (message) => `Action ${i + 1} (${name}) failed: ${message}`;
+        content.push({ type: "text", text: line(err.message) });
+        return markQuotedError({ content, isError: true }, err, line);
       }
+      if (result?.content) content.push(...result.content);
+      if (result?.isError) return fail(`Action ${i + 1} (${name}) failed, so the batch stopped.`);
     }
 
     return { content };
@@ -1466,19 +1581,19 @@ const toolHandlers = {
   async upload_image(args) {
     const { imageId, ref, coordinate, filename, tabId } = args;
     const tabError = await tabAccessError(tabId);
-    if (tabError) return { content: [{ type: "text", text: tabError }] };
+    if (tabError) return tabError;
 
     // Only screenshots captured by the computer tool this session are stored.
     // "user-uploaded" images have no equivalent here (no Claude.ai file channel).
     const base64 = screenshotStore.get(imageId);
     if (!base64) {
-      return { content: [{ type: "text", text: `Image "${imageId}" not found. Only screenshots captured by the computer tool in this session can be uploaded.` }] };
+      return inputFreeError(`Image "${imageId}" not found. Only screenshots captured by the computer tool in this session can be uploaded.`);
     }
 
     // Best-effort: only the ref path (file input) is supported. The coordinate
     // drag & drop path (e.g. Google Docs) is not implemented in this fork.
     if (!ref) {
-      return { content: [{ type: "text", text: "upload_image requires a 'ref' to a file input in this extension. Coordinate-based drag & drop is not supported." }] };
+      return inputFreeError("upload_image requires a 'ref' to a file input in this extension. Coordinate-based drag & drop is not supported.");
     }
 
     // Stored screenshots are JPEG (see takeScreenshot). Set the File mime to
@@ -1492,7 +1607,7 @@ const toolHandlers = {
     });
     const result = resp?.result;
     if (!result || result.error) {
-      return { content: [{ type: "text", text: `Error: ${result?.error || "image upload failed"}` }] };
+      return result ? errorResult(`Error: ${result.error}`) : inputFreeError("Error: image upload failed");
     }
     return { content: [{ type: "text", text: `Uploaded image ${imageId} to ${ref} (${result.name}, ${result.size} bytes).` }] };
   },
@@ -1500,10 +1615,10 @@ const toolHandlers = {
   async file_upload(args) {
     const { paths, ref, tabId } = args;
     const tabError = await tabAccessError(tabId);
-    if (tabError) return { content: [{ type: "text", text: tabError }] };
-    if (!ref) return { content: [{ type: "text", text: "file_upload requires a 'ref' to a file input." }] };
+    if (tabError) return tabError;
+    if (!ref) return errorResult("file_upload requires a 'ref' to a file input.");
     if (!Array.isArray(paths) || paths.length === 0) {
-      return { content: [{ type: "text", text: "file_upload requires 'paths' to be a non-empty array of absolute file paths." }] };
+      return errorResult("file_upload requires 'paths' to be a non-empty array of absolute file paths.");
     }
 
     // The host checks every path against the upload allowlist before a request
@@ -1515,7 +1630,7 @@ const toolHandlers = {
     // be reachable by DOM.querySelector from the document root.)
     const mark = await sendContentMessage(tabId, { type: "markFileInput", ref });
     if (!mark?.result || mark.result.error) {
-      return { content: [{ type: "text", text: `Error: ${mark?.result?.error || "could not resolve a file input for the ref"}` }] };
+      return errorResult(`Error: ${mark?.result?.error || "could not resolve a file input for the ref"}`);
     }
     const token = mark.result.token;
 
@@ -1526,7 +1641,7 @@ const toolHandlers = {
         selector: `[data-mcp-file-input="${token}"]`,
       });
       if (!nodeId) {
-        return { content: [{ type: "text", text: "Error: could not locate the file input node via CDP (it may be inside shadow DOM)." }] };
+        return errorResult("Error: could not locate the file input node via CDP (it may be inside shadow DOM).");
       }
       await cdp(tabId, "DOM.setFileInputFiles", { nodeId, files: paths });
     } finally {
@@ -1537,31 +1652,31 @@ const toolHandlers = {
   },
 
   async gif_creator(args) {
-    return { content: [{ type: "text", text: "GIF recording is not yet implemented in this extension." }] };
+    return errorResult("GIF recording is not yet implemented in this extension.");
   },
 
   async shortcuts_list(args) {
-    return { content: [{ type: "text", text: "No shortcuts available. Shortcuts are not supported in this extension." }] };
+    return errorResult("No shortcuts available. Shortcuts are not supported in this extension.");
   },
 
   async shortcuts_execute(args) {
-    return { content: [{ type: "text", text: "Shortcuts are not supported in this extension." }] };
+    return errorResult("Shortcuts are not supported in this extension.");
   },
 
   async switch_browser(args) {
-    return { content: [{ type: "text", text: "Browser switching is not yet supported. The extension connects to whichever browser has it loaded (Chrome, Brave, or Edge). To switch, disable the extension in the current browser, enable it in the target browser, and restart both." }] };
+    return errorResult("Browser switching is not yet supported. The extension connects to whichever browser has it loaded (Chrome, Brave, or Edge). To switch, disable the extension in the current browser, enable it in the target browser, and restart both.");
   },
 
   async list_connected_browsers(args) {
     // Honest stub: this fork uses Chrome native messaging with one host per
     // browser and no shared account relay, so there is no multi-browser
     // registry (deviceIds) to enumerate.
-    return { content: [{ type: "text", text: "Listing connected browsers is not supported in this extension. It uses native messaging with a single browser per host, so there is no multi-browser registry to enumerate." }] };
+    return errorResult("Listing connected browsers is not supported in this extension. It uses native messaging with a single browser per host, so there is no multi-browser registry to enumerate.");
   },
 
   async select_browser(args) {
     // Honest stub: no deviceId registry exists (see list_connected_browsers).
-    return { content: [{ type: "text", text: "Selecting a browser by deviceId is not supported in this extension. The native-messaging host connects to whichever single browser has the extension loaded." }] };
+    return errorResult("Selecting a browser by deviceId is not supported in this extension. The native-messaging host connects to whichever single browser has the extension loaded.");
   },
 
 };
@@ -1612,21 +1727,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 // --- Init ---
 
-// Recover MCP tab group state after service worker restart
+// Recover MCP tab group state after a service worker restart: only the group this extension
+// created, by the id it stored, never a group found by its title, which the user can give any
+// group of their own. A stored group that is gone is not adopted, and a new one is created on
+// demand. tabAccessError and ensureTabGroup wait for this, so a first call cannot race it.
 async function recoverTabGroupState() {
   try {
-    const groups = await chrome.tabGroups.query({ title: "MCP" });
-    if (groups.length > 0) {
-      tabGroupId = groups[0].id;
-      const tabs = await chrome.tabs.query({ groupId: tabGroupId });
-      tabGroupTabs = new Set(tabs.map((t) => t.id));
-    }
+    const { [TAB_GROUP_ID_KEY]: storedId } = await chrome.storage.session.get(TAB_GROUP_ID_KEY);
+    if (typeof storedId !== "number") return;
+    await chrome.tabGroups.get(storedId); // rejects when the group no longer exists
+    tabGroupId = storedId;
+    const tabs = await chrome.tabs.query({ groupId: storedId });
+    tabGroupTabs = new Set(tabs.map((t) => t.id));
   } catch {
-    // Not critical — will be set on first tabs_context_mcp call
+    // Not critical: a new group is created on the first tabs_context_mcp or tabs_create_mcp call
   }
 }
 
-recoverTabGroupState();
+const tabGroupRecovery = recoverTabGroupState().then(() => { groupRecoverySettled = true; });
 connectNativeHost();
 // Audit records only tabs the tools may use, but an open JS dialog must not
 // stop a tab's recording, so the dialog state is ignored here.

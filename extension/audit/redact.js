@@ -54,6 +54,26 @@ const DATA_URI_RE = /\bdata:[\s\S]*/i;
 // on input that never closes a token.
 const CSS_DATA_URI_RE = /\burl\(\s*(?:"(data:(?:[^"\\]|\\[\s\S])*)"|'(data:(?:[^'\\]|\\[\s\S])*)'|(data:(?:[^\s"'()\\]|\\[\s\S])*))\s*\)|(?<=")data:[^"\\,]*(?=")|(?<=')data:[^'\\,]*(?=')|(?<![\w.#-])data:[\s\S]*/gi;
 
+// A URL in CSS text, found in one pass. First a whole url(...) token: its
+// payload ends at the closing quote of url("...") or url('...'), or at the ")"
+// of a bare url(...), and "\" escapes the character after it. Failing that,
+// any other URL token (in a string, a custom property, or a url( that never
+// closes) is redacted as free text, to the next whitespace. Minified CSS has
+// no whitespace after a url(), so the free-text mask alone removed every rule
+// after one. A bare payload needs at least one character: with an empty one,
+// the whitespace before and after it could split a long run of spaces in
+// quadratically many ways.
+const CSS_URL_RE = new RegExp(`${/(\burl\(\s*)(?:"((?:[^"\\]|\\[\s\S])*)"|'((?:[^'\\]|\\[\s\S])*)'|((?:[^\s"'()\\]|\\[\s\S])+))(\s*\))/.source}|${URL_TOKEN_RE.source}`, "gi");
+const CSS_URL_SCHEME_RE = /^[a-z][a-z0-9+.-]{0,31}:\/\//i;
+
+// A url() payload that is an absolute URL is redacted as one URL, so a space
+// or an escaped quote in its query cannot end the mask early. Any other
+// payload (a relative URL, a data: mask) only has the URLs inside it redacted.
+function redactCssUrlPayload(payload) {
+  if (CSS_URL_SCHEME_RE.test(payload)) return redactUrl(payload);
+  return payload.replace(URL_TOKEN_RE, (m) => redactUrl(m));
+}
+
 function scrubCssText(text, maxLen) {
   if (typeof text !== "string") return text;
   let scrubbed = text.replace(CSS_DATA_URI_RE, (m, doubleQuoted, singleQuoted, bare) => {
@@ -62,7 +82,12 @@ function scrubCssText(text, maxLen) {
     if (bare !== undefined) return `url(data:[${bare.length} chars])`;
     return `data:[${m.length} chars]`;
   });
-  scrubbed = scrubbed.replace(URL_TOKEN_RE, (m) => redactUrl(m));
+  scrubbed = scrubbed.replace(CSS_URL_RE, (m, open, doubleQuoted, singleQuoted, bare, close) => {
+    if (open === undefined) return redactUrl(m);
+    if (doubleQuoted !== undefined) return `${open}"${redactCssUrlPayload(doubleQuoted)}"${close}`;
+    if (singleQuoted !== undefined) return `${open}'${redactCssUrlPayload(singleQuoted)}'${close}`;
+    return `${open}${redactCssUrlPayload(bare)}${close}`;
+  });
   return clipTo(scrubbed, maxLen);
 }
 
@@ -378,10 +403,12 @@ function maskJsStringLiterals(code) {
   return out;
 }
 
+// Comments are kept as written, so the final summary still goes through
+// scrubUrls for a URL inside one.
 function javascriptSummary(args) {
   const code = maskJsStringLiterals(args.text || "");
-  if (code.length <= AUDIT_JS_CODE_CLIP) return code;
-  return `${code.slice(0, AUDIT_JS_CODE_CLIP)} … (+${code.length - AUDIT_JS_CODE_CLIP} chars)`;
+  if (code.length <= AUDIT_JS_CODE_CLIP) return scrubUrls(code);
+  return scrubUrls(`${code.slice(0, AUDIT_JS_CODE_CLIP)} … (+${code.length - AUDIT_JS_CODE_CLIP} chars)`);
 }
 
 function fileUploadSummary(args) {
@@ -626,9 +653,32 @@ function auditSummary(tool, args) {
     case "form_input": return formInputSummary(args);
     case "javascript_tool": return javascriptSummary(args);
     case "file_upload": return fileUploadSummary(args);
-    case "find": return `query: ${args.query}`;
+    case "find": return scrubUrls(`query: ${args.query}`);
     case "upload_image": return uploadImageSummary(args);
     case "browser_batch": return browserBatchSummary(args);
     default: return genericSummary(args);
+  }
+}
+
+// Whether auditSummary masks, drops or clips part of this call's input beyond
+// URL scrubbing: typed text and key presses, a form value, a navigate URL, code,
+// a find query, upload_image's filename and every nested action of a batch. An
+// error text of such a call can quote that input, so audit stores it only when
+// it is known to hold none (see audit.js). The generic summary and file_upload's
+// show every argument, only clipped for size, and so do navigate back/forward
+// and a boolean form_input value.
+function summaryHidesInput(tool, args) {
+  args = args || {};
+  switch (tool) {
+    case "computer": return args.action === "type" || args.action === "key";
+    case "navigate": return args.url !== "back" && args.url !== "forward";
+    case "form_input": return typeof args.value !== "boolean";
+    case "javascript_tool":
+    case "find":
+    case "upload_image":
+    case "browser_batch":
+      return true;
+    default:
+      return false;
   }
 }

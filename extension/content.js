@@ -32,6 +32,10 @@
   const docByIdFn = Document.prototype.getElementById;
   const docElementFromPointFn = Document.prototype.elementFromPoint;
   const scrollIntoViewFn = Element.prototype.scrollIntoView;
+  const elementQueryFn = Element.prototype.querySelector;
+  const querySelectorAllFn = Element.prototype.querySelectorAll;
+  const fragmentQueryFn = DocumentFragment.prototype.querySelector;
+  const fragmentQueryAllFn = DocumentFragment.prototype.querySelectorAll;
   const parentNodeGet = Object.getOwnPropertyDescriptor(Node.prototype, "parentNode").get;
   const isConnectedGet = Object.getOwnPropertyDescriptor(Node.prototype, "isConnected").get;
   const assignedSlotGet = Object.getOwnPropertyDescriptor(Element.prototype, "assignedSlot").get;
@@ -39,10 +43,15 @@
   // is already instanceof-guarded there (the same rule as offsetParentGet above), so it's not
   // part of the dom object. Two call sites: labelNotes and isOwnLabel.
   const labelControlGet = Object.getOwnPropertyDescriptor(HTMLLabelElement.prototype, "control").get;
-  // Not part of the public dom object: captured the same way, called directly at their one
-  // call site each (both in getPageText).
+  // Not part of the public dom object: captured the same way, called directly at its one call
+  // site (in getPageText).
   const cloneNodeFn = Node.prototype.cloneNode;
-  const querySelectorAllFn = Element.prototype.querySelectorAll;
+  // The same, for setFormValue, whose target can be the ref'd element itself: a <form> there
+  // has these replaced by a control named like them. isContentEditableGet is HTMLElement-owned,
+  // so it is called only after an instanceof HTMLElement check.
+  const isContentEditableGet = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "isContentEditable").get;
+  const textContentSet = Object.getOwnPropertyDescriptor(Node.prototype, "textContent").set;
+  const dispatchEventFn = EventTarget.prototype.dispatchEvent;
 
   function str(value) {
     return typeof value === "string" ? value : "";
@@ -73,6 +82,10 @@
     parentNode: (n) => (n ? parentNodeGet.call(n) : null),
     isConnected: (n) => (n ? isConnectedGet.call(n) : false),
     scrollIntoView: (el, opts) => { if (el) scrollIntoViewFn.call(el, opts); },
+    // root is an Element or a ShadowRoot (a DocumentFragment), each queried through the method
+    // its own prototype owns.
+    query: (root, sel) => (root instanceof Element ? elementQueryFn : fragmentQueryFn).call(root, sel),
+    queryAll: (root, sel) => (root instanceof Element ? querySelectorAllFn : fragmentQueryAllFn).call(root, sel),
     str,
     docTitle: () => str(docTitleGet.call(document)),
     docBody: () => docBodyGet.call(document),
@@ -332,7 +345,7 @@
     if (startRefId) {
       const el = resolveRef(startRefId);
       if (el) root = el;
-      else return `Error: ref_id "${startRefId}" not found or element was garbage collected.`;
+      else return { error: `Error: ref_id "${startRefId}" not found or element was garbage collected.` };
     }
 
     walk(root, 0, "");
@@ -436,20 +449,21 @@
 
   // --- Form input ---
 
-  // Find the actual input/textarea/select inside an element, traversing shadow DOM
+  // Find the actual input/textarea/select inside an element, traversing shadow DOM. el can be a
+  // <form>, so every read goes through dom.
   function findInputInside(el) {
-    const tag = el.tagName.toLowerCase();
-    if (["input", "textarea", "select"].includes(tag)) return el;
+    if (["input", "textarea", "select"].includes(dom.tag(el))) return el;
 
     // Check shadow DOM first
-    const root = el.shadowRoot || el;
-    const inner = root.querySelector("input, textarea, select");
+    const root = dom.shadowRoot(el) || el;
+    const inner = dom.query(root, "input, textarea, select");
     if (inner) return inner;
 
     // Recurse into shadow roots of children
-    for (const child of root.querySelectorAll("*")) {
-      if (child.shadowRoot) {
-        const deep = child.shadowRoot.querySelector("input, textarea, select");
+    for (const child of dom.queryAll(root, "*")) {
+      const shadow = dom.shadowRoot(child);
+      if (shadow) {
+        const deep = dom.query(shadow, "input, textarea, select");
         if (deep) return deep;
       }
     }
@@ -458,16 +472,16 @@
 
   // Find a file input (self, descendant, or inside shadow DOM) for uploads.
   function findFileInput(el) {
-    const isFile = (n) =>
-      n.tagName && n.tagName.toLowerCase() === "input" && (n.type || "").toLowerCase() === "file";
+    const isFile = (n) => n instanceof HTMLInputElement && n.type === "file";
     if (isFile(el)) return el;
-    const root = el.shadowRoot || el;
-    const inner = root.querySelector('input[type="file"]');
-    if (inner) return inner;
-    for (const child of root.querySelectorAll("*")) {
-      if (child.shadowRoot) {
-        const deep = child.shadowRoot.querySelector('input[type="file"]');
-        if (deep) return deep;
+    const root = dom.shadowRoot(el) || el;
+    const inner = dom.query(root, 'input[type="file"]');
+    if (isFile(inner)) return inner;
+    for (const child of dom.queryAll(root, "*")) {
+      const shadow = dom.shadowRoot(child);
+      if (shadow) {
+        const deep = dom.query(shadow, 'input[type="file"]');
+        if (isFile(deep)) return deep;
       }
     }
     return null;
@@ -526,55 +540,62 @@
     return { success: true, name: file.name, size: file.size };
   }
 
+  // The target can be the ref'd element itself, a <form> for example, so each branch below is
+  // guarded by instanceof before it reads a property, and the rest goes through captured methods.
+  // A change that did not take is an error, never a success: a target with no value to set
+  // (assigning el.value there only made an expando), a checkbox or radio that does not end at the
+  // requested state, or a value the field rejects.
   function setFormValue(refId, value) {
     const el = resolveRef(refId);
     if (!el) return { error: `Element ${refId} not found or was garbage collected.` };
 
-    el.scrollIntoView({ block: "center", behavior: "instant" });
+    dom.scrollIntoView(el, { block: "center", behavior: "instant" });
 
     // Resolve the actual form element (may be inside shadow DOM)
     const target = findInputInside(el) || el;
-    const tag = target.tagName.toLowerCase();
-    const type = (target.type || "").toLowerCase();
+    let readBack = () => target.value;
 
-    if (tag === "select") {
+    if (target instanceof HTMLSelectElement) {
       const opt = Array.from(target.options).find(
-        (o) => o.value === String(value) || o.textContent.trim() === String(value)
+        (o) => o.value === String(value) || dom.text(o).trim() === String(value)
       );
-      if (opt) {
-        target.value = opt.value;
-      } else {
-        target.value = String(value);
-      }
-    } else if (type === "checkbox" || type === "radio") {
+      // Setting a value no option has would clear the selection instead.
+      if (!opt) return { error: `No option with the value or text "${value}" in this select.` };
+      target.value = opt.value;
+    } else if (target instanceof HTMLInputElement && (target.type === "checkbox" || target.type === "radio")) {
       const shouldCheck = typeof value === "boolean" ? value : value === "true";
       if (target.checked !== shouldCheck) target.click();
+      if (target.checked !== shouldCheck) {
+        if (target.type === "radio" && !shouldCheck) {
+          return { error: `${refId} is a radio button, and a click cannot uncheck it. Check another radio button of its group instead.` };
+        }
+        return { error: `${refId} is still ${target.checked ? "checked" : "unchecked"}: the page did not let the click change it.` };
+      }
       return { success: true, checked: target.checked };
-    } else if (target.contentEditable === "true") {
-      target.textContent = String(value);
-    } else if (["input", "textarea"].includes(tag)) {
+    } else if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
       // Use the native setter for actual input/textarea elements
-      const proto = tag === "textarea" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-      const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
-      if (setter) {
-        setter.call(target, String(value));
-      } else {
-        target.value = String(value);
+      const proto = target instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const setValue = Object.getOwnPropertyDescriptor(proto, "value").set;
+      const before = target.value;
+      setValue.call(target, String(value));
+      // Value sanitization (type date, number, color, ...) turns a value the field rejects into
+      // "". The old value is put back then, and no input or change event is sent.
+      if (String(value) !== "" && target.value === "") {
+        setValue.call(target, before);
+        return { error: `${refId} did not accept the value: the field would be left empty. Check the value's format.` };
       }
+    } else if (target instanceof HTMLElement && isContentEditableGet.call(target)) {
+      textContentSet.call(target, String(value));
+      readBack = () => dom.text(target);
     } else {
-      // Fallback for unknown elements — try direct assignment
-      try {
-        target.value = String(value);
-      } catch {
-        return { error: `Cannot set value on <${tag}> element. No input found inside.` };
-      }
+      return { error: `Cannot set a value on <${dom.tag(target)}>. No input, textarea, select or editable element found at or inside it.` };
     }
 
     // Dispatch events on the target (bubbles up through shadow DOM)
-    target.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
-    target.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+    dispatchEventFn.call(target, new Event("input", { bubbles: true, composed: true }));
+    dispatchEventFn.call(target, new Event("change", { bubbles: true, composed: true }));
 
-    return { success: true, value: target.value };
+    return { success: true, value: readBack() };
   }
 
   // --- Click targeting: describe what's at a point, scroll refs into view, hit-test ---

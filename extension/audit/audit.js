@@ -25,6 +25,7 @@
   // stops a recording. Defaults to "every tab", so callers that don't pass one
   // (existing tests, and any future caller) keep today's behaviour.
   let isTabAllowed = async () => true;
+  const auditTexts = new WeakMap(); // result or error background.js marked as holding no tool input -> a text to store instead, or null for its own
   const tabOwners = new Map(); // tabId -> "<runId>.<session.id>", the last session to act on that tab
   const tabOwnerSetAt = new Map(); // tabId -> Date.now() when tabOwners was last set, for the retry below
   const knownTagsByTab = new Map(); // tabId -> Map(rrweb node id -> lowercase tagName, or a text node's marker), for redactEvents
@@ -249,20 +250,71 @@
           // ensureRecorder), so a slow or timed-out ensureRecorder call never
           // inflates the tool's own recorded duration.
           const ms = Date.now() - started;
-          if (allowed) ensureRecorder(tabId);
+          if (allowed) ensureRecorderIfAllowed(tabId);
           // Fire-and-forget — safeRecord never rejects (its own try/catch
           // guarantees that), and a stalled store write must never delay the
           // tool's actual response to the host.
-          safeRecord(name, args, ctx, `error: ${scrubUrls(String(err.message), AUDIT_ERROR_CLIP)}`, ms);
+          safeRecord(name, args, ctx, errorOutcome(name, args, String(err.message), err), ms);
           throw err;
         }
         const ms = Date.now() - started;
-        if (allowed) ensureRecorder(tabId);
-        safeRecord(name, args, ctx, "ok", ms);
+        if (allowed) ensureRecorderIfAllowed(tabId);
+        const outcome = result && result.isError === true ? errorOutcome(name, args, errorResultText(result), result) : "ok";
+        safeRecord(name, args, ctx, outcome, ms);
         return result;
       };
     }
     return handlers;
+  }
+
+  // The after-hook. The tab can have left the MCP group during the call, and
+  // then it gets no recorder probe or injection.
+  async function ensureRecorderIfAllowed(tabId) {
+    try {
+      if (await isTabAllowed(tabId)) await ensureRecorder(tabId);
+    } catch (err) {
+      console.error("[audit] after-call recorder check failed:", err);
+    }
+  }
+
+  // A refusal or a failure comes back as a result with isError, not a throw.
+  // Its last text block says what failed (a browser_batch lists the actions it
+  // ran before the line naming the one that failed).
+  function errorResultText(result) {
+    const texts = (Array.isArray(result.content) ? result.content : []).filter((c) => c && c.type === "text" && typeof c.text === "string");
+    return texts.length > 0 ? texts[texts.length - 1].text : "";
+  }
+
+  // The stored outcome of a failed call. An error text can quote the call's
+  // input (a select miss quotes the form value, an unparseable URL keeps its
+  // query after a space, a V8 message quotes a string literal), so for a call
+  // whose summary hides input (summaryHidesInput) the text is stored only when
+  // background.js marked it as holding none: the shared refusals, fixed texts,
+  // and timeout, dialog and transport failures. A text that quotes page text
+  // the call can produce (a JavaScript dialog's message) is marked with a fixed
+  // text to store instead, for every tool. The reply itself is unchanged.
+  function errorOutcome(tool, args, text, source) {
+    const stored = auditTextFor(source, text);
+    if (stored !== null) return `error: ${scrubUrls(stored, AUDIT_ERROR_CLIP)}`;
+    if (summaryHidesInput(tool, args)) return "error (text withheld)";
+    return `error: ${scrubUrls(text, AUDIT_ERROR_CLIP)}`;
+  }
+
+  // Marks a tool result or a thrown error whose text holds no tool input, so
+  // errorOutcome may store it, or store auditText instead when one is given.
+  // An earlier mark is kept, so an error re-thrown through another marking
+  // layer keeps its fixed text. Returns what it was given.
+  function markInputFree(resultOrError, auditText = null) {
+    if (resultOrError && typeof resultOrError === "object" && !auditTexts.has(resultOrError)) auditTexts.set(resultOrError, auditText);
+    return resultOrError;
+  }
+
+  // What errorOutcome may store for a marked result or error: its fixed text,
+  // or ownText. null when it is not marked.
+  function auditTextFor(resultOrError, ownText) {
+    if (!auditTexts.has(resultOrError)) return null;
+    const fixed = auditTexts.get(resultOrError);
+    return fixed === null ? ownText : fixed;
   }
 
   // The owner is set synchronously in wrapHandlers,
@@ -313,5 +365,13 @@
     }
   }
 
-  globalThis.Audit = { init, wrapHandlers, onRecorderEvents, settings };
+  // A tab that left the MCP group keeps its recorder running, but its batches
+  // are dropped from now on: an owner comes back only with the next audited
+  // call on that tab.
+  function dropOwner(tabId) {
+    tabOwners.delete(tabId);
+    tabOwnerSetAt.delete(tabId);
+  }
+
+  globalThis.Audit = { init, wrapHandlers, onRecorderEvents, settings, dropOwner, markInputFree, auditTextFor };
 })();
