@@ -10,6 +10,7 @@ Tool-usage notes for this fork's browser automation MCP server (`mcp__open-claud
 ## Tabs and errors
 
 - All agent sessions share one MCP tab group, so you can see and act on other sessions' tabs, even though the `tabs_close_mcp` description says "this session's group". Work only in tabs you created or the user pointed you to.
+- After an extension reload, update or browser restart, the extension does not reuse the old MCP group, even though it is still titled "MCP". The next call that needs a tab creates a new group. Get fresh tab ids with `tabs_context_mcp` (`createIfEmpty: true`) before you use a tab again.
 - A refused or failed call returns an error result (`isError: true`), with the reason in its text. Treat it as a failure. A `browser_batch` stops at the first action that fails: the actions before it ran, the ones after it did not. When the MCP server itself rejects a batch (invalid input, an unknown tool, a nested batch, an upload outside the allowed folders), no action in it ran.
 
 ## Files: upload and save
@@ -40,7 +41,7 @@ The browser profile may have its own opt-in audit log and DOM replay (rrweb), sw
 
 ## Honest stubs
 
-`gif_creator`, `shortcuts_list`, `shortcuts_execute`, `switch_browser`, `list_connected_browsers` and `select_browser` are honest stubs, each explaining what's missing in its own words (for example `shortcuts_execute` replies "Shortcuts are not supported in this extension."). Don't retry expecting a different result.
+`gif_creator`, `shortcuts_list`, `shortcuts_execute`, `switch_browser`, `list_connected_browsers` and `select_browser` are not implemented in this fork. Each one returns an error result (`isError: true`) that explains what's missing in its own words (for example `shortcuts_execute` replies "Shortcuts are not supported in this extension."). Skip them, and don't retry expecting a different result. Never put one in a `browser_batch`: a batch stops at the first action that returns an error, so the actions after it would not run.
 
 ## Safari
 
