@@ -471,6 +471,7 @@ document.getElementById('file-input').addEventListener('change', function (e) {
     const refused = await mcpClient.callTool({ name: "file_upload", arguments: { paths: [secretFile], ref, tabId } });
     assert.match(refused.content[0].text, /^Error: Not in an allowed upload folder: /, `expected secret.txt to be refused: ${refused.content[0].text}`);
     assert.ok(refused.content[0].text.includes(secretFile), "expected the refusal to name the rejected path");
+    assert.equal(refused.isError, true, "expected the refusal to be flagged isError");
 
     const uploaded = await mcpClient.callTool({ name: "file_upload", arguments: { paths: [allowedFile], ref, tabId } });
     assert.match(uploaded.content[0].text, /^Uploaded 1 file\(s\) to ref_\d+: /, `expected the Downloads upload to succeed: ${uploaded.content[0].text}`);
@@ -536,6 +537,7 @@ document.getElementById('file-input').addEventListener('change', function (e) {
     const elapsed = Date.now() - started;
     assert.ok(elapsed < 4500, `expected the call to fail promptly on kill, not after the full 5s wait (took ${elapsed}ms)`);
     assert.equal(waitResult.content[0].text, `Error: ${LOST}`, `expected the exact LOST message, got: ${waitResult.content[0].text}`);
+    assert.equal(waitResult.isError, true, "expected the LOST reply to be flagged isError");
 
     // Nothing else restarts the native host: Chrome's own extension retries
     // connectNative() automatically (every ~2s), respawning it from the same
