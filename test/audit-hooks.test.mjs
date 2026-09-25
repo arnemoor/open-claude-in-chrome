@@ -398,13 +398,15 @@ test("I5: a tab inside the MCP group still gets a recorder", async () => {
   assert.equal(ensureRecorderCalls(bg).length, 4);
 });
 
-// Item 9: a tab's recorder keeps running (and keeps sending batches) after the
-// tab leaves the MCP group — nothing tells the content script to stop. Those
+// A tab's recorder keeps running (and keeps sending batches) after the tab
+// leaves the MCP group — nothing tells the content script to stop. Those
 // batches must stop being stored the moment isTabAllowed(tabId) goes false,
 // and the stale owner must be cleared, not just gated: if the tab later
 // rejoins the group with no new audited call re-establishing ownership, a
-// batch for it must still be dropped, not resumed under the old owner.
-test("item 9: recorder events stop and the owner is cleared once a tab leaves the MCP group", async () => {
+// batch for it must still be dropped, not resumed under the old owner. The
+// tab is bg.tabId, which the extension has cached as a group member, so the
+// cache must not keep a tab Chrome reports as ungrouped (groupId -1) allowed.
+test("recorder events stop and the owner is cleared once a cached tab leaves the MCP group", async () => {
   const fakeStore = makeFakeStore();
   let insideGroup = true;
   const bg = await loadBackground({
@@ -413,23 +415,45 @@ test("item 9: recorder events stop and the owner is cleared once a tab leaves th
   });
   await flush();
   await bg.chrome.storage.local.set({ audit: { enabled: true, retentionDays: 7 } });
+  assert.ok(bg.get("tabGroupTabs").has(bg.tabId), "the tab must be one the extension cached");
 
-  bg.deliver({ type: "tool_request", id: "1.s1.1", tool: "gif_creator", args: { tabId: 42 }, session: SESSION });
+  bg.deliver({ type: "tool_request", id: "1.s1.1", tool: "gif_creator", args: { tabId: bg.tabId }, session: SESSION });
   await flush();
 
-  bg.chrome.runtime.onMessage.fire({ type: "ocic_audit_events", events: [{ type: 2 }] }, { id: bg.chrome.runtime.id, tab: { id: 42 }, frameId: 0 }, () => {});
+  bg.chrome.runtime.onMessage.fire({ type: "ocic_audit_events", events: [{ type: 2 }] }, { id: bg.chrome.runtime.id, tab: { id: bg.tabId }, frameId: 0 }, () => {});
   await flush();
   assert.equal(fakeStore.calls.filter((c) => c[0] === "addEvents").length, 1, "still inside the group: the batch is stored");
 
   insideGroup = false; // the tab leaves the MCP group (dragged out, ungrouped), no new tool call
-  bg.chrome.runtime.onMessage.fire({ type: "ocic_audit_events", events: [{ type: 2 }] }, { id: bg.chrome.runtime.id, tab: { id: 42 }, frameId: 0 }, () => {});
+  bg.chrome.runtime.onMessage.fire({ type: "ocic_audit_events", events: [{ type: 2 }] }, { id: bg.chrome.runtime.id, tab: { id: bg.tabId }, frameId: 0 }, () => {});
   await flush();
   assert.equal(fakeStore.calls.filter((c) => c[0] === "addEvents").length, 1, "left the group: the next batch must be dropped");
 
   insideGroup = true; // the tab rejoins, but nothing has re-established ownership
-  bg.chrome.runtime.onMessage.fire({ type: "ocic_audit_events", events: [{ type: 2 }] }, { id: bg.chrome.runtime.id, tab: { id: 42 }, frameId: 0 }, () => {});
+  bg.chrome.runtime.onMessage.fire({ type: "ocic_audit_events", events: [{ type: 2 }] }, { id: bg.chrome.runtime.id, tab: { id: bg.tabId }, frameId: 0 }, () => {});
   await flush();
   assert.equal(fakeStore.calls.filter((c) => c[0] === "addEvents").length, 1, "the owner was cleared on leaving, so rejoining alone must not resume storing under the old owner");
+});
+
+// The groupId change itself drops the owner at once, not only the next batch's
+// live check: after a drag out and straight back in, no batch is stored until
+// an audited call takes the tab again.
+test("a tab leaving the MCP group loses its audit owner as soon as Chrome reports the move", async () => {
+  const fakeStore = makeFakeStore();
+  const bg = await loadBackground({ beforeRun: injectFakeStore(fakeStore) });
+  await flush();
+  await bg.chrome.storage.local.set({ audit: { enabled: true, retentionDays: 7 } });
+
+  bg.deliver({ type: "tool_request", id: "1.s1.1", tool: "gif_creator", args: { tabId: bg.tabId }, session: SESSION });
+  await flush();
+
+  const tab = { id: bg.tabId, windowId: 1, url: "https://example.test/" };
+  bg.chrome.tabs.onUpdated.fire(bg.tabId, { groupId: -1 }, { ...tab, groupId: -1 });
+  bg.chrome.tabs.onUpdated.fire(bg.tabId, { groupId: 7 }, { ...tab, groupId: 7 });
+  bg.chrome.runtime.onMessage.fire({ type: "ocic_audit_events", events: [{ type: 2 }] }, { id: bg.chrome.runtime.id, tab: { id: bg.tabId }, frameId: 0 }, () => {});
+  await flush();
+
+  assert.deepEqual(fakeStore.calls.filter((c) => c[0] === "addEvents"), []);
 });
 
 // Item 16: a chrome:// page, the Web Store, or any other page that refuses

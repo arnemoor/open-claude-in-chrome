@@ -322,5 +322,13 @@
     }
   }
 
-  globalThis.Audit = { init, wrapHandlers, onRecorderEvents, settings };
+  // A tab that left the MCP group keeps its recorder running, but its batches
+  // are dropped from now on: an owner comes back only with the next audited
+  // call on that tab.
+  function dropOwner(tabId) {
+    tabOwners.delete(tabId);
+    tabOwnerSetAt.delete(tabId);
+  }
+
+  globalThis.Audit = { init, wrapHandlers, onRecorderEvents, settings, dropOwner };
 })();

@@ -20,6 +20,7 @@ const networkRequests = new Map(); // tabId -> [{url, method, status, type, time
 const screenshotStore = new Map(); // imageId -> base64
 const openDialogs = new Map(); // tabId -> message, while a JS dialog (alert/confirm/prompt/beforeunload) blocks the page
 const pendingCdpRejects = new Map(); // tabId -> Set<reject>, one entry per in-flight rawCdp call on that tab
+const releasedTabs = new Set(); // tabIds that left the MCP group: no CDP command reaches them until they are back
 
 // Thrown to reject every pending rawCdp call on a tab the instant its dialog opens, instead of
 // letting each one run out its own CDP_TIMEOUT_MS: a dialog freezes the renderer, so an
@@ -175,7 +176,6 @@ function formatTabContext(tabs) {
 //     resize_window — window.get/update are browser-level and readViewport already degrades to
 //     null within its own short budget instead of hanging).
 async function tabAccessError(tabId, { allowBlockedUrl = false, allowDialog = false } = {}) {
-  // Always check live state — in-memory tabGroupTabs can be stale after service worker restart
   let tab;
   try {
     tab = await chrome.tabs.get(tabId);
@@ -183,24 +183,23 @@ async function tabAccessError(tabId, { allowBlockedUrl = false, allowDialog = fa
     return `Tab ${tabId} is not in the MCP group.`;
   }
 
-  let inGroup;
-  if (tab.groupId !== -1) {
-    // Recover tabGroupId if we lost it (service worker restart)
-    if (tabGroupId === null) {
-      try {
-        const group = await chrome.tabGroups.get(tab.groupId);
-        if (group.title === "MCP") {
-          tabGroupId = group.id;
-          const groupTabs = await chrome.tabs.query({ groupId: tabGroupId });
-          tabGroupTabs = new Set(groupTabs.map((t) => t.id));
-        }
-      } catch {}
-    }
-    inGroup = tab.groupId === tabGroupId;
-  } else {
-    inGroup = tabGroupTabs.has(tabId);
+  // Recover tabGroupId if we lost it (service worker restart)
+  if (tab.groupId !== -1 && tabGroupId === null) {
+    try {
+      const group = await chrome.tabGroups.get(tab.groupId);
+      if (group.title === "MCP") {
+        tabGroupId = group.id;
+        const groupTabs = await chrome.tabs.query({ groupId: tabGroupId });
+        tabGroupTabs = new Set(groupTabs.map((t) => t.id));
+      }
+    } catch {}
   }
-  if (!inGroup) return `Tab ${tabId} is not in the MCP group.`;
+  // Only the tab's live groupId counts, never the tabGroupTabs cache: a tab the user dragged out
+  // of the group, or popped into its own window, has groupId -1 at once, before any event has
+  // updated the cache.
+  if (tab.groupId !== tabGroupId) return `Tab ${tabId} is not in the MCP group.`;
+  tabGroupTabs.add(tabId);
+  releasedTabs.delete(tabId);
 
   if (!allowBlockedUrl && isBlockedUrl(tab.url, chrome.runtime.id)) {
     return `Tab ${tabId} shows a local file or this extension's own page, which the agent cannot use.`;
@@ -239,6 +238,8 @@ function rawCdp(tabId, method, params = {}, timeoutMs = CDP_TIMEOUT_MS) {
 }
 
 async function ensureAttached(tabId) {
+  // A call still in flight when its tab left the MCP group sends that tab nothing more.
+  if (releasedTabs.has(tabId)) throw new Error(`Tab ${tabId} is not in the MCP group.`);
   if (attachedTabs.has(tabId)) return;
   let pending = attaching.get(tabId);
   if (!pending) {
@@ -306,18 +307,43 @@ async function readViewport(tabId, timeoutMs = 2000) {
   }
 }
 
-// Clean up when tab is closed
-chrome.tabs.onRemoved.addListener((tabId) => {
+// Drops everything held for a tab the tools may no longer use (it closed, or it left the MCP
+// group): its debugger session, console and network buffers, dialog state and audit owner. A
+// debugger attach still in flight is detached once it completes, unless the tab is back in the
+// group by then.
+function forgetTab(tabId) {
   tabGroupTabs.delete(tabId);
   if (attachedTabs.has(tabId)) {
-    try { chrome.debugger.detach({ tabId }); } catch {}
     attachedTabs.delete(tabId);
+    chrome.debugger.detach({ tabId }).catch(() => {});
   }
+  const pendingAttach = attaching.get(tabId);
   attaching.delete(tabId);
+  if (pendingAttach) pendingAttach.then(() => { if (releasedTabs.has(tabId)) forgetTab(tabId); }, () => {});
   consoleMessages.delete(tabId);
   networkRequests.delete(tabId);
   openDialogs.delete(tabId);
   pendingCdpRejects.delete(tabId);
+  Audit.dropOwner(tabId);
+}
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  releasedTabs.delete(tabId);
+  forgetTab(tabId);
+});
+
+// A tab that leaves the MCP group (dragged out, popped into its own window, moved to another
+// group, or ungrouped) is released at once, on top of tabAccessError refusing it by its live
+// groupId. A tab dragged into the group is tracked like one created there.
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (!("groupId" in changeInfo)) return;
+  if (tabGroupId !== null && changeInfo.groupId === tabGroupId) {
+    releasedTabs.delete(tabId);
+    tabGroupTabs.add(tabId);
+    return;
+  }
+  if (tabGroupTabs.has(tabId)) releasedTabs.add(tabId);
+  forgetTab(tabId);
 });
 
 // Handle user dismissing debugger bar
