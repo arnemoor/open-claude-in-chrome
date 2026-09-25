@@ -101,7 +101,7 @@ test("a write that fails partway through is reported as a failure, and no file i
   `);
   // ulimit -f pins the child's max file size well below the 20000-byte image,
   // so the write fails partway through (a stand-in for a full disk).
-  const out = execFileSync("/bin/sh", ["-c", `ulimit -f 4 && exec node "${scriptPath}"`], { encoding: "utf8", timeout: 5000 });
+  const out = execFileSync("/bin/sh", ["-c", `ulimit -f 4 && exec ${JSON.stringify(process.execPath)} "${scriptPath}"`], { encoding: "utf8", timeout: 5000 });
   const r = JSON.parse(out);
   assert.match(r.content[1].text, /^save_to_disk failed: /);
   assert.deepEqual(fs.readdirSync(screenshotsDir(home)), []);

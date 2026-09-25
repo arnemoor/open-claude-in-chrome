@@ -235,7 +235,7 @@ function schemaProblems(served, fixture) {
   return problems;
 }
 
-// Mirror mcp-server.js pre-validation coercion (mcp-server.js:445-466) so the
+// Mirror mcp-server.js pre-validation coercion (mcp-server.js:107-128) so the
 // dispatch expectation matches what the server actually forwards to the native
 // host (e.g. a string tabId is coerced to a number before validation).
 function expectedArgs(input, name) {
@@ -335,7 +335,7 @@ describe("dispatch parity (each tool reaches the browser with matching args)", (
     nativeHost = await startRecordingHub(home, recorded);
     session = await startSession(iso.env);
     const routed = await waitForRoute(session.client);
-    assert.ok(routed, "mock native host should attach to the primary and route tool calls");
+    assert.ok(routed, "mock native host should be connected and routing tool calls");
     recorded.length = 0; // discard the readiness-probe request(s)
   });
 
@@ -392,7 +392,7 @@ describe("file_upload allowlist enforcement", () => {
     nativeHost = await startRecordingHub(home, recorded);
     session = await startSession(iso.env);
     const routed = await waitForRoute(session.client);
-    assert.ok(routed, "mock native host should attach to the primary and route tool calls");
+    assert.ok(routed, "mock native host should be connected and routing tool calls");
     recorded.length = 0; // discard the readiness-probe request(s)
   });
 

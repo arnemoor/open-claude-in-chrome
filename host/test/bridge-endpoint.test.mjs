@@ -90,15 +90,15 @@ test("missing paths rethrow ENOENT unchanged", () => {
   assert.throws(() => verifySocketOwner(path.join(dir, "bridge.sock")), (e) => e.code === "ENOENT");
 });
 
-test("verifySocketOwner accepts our socket and refuses anything else", async () => {
+test("verifySocketOwner accepts our socket and refuses anything else", { timeout: 10000 }, async (t) => {
   const dir = bridgeDir(tmpHome());
   prepareBridgeDir(dir);
   const sock = path.join(dir, "bridge.sock");
   const srv = net.createServer().listen(sock);
+  t.after(() => new Promise((r) => srv.close(r)).catch(() => {}));
   await new Promise((r) => srv.once("listening", r));
   verifySocketOwner(sock);
   assert.throws(() => verifySocketOwner(sock, { uid: process.getuid() + 1 }), BridgeSecurityError);
-  await new Promise((r) => srv.close(r));
   const file = path.join(dir, "file");
   fs.writeFileSync(file, "x");
   assert.throws(() => verifySocketOwner(file), BridgeSecurityError);

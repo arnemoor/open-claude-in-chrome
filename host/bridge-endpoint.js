@@ -1,7 +1,9 @@
 // Where the native host (hub) and the MCP servers (clients) meet: a Unix socket in a
 // directory only the current user can enter. The directory check replaces the old
 // shared token and protects both directions: other users cannot reach the hub, and a
-// client knows the socket was created by its own user.
+// client knows the socket was created by its own user. This rests on HOME and its
+// parent folders not being writable by other users; the bridge's security holds only
+// as long as that's true.
 
 import fs from "node:fs";
 import os from "node:os";
