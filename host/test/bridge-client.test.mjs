@@ -119,6 +119,25 @@ test("a grace-timeout rejection drops its waiter instead of leaking it until the
   assert.equal(c._connectWaiters.length, 0, "the timed-out request's waiter must not remain queued");
 });
 
+// --- Fix round: M4 -----------------------------------------------------------
+
+test("a hub that appears late in the grace window is not missed by a grown backoff", { timeout: 10000 }, async (t) => {
+  const home = tmpHome();
+  const c = client(home, { graceMs: 1000, retryMinMs: 50, retryMaxMs: 400 });
+  t.after(() => c.close());
+  const p = c.request("find", {});
+  // Past where the old exponential backoff (capped at retryMaxMs=400) would
+  // already have spread out its retries to every 400ms: its last attempt
+  // before the 1000ms deadline lands at t=750, next at t=1150 (too late).
+  await sleep(850);
+  const { hub, ext } = await startHub(home);
+  t.after(() => hub.stop("cleanup").catch(() => {}));
+  await waitFor(() => ext.received.length === 1);
+  ext.reply(ext.received[0], "ok");
+  assert.equal(await p, "ok");
+  c.close(); await hub.stop("test");
+});
+
 // --- Task 5 (H5): M5 deferred logging ---------------------------------------
 
 test("a persistent security refusal logs security_refusal once, and again after a successful connect clears it", { timeout: 10000 }, async (t) => {

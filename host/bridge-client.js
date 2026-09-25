@@ -157,8 +157,13 @@ export class BridgeClient {
 
   _scheduleRetry() {
     if (this._closed || this._retryTimer) return;
-    const delay = this._backoffMs;
-    this._backoffMs = Math.min(this._backoffMs * 2, this.retryMaxMs);
+    // While any request is still waiting out its grace window (M4), retry at
+    // retryMinMs instead of the grown backoff: a hub that appears late in a
+    // 5s grace must not be missed because the backoff had already spread out
+    // toward retryMaxMs from earlier, unrelated failures.
+    const waiting = this._connectWaiters.length > 0;
+    const delay = waiting ? this.retryMinMs : this._backoffMs;
+    if (!waiting) this._backoffMs = Math.min(this._backoffMs * 2, this.retryMaxMs);
     this._retryTimer = setTimeout(() => {
       this._retryTimer = null;
       this._connectOnce();
