@@ -203,6 +203,72 @@ test("prune also deletes a tab's trailing incremental-only rows once their own F
   });
 });
 
+const tabCount = async (page, id) => (await listSessionSummaries(page)).find((s) => s.session.id === id).tabCount;
+
+// Every audited call upserts its session twice (when it starts and when it is
+// recorded), and that must not reset the tab ids addEvents keeps on the row.
+test("the tab count survives the upsertSession of a later audited call", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  await withStore(async (page) => {
+    await upsert(page, { id: "s1", label: "app", cwd: "/x", pid: 1 }, 1000);
+    await addEvents(page, "s1", 11, [{ type: 4, timestamp: 1 }, { type: 2, timestamp: 2 }]);
+    await addEvents(page, "s1", 12, [{ type: 4, timestamp: 3 }, { type: 2, timestamp: 4 }]);
+    await upsert(page, { id: "s1", label: "app", cwd: "/x", pid: 1 }, 2000);
+    assert.equal(await tabCount(page, "s1"), 2);
+    await addEvents(page, "s1", 11, [{ type: 3, timestamp: 5 }]);
+    assert.equal(await tabCount(page, "s1"), 2);
+    const [session] = await listSessions(page);
+    assert.equal(session.firstSeen, 1000);
+    assert.equal(session.lastSeen, 2000);
+  });
+});
+
+test("prune drops the tab ids whose events it deleted", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  await withStore(async (page) => {
+    await upsert(page, { id: "s1", label: "app", cwd: "/x", pid: 1 }, Date.now() + 60_000); // stays active through the prune
+    await addEvents(page, "s1", 11, [{ type: 4, timestamp: 1 }, { type: 2, timestamp: 2 }]); // ages out below
+    await new Promise((r) => setTimeout(r, 500));
+    await addEvents(page, "s1", 12, [{ type: 4, timestamp: 3 }, { type: 2, timestamp: 4 }]);
+    await addEvents(page, "s1", 13, [{ type: 3, timestamp: 5 }]); // no FullSnapshot: nothing to replay from
+    assert.equal(await tabCount(page, "s1"), 3);
+
+    const dayMs = 24 * 60 * 60 * 1000;
+    await prune(page, { retentionDays: 250 / dayMs, maxSessions: 200, now: Date.now() }); // cutoff ~250ms ago
+
+    const { eventsByTab } = await getSession(page, "s1");
+    assert.deepEqual(Object.keys(eventsByTab), ["12"]);
+    assert.equal(await tabCount(page, "s1"), 1);
+  });
+});
+
+// A batch held back by the hasSession retry is stored after a later one, so key
+// order is not time order. The replay sorts a stream by event timestamps, and
+// so must prune.
+test("prune keeps a FullSnapshot row stored after an incremental row of the same stream", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  await withStore(async (page) => {
+    await upsert(page, { id: "s2", label: "app", cwd: "/x", pid: 1 }, Date.now());
+    await addEvents(page, "s2", 21, [{ type: 3, timestamp: 3000, data: { source: 1 } }]);
+    await addEvents(page, "s2", 21, [{ type: 4, timestamp: 1000 }, { type: 2, timestamp: 1001 }]);
+
+    await prune(page, { retentionDays: 7, maxSessions: 200, now: Date.now() }); // nothing is old enough to age out
+
+    const { eventsByTab } = await getSession(page, "s2");
+    assert.deepEqual(eventsByTab[21].map((e) => e.timestamp), [3000, 1000, 1001]);
+  });
+});
+
+test("prune deletes an incremental row older than the stream's first FullSnapshot, even when it was stored after it", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  await withStore(async (page) => {
+    await upsert(page, { id: "s3", label: "app", cwd: "/x", pid: 1 }, Date.now());
+    await addEvents(page, "s3", 31, [{ type: 4, timestamp: 1000 }, { type: 2, timestamp: 1001 }, { type: 3, timestamp: 1100, data: { source: 1 } }]);
+    await addEvents(page, "s3", 31, [{ type: 3, timestamp: 500, data: { source: 1 } }]); // a late batch from before the snapshot
+
+    await prune(page, { retentionDays: 7, maxSessions: 200, now: Date.now() });
+
+    const { eventsByTab } = await getSession(page, "s3");
+    assert.deepEqual(eventsByTab[31].map((e) => e.timestamp), [1000, 1001, 1100]);
+  });
+});
+
 test("hasSession reports existence without fetching actions or events", { skip: !chromeAvailable, timeout: 20000 }, async () => {
   await withStore(async (page) => {
     assert.equal(await hasSession(page, "s1"), false);
