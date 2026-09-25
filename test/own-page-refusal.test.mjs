@@ -12,16 +12,27 @@ import { chromeAvailable, launchChrome, openPage } from "./harness/browser.mjs";
 
 const refusalFor = (tabId) => `Tab ${tabId} shows a local file or this extension's own page, which the agent cannot use.`;
 
-test("a tab showing a local file is refused, whatever tool is called", async () => {
+test("a tab showing a local file is refused, whatever tool that needs the page is called", async () => {
   const bg = await loadBackground({ tab: { url: "file:///Users/x/secret.txt" } });
   const r1 = await bg.handlers.get_page_text({ tabId: bg.tabId });
   assert.equal(r1.content[0].text, refusalFor(bg.tabId));
   const r2 = await bg.handlers.computer({ action: "screenshot", tabId: bg.tabId });
   assert.equal(r2.content[0].text, refusalFor(bg.tabId));
-  const r3 = await bg.handlers.tabs_close_mcp({ tabId: bg.tabId });
-  assert.equal(r3.content[0].text, refusalFor(bg.tabId));
   // Refused upfront: no CDP call and no content-script message ever went out.
-  assert.equal(bg.calls.filter((c) => c[0] === "cdp" || c[0] === "tabs.sendMessage" || c[0] === "tabs.remove").length, 0);
+  assert.equal(bg.calls.filter((c) => c[0] === "cdp" || c[0] === "tabs.sendMessage").length, 0);
+});
+
+// Round 2 item 7: closing a blocked tab is harmless (it doesn't read or act on the page), so the
+// agent should still be able to clean one up rather than leave it stuck forever.
+test("tabs_close_mcp can close a tab showing a local file or this extension's own page", async () => {
+  const file = await loadBackground({ tab: { url: "file:///Users/x/secret.txt" } });
+  const r1 = await file.handlers.tabs_close_mcp({ tabId: file.tabId });
+  assert.equal(r1.content[0].text, `Closed tab ${file.tabId}.`);
+  assert.equal(file.calls.filter((c) => c[0] === "tabs.remove").length, 1);
+
+  const own = await loadBackground({ tab: { url: "chrome-extension://testextensionid/options.html" } });
+  const r2 = await own.handlers.tabs_close_mcp({ tabId: own.tabId });
+  assert.equal(r2.content[0].text, `Closed tab ${own.tabId}.`);
 });
 
 test("a tab showing this extension's own page is refused", async () => {

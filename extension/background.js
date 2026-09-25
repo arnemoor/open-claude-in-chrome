@@ -19,6 +19,19 @@ const consoleMessages = new Map(); // tabId -> [{level, text, timestamp, url}]
 const networkRequests = new Map(); // tabId -> [{url, method, status, type, timestamp}]
 const screenshotStore = new Map(); // imageId -> base64
 const openDialogs = new Map(); // tabId -> message, while a JS dialog (alert/confirm/prompt/beforeunload) blocks the page
+const pendingCdpRejects = new Map(); // tabId -> Set<reject>, one entry per in-flight rawCdp call on that tab
+
+// Thrown to reject every pending rawCdp call on a tab the instant its dialog opens (round 2 item
+// 2), instead of letting each one run out its own CDP_TIMEOUT_MS: a dialog freezes the renderer,
+// so an in-flight command (e.g. the click that opened it) is stuck until the user closes it
+// regardless of how it's reported. dialogMessage lets a caller (e.g. a click action) report that
+// its own action already happened before the dialog interrupted the rest.
+class DialogOpenedDuringCall extends Error {
+  constructor(message) {
+    super(`A JavaScript dialog opened during this call ("${message}").`);
+    this.dialogMessage = message;
+  }
+}
 
 // --- Keep-alive alarm ---
 chrome.alarms.create("keepalive", { periodInMinutes: 0.4 });
@@ -126,7 +139,7 @@ async function ensureTabGroup(createIfEmpty) {
 
 function formatTabContext(tabs) {
   // A blocked tab (a local file, or this extension's own page) stays listed so the agent can
-  // see it exists, but with no title and no real URL \u2014 the agent can't act on it anyway (every
+  // see it exists, but with no title and no real URL. The agent can't act on it anyway (every
   // tool that takes a tabId refuses it via tabAccessError above).
   const available = tabs.map((t) =>
     isBlockedUrl(t.url || "", chrome.runtime.id)
@@ -155,7 +168,13 @@ function formatTabContext(tabs) {
 // local file or this extension's own page (also reached via back/forward, or a tab dragged into
 // the group by hand — see isBlockedUrl below), or blocked behind an open JS dialog. Returns null
 // when tabId is fine to use, or the exact refusal text to show the agent otherwise.
-async function tabAccessError(tabId) {
+//   allowBlockedUrl: skip the file:/own-origin check (tabs_close_mcp only — closing such a tab
+//     doesn't read or act on it, so it's harmless, and it's the agent's only way to clean one up).
+//   allowDialog: skip the open-dialog check, for tools that don't need the page to be responsive
+//     (tabs_close_mcp and navigate — closing or navigating a tab dismisses its dialog anyway;
+//     resize_window — window.get/update are browser-level and readViewport already degrades to
+//     null within its own short budget instead of hanging).
+async function tabAccessError(tabId, { allowBlockedUrl = false, allowDialog = false } = {}) {
   // Always check live state — in-memory tabGroupTabs can be stale after service worker restart
   let tab;
   try {
@@ -183,11 +202,11 @@ async function tabAccessError(tabId) {
   }
   if (!inGroup) return `Tab ${tabId} is not in the MCP group.`;
 
-  if (isBlockedUrl(tab.url, chrome.runtime.id)) {
+  if (!allowBlockedUrl && isBlockedUrl(tab.url, chrome.runtime.id)) {
     return `Tab ${tabId} shows a local file or this extension's own page, which the agent cannot use.`;
   }
 
-  if (openDialogs.has(tabId)) {
+  if (!allowDialog && openDialogs.has(tabId)) {
     return `A JavaScript dialog is open on this tab ("${openDialogs.get(tabId)}"). It blocks the page until the user closes it.`;
   }
 
@@ -203,7 +222,19 @@ function rawCdp(tabId, method, params = {}, timeoutMs = CDP_TIMEOUT_MS) {
   const timeout = new Promise((_, reject) => {
     timer = setTimeout(() => reject(new Error(`CDP ${method} timed out after ${timeoutMs / 1000}s`)), timeoutMs);
   });
-  return Promise.race([chrome.debugger.sendCommand({ tabId }, method, params), timeout]).finally(() => clearTimeout(timer));
+  // Raced alongside the command itself: if a dialog opens on this tab before it settles, reject
+  // right away instead of waiting out timeoutMs for what a dialog has already frozen.
+  let rejectOnDialog;
+  const dialogAbort = new Promise((_, reject) => {
+    rejectOnDialog = reject;
+    let waiters = pendingCdpRejects.get(tabId);
+    if (!waiters) { waiters = new Set(); pendingCdpRejects.set(tabId, waiters); }
+    waiters.add(rejectOnDialog);
+  });
+  return Promise.race([chrome.debugger.sendCommand({ tabId }, method, params), timeout, dialogAbort]).finally(() => {
+    clearTimeout(timer);
+    pendingCdpRejects.get(tabId)?.delete(rejectOnDialog);
+  });
 }
 
 async function ensureAttached(tabId) {
@@ -285,6 +316,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   consoleMessages.delete(tabId);
   networkRequests.delete(tabId);
   openDialogs.delete(tabId);
+  pendingCdpRejects.delete(tabId);
 });
 
 // Handle user dismissing debugger bar
@@ -292,6 +324,7 @@ chrome.debugger.onDetach.addListener((source, reason) => {
   attachedTabs.delete(source.tabId);
   attaching.delete(source.tabId);
   openDialogs.delete(source.tabId);
+  pendingCdpRejects.delete(source.tabId);
 });
 
 // --- CDP event listeners for dialogs, console and network ---
@@ -302,9 +335,16 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   // it: CDP commands against the page either silently no-op (Input.dispatchKeyEvent) or hang
   // until it closes (Runtime.evaluate, Page.captureScreenshot). tabAccessError checks this
   // before a tool handler ever reaches one of those, instead of reporting a false success or
-  // waiting out a long timeout.
+  // waiting out a long timeout. A dialog opened mid-call (e.g. an onclick handler calling
+  // confirm()) is different: the call was already in flight, so reject it now instead of
+  // leaving it to run out rawCdp's own timeout for what's already frozen.
   if (method === "Page.javascriptDialogOpening") {
     openDialogs.set(tabId, params.message || "");
+    const waiters = pendingCdpRejects.get(tabId);
+    if (waiters) {
+      for (const reject of waiters) reject(new DialogOpenedDuringCall(params.message || ""));
+      waiters.clear();
+    }
   }
   if (method === "Page.javascriptDialogClosed") {
     openDialogs.delete(tabId);
@@ -547,9 +587,11 @@ function parseModifierString(modStr) {
 // --- Content script communication ---
 const CONTENT_MESSAGE_TIMEOUT_MS = 10000;
 
-// A page that never answers (e.g. frozen behind a JS dialog — tabAccessError normally catches
-// that first, but a dialog opened between that check and this call is still possible) used to
-// hang forever: neither attempt below had any timeout of its own.
+// A page that never answers used to hang forever: neither attempt below had any timeout of its
+// own. Content.js answers every message synchronously, so a healthy page replies in
+// milliseconds; a real 10s wait means the page is still loading, its main thread is busy, or
+// (tabAccessError normally catches this first, but a dialog opened in the gap is still
+// possible) it's frozen behind a JS dialog. The text below stays neutral about which.
 async function sendContentMessage(tabId, message, timeoutMs = CONTENT_MESSAGE_TIMEOUT_MS) {
   const attempt = (async () => {
     try {
@@ -566,7 +608,7 @@ async function sendContentMessage(tabId, message, timeoutMs = CONTENT_MESSAGE_TI
   })();
   let timer;
   const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`Tab ${tabId} did not respond within ${timeoutMs / 1000}s. If a JavaScript dialog is open on it, close it and try again.`)), timeoutMs);
+    timer = setTimeout(() => reject(new Error(`The page did not respond within ${timeoutMs / 1000} s (it may be busy or showing a dialog). The action may still complete.`)), timeoutMs);
   });
   return Promise.race([attempt, timeout]).finally(() => clearTimeout(timer));
 }
@@ -651,6 +693,23 @@ function pointerReply(verb, coordinate, hit, scrolled, notes) {
   text += ".";
   if (notes.length) text += ` Warning: ${notes.join(" ")}`;
   return text;
+}
+
+// Runs a click dispatch, then replies normally — unless a JS dialog opened mid-dispatch (round 2
+// item 2, e.g. an onclick handler calling confirm()): the click itself already happened before
+// the dialog interrupted whatever was left of it, so this says so instead of surfacing the raw
+// internal error or (rawCdp already rejects those calls immediately, see item 2) waiting out a
+// timeout for what a dialog has already frozen.
+async function dispatchPointerAction(verb, coordinate, hit, scrolled, notes, run) {
+  try {
+    await run();
+  } catch (err) {
+    if (err instanceof DialogOpenedDuringCall) {
+      return `${verb}, and the page opened a JavaScript dialog ("${err.dialogMessage}"). It blocks the page until the user closes it.`;
+    }
+    throw err;
+  }
+  return pointerReply(verb, coordinate, hit, scrolled, notes);
 }
 
 // Normalizes a navigate URL, keeping explicit schemes intact instead of forcing everything
@@ -740,7 +799,7 @@ function normalizeNavigateUrl(input, ownExtensionId) {
 
   // Unpacked extensions get file: access by default, so this would otherwise let the agent
   // read any local file (navigate there, then get_page_text) regardless of the upload
-  // allowlist — see final-review-a C1.
+  // allowlist.
   if (inner.protocol === "file:") {
     return { error: "file: URLs are blocked: the agent cannot open local files." };
   }
@@ -773,7 +832,7 @@ const toolHandlers = {
       // The group's one tab could have closed in the gap since ensureTabGroup last checked
       // (Chrome auto-removes a group once its last tab is gone), leaving tabGroupId stale.
       // Retry once instead of falling back to a windowId-less tabs.create, which lands in the
-      // operator's own window and then fails to group (Minor 8).
+      // operator's own window and then fails to group.
       await ensureTabGroup(true);
       groupTabs = await chrome.tabs.query({ groupId: tabGroupId });
       if (groupTabs.length === 0) {
@@ -783,6 +842,11 @@ const toolHandlers = {
     const tab = await chrome.tabs.create({ windowId: groupTabs[0].windowId, active: true });
     await chrome.tabs.group({ tabIds: [tab.id], groupId: tabGroupId });
     tabGroupTabs.add(tab.id);
+    // Attach the fresh tab now, not on whatever tool call happens to touch it first: a dialog
+    // that opens before the tab is ever attached is never seen, and every CDP call then hangs
+    // for the full 30s until the user closes it (round 2 item 1, probe F). Best-effort: some
+    // pages (e.g. chrome://) refuse debugger attach outright, and tab creation must still work.
+    try { await ensureAttached(tab.id); } catch {}
     const tabs = await chrome.tabs.query({ groupId: tabGroupId });
     const result = formatTabContext(tabs);
     result.content[0].text = `Created new tab. Tab ID: ${tab.id}\n\n` + result.content[0].text;
@@ -791,7 +855,7 @@ const toolHandlers = {
 
   async tabs_close_mcp(args) {
     const { tabId } = args;
-    const tabError = await tabAccessError(tabId);
+    const tabError = await tabAccessError(tabId, { allowBlockedUrl: true, allowDialog: true });
     if (tabError) return { content: [{ type: "text", text: tabError }] };
     // chrome.tabs.onRemoved cleans up our per-tab state (attached debugger,
     // console/network buffers). Chrome auto-removes the tab group when its last
@@ -802,8 +866,15 @@ const toolHandlers = {
 
   async navigate(args) {
     const { url, tabId } = args;
-    const tabError = await tabAccessError(tabId);
+    const tabError = await tabAccessError(tabId, { allowDialog: true });
     if (tabError) return { content: [{ type: "text", text: tabError }] };
+
+    // Attach before navigating, not after: otherwise a page that opens a dialog on load is
+    // never seen (round 2 item 1, probe F) — every CDP call then hangs for the full 30s until
+    // the user closes it. Best-effort: some pages (e.g. chrome://) refuse debugger attach
+    // outright, and navigate must still work on those, as it did before this fix (never
+    // attaching at all).
+    try { await ensureAttached(tabId); } catch {}
 
     if (url === "back") {
       await chrome.tabs.goBack(tabId);
@@ -851,8 +922,10 @@ const toolHandlers = {
 
     const tabs = await chrome.tabs.query({ groupId: tabGroupId });
     const loading = tab.status !== "complete" ? " (still loading)" : "";
+    // Same (blocked) rule as tabs_context_mcp/formatTabContext: a *different* group tab can be
+    // on a blocked page even when the one just navigated (checked above) isn't.
     const text = `Navigated to ${tab.url}${loading}.\n## Pages\n` +
-      tabs.map((t, i) => `${i + 1}: ${t.url}${t.id === tabId ? " [selected]" : ""}`).join("\n");
+      tabs.map((t, i) => `${i + 1}: ${isBlockedUrl(t.url, chrome.runtime.id) ? "(blocked)" : t.url}${t.id === tabId ? " [selected]" : ""}`).join("\n");
 
     return { content: [{ type: "text", text }] };
   },
@@ -898,6 +971,9 @@ const toolHandlers = {
       } catch {
         probe = null;
       }
+      if (probe?.error) {
+        return { content: [{ type: "text", text: probe.error }] };
+      }
       if (probe?.inViewport === false) {
         return { content: [{ type: "text", text: `Coordinate (${coordinate[0]}, ${coordinate[1]}) is outside the viewport (${probe.viewport || ""}). Scroll first or use a ref.` }] };
       }
@@ -926,26 +1002,26 @@ const toolHandlers = {
 
       case "left_click": {
         if (!coordinate) return { content: [{ type: "text", text: "coordinate is required for left_click" }] };
-        await mouseClick(tabId, coordinate[0], coordinate[1], { modifiers });
-        return { content: [{ type: "text", text: pointerReply("Clicked", coordinate, hit, scrolled, notes) }] };
+        const text = await dispatchPointerAction("Clicked", coordinate, hit, scrolled, notes, () => mouseClick(tabId, coordinate[0], coordinate[1], { modifiers }));
+        return { content: [{ type: "text", text }] };
       }
 
       case "right_click": {
         if (!coordinate) return { content: [{ type: "text", text: "coordinate is required for right_click" }] };
-        await mouseClick(tabId, coordinate[0], coordinate[1], { button: "right", modifiers });
-        return { content: [{ type: "text", text: pointerReply("Right-clicked", coordinate, hit, scrolled, notes) }] };
+        const text = await dispatchPointerAction("Right-clicked", coordinate, hit, scrolled, notes, () => mouseClick(tabId, coordinate[0], coordinate[1], { button: "right", modifiers }));
+        return { content: [{ type: "text", text }] };
       }
 
       case "double_click": {
         if (!coordinate) return { content: [{ type: "text", text: "coordinate is required for double_click" }] };
-        await mouseClick(tabId, coordinate[0], coordinate[1], { clickCount: 2, modifiers });
-        return { content: [{ type: "text", text: pointerReply("Double-clicked", coordinate, hit, scrolled, notes) }] };
+        const text = await dispatchPointerAction("Double-clicked", coordinate, hit, scrolled, notes, () => mouseClick(tabId, coordinate[0], coordinate[1], { clickCount: 2, modifiers }));
+        return { content: [{ type: "text", text }] };
       }
 
       case "triple_click": {
         if (!coordinate) return { content: [{ type: "text", text: "coordinate is required for triple_click" }] };
-        await mouseClick(tabId, coordinate[0], coordinate[1], { clickCount: 3, modifiers });
-        return { content: [{ type: "text", text: pointerReply("Triple-clicked", coordinate, hit, scrolled, notes) }] };
+        const text = await dispatchPointerAction("Triple-clicked", coordinate, hit, scrolled, notes, () => mouseClick(tabId, coordinate[0], coordinate[1], { clickCount: 3, modifiers }));
+        return { content: [{ type: "text", text }] };
       }
 
       case "hover": {
@@ -1118,6 +1194,8 @@ const toolHandlers = {
       },
     });
 
+    if (resp?.result?.error) return { content: [{ type: "text", text: resp.result.error }] };
+
     let tree = resp?.result || "Error: Could not generate accessibility tree";
     // Append viewport dimensions so Claude knows the coordinate space
     const vp = await readViewport(tabId);
@@ -1131,6 +1209,7 @@ const toolHandlers = {
     if (tabError) return { content: [{ type: "text", text: tabError }] };
 
     const resp = await sendContentMessage(tabId, { type: "getPageText" });
+    if (resp?.result?.error) return { content: [{ type: "text", text: resp.result.error }] };
     if (!resp?.result) return { content: [{ type: "text", text: "Error: Could not extract page text" }] };
 
     try {
@@ -1154,6 +1233,7 @@ const toolHandlers = {
     if (tabError) return { content: [{ type: "text", text: tabError }] };
 
     const resp = await sendContentMessage(tabId, { type: "findElements", query });
+    if (resp?.result?.error) return { content: [{ type: "text", text: resp.result.error }] };
     const results = resp?.result || [];
 
     if (results.length === 0) {
@@ -1291,7 +1371,7 @@ const toolHandlers = {
 
   async resize_window(args) {
     const { width, height, tabId } = args;
-    const tabError = await tabAccessError(tabId);
+    const tabError = await tabAccessError(tabId, { allowDialog: true });
     if (tabError) return { content: [{ type: "text", text: tabError }] };
 
     const tab = await chrome.tabs.get(tabId);

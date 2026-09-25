@@ -112,3 +112,24 @@ test("navigate refuses instead of revealing the title when back lands on a block
   assert.equal(r.content[0].text, `Tab ${bg.tabId} shows a local file or this extension's own page, which the agent cannot use.`);
   assert.doesNotMatch(r.content[0].text, /secret\.txt/);
 });
+
+// Round 2 item 5: navigate's own "## Pages" listing leaked a blocked *other* tab's real URL
+// (e.g. file:///Users/x/.ssh/id_ed25519) even though tabs_context_mcp already redacts it.
+test("navigate's page list shows (blocked) instead of a blocked tab's real URL", async () => {
+  let bg;
+  const update = async () => { setTimeout(() => bg.chrome.tabs.onUpdated.fire(11, { status: "complete" }), 0); };
+  bg = await loadBackground({
+    overrides: {
+      tabs: {
+        update,
+        query: async () => [
+          { id: 11, windowId: 1, groupId: 7, title: "t", url: "https://example.com/" },
+          { id: 99, windowId: 1, groupId: 7, title: "id_ed25519", url: "file:///Users/x/.ssh/id_ed25519" },
+        ],
+      },
+    },
+  });
+  const r = await bg.handlers.navigate({ url: "https://example.com", tabId: 11 });
+  assert.doesNotMatch(r.content[0].text, /\.ssh\/id_ed25519/);
+  assert.match(r.content[0].text, /^2: \(blocked\)$/m);
+});
