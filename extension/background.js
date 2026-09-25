@@ -1257,9 +1257,11 @@ const toolHandlers = {
     });
 
     if (resp?.result?.error) return errorResult(resp.result.error);
-    if (!resp?.result) return errorResult("Error: Could not generate accessibility tree");
+    if (resp?.result == null) return errorResult("Error: Could not generate accessibility tree");
 
-    let tree = resp.result;
+    // An empty tree (about:blank, an empty body, filter "interactive" on a page with only text)
+    // is a status answer, like find's "No elements found", not a failure.
+    let tree = resp.result || (args.filter === "interactive" ? "No interactive elements found." : "No elements found.");
     // Append viewport dimensions so Claude knows the coordinate space
     const vp = await readViewport(tabId);
     if (vp) tree += `\n\nViewport: ${vp.width}x${vp.height}`;

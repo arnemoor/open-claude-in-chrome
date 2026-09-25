@@ -82,6 +82,17 @@ test("read_page and get_page_text report a missing result with isError", async (
   assert.equal(await refusal(bg, (b) => b.handlers.get_page_text({ tabId: 11 })), "Error: Could not extract page text");
 });
 
+// An empty tree is read_page's empty list: a status answer, not a failure.
+test("read_page on an empty tree is a success with a no-elements line and the viewport", async () => {
+  const bg = await loadBackground({ content: contentReplying({ generateAccessibilityTree: { result: "" } }) });
+  const all = await bg.handlers.read_page({ tabId: 11 });
+  assert.equal("isError" in all, false, JSON.stringify(all));
+  assert.equal(all.content[0].text, "No elements found.\n\nViewport: 1200x713");
+  const interactive = await bg.handlers.read_page({ tabId: 11, filter: "interactive" });
+  assert.equal("isError" in interactive, false);
+  assert.equal(interactive.content[0].text, "No interactive elements found.\n\nViewport: 1200x713");
+});
+
 test("javascript_tool reports a thrown exception with isError", async () => {
   const bg = await loadBackground({
     overrides: { debugger: { sendCommand: async (t, m, p) => (m === "Runtime.evaluate" && p.expression === "boom()" ? { exceptionDetails: { text: "Uncaught ReferenceError: boom is not defined" } } : {}) } },
@@ -183,6 +194,20 @@ before(async () => {
   await browser.send("Browser.setDownloadBehavior", { behavior: "deny" });
 }, { timeout: 30000 });
 after(async () => { await browser?.close(); });
+
+test("real Chrome: read_page on about:blank and on a text-only page with filter interactive is a success", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  const blank = await openPage(browser);
+  const blankBg = await loadBackground({ page: blank, content: await injectContentScript(blank, CONTENT) });
+  const r1 = await blankBg.handlers.read_page({ tabId: blankBg.tabId });
+  assert.equal("isError" in r1, false, JSON.stringify(r1));
+  assert.match(r1.content[0].text, /^No elements found\.\n\nViewport: \d+x\d+$/);
+
+  const text = await openPage(browser, { html: "<p>Only text here.</p>" });
+  const textBg = await loadBackground({ page: text, content: await injectContentScript(text, CONTENT) });
+  const r2 = await textBg.handlers.read_page({ tabId: textBg.tabId, filter: "interactive" });
+  assert.equal("isError" in r2, false, JSON.stringify(r2));
+  assert.match(r2.content[0].text, /^No interactive elements found\.\n\nViewport: \d+x\d+$/);
+});
 
 test("real Chrome: read_page with an unknown ref_id replies with isError", { skip: !chromeAvailable, timeout: 20000 }, async () => {
   const page = await openPage(browser, { html: "<button>Go</button>" });
