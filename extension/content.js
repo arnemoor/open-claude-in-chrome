@@ -35,8 +35,9 @@
   const parentNodeGet = Object.getOwnPropertyDescriptor(Node.prototype, "parentNode").get;
   const isConnectedGet = Object.getOwnPropertyDescriptor(Node.prototype, "isConnected").get;
   const assignedSlotGet = Object.getOwnPropertyDescriptor(Element.prototype, "assignedSlot").get;
-  // Tag-owned getter (HTMLLabelElement only): guarded by `instanceof` at its one call site
-  // (labelNotes), the same rule as offsetParentGet above, so it's not part of the dom object.
+  // Tag-owned getter (HTMLLabelElement only): called only on what enclosingLabel returns, which
+  // is already instanceof-guarded there (the same rule as offsetParentGet above), so it's not
+  // part of the dom object. Two call sites: labelNotes and isOwnLabel.
   const labelControlGet = Object.getOwnPropertyDescriptor(HTMLLabelElement.prototype, "control").get;
   // Not part of the public dom object (not in E4b's interface): captured the same way, called
   // directly at their one call site each (both in getPageText).
@@ -703,19 +704,32 @@
 
   // Shared by getRefTarget and probePoint: warn when the hit point is inside a <label> whose
   // control is missing or disabled, since a click there won't do what it looks like it will.
+  // Skipped when interactive content of its own (the same LABEL_ESCAPE_SELECTOR walk isOwnLabel
+  // uses, excluding the label's own control) sits between the hit and the label: a browser
+  // doesn't forward that click to the label's control at all, so whether that control exists or
+  // is disabled is beside the point — e.g. a <button> inside <label for=c> with a disabled #c,
+  // or a shadow input inside <label>Name <my-input></label> with no recognized .control.
   function labelNotes(hit) {
     const notes = [];
     const label = enclosingLabel(hit);
     if (label) {
       const control = labelControlGet.call(label);
-      if (!control) notes.push("This label has no associated control, so the click may do nothing.");
-      else if (dom.matches(control, ":disabled")) notes.push("This label's control is disabled.");
+      let escaped = false;
+      let n = hit;
+      while (n !== label) {
+        if (n !== control && n instanceof Element && dom.matches(n, LABEL_ESCAPE_SELECTOR)) { escaped = true; break; }
+        n = flatTreeParent(n);
+      }
+      if (!escaped) {
+        if (!control) notes.push("This label has no associated control, so the click may do nothing.");
+        else if (dom.matches(control, ":disabled")) notes.push("This label's control is disabled.");
+      }
     }
     return notes;
   }
 
-  // HTML "interactive content" (the spec category, not M9's broader display set of things
-  // that merely *look* clickable): a browser does not forward a click on any of these, nested
+  // HTML "interactive content" (the spec category, not the broader display set of things that
+  // merely *look* clickable): a browser does not forward a click on any of these, nested
   // inside a label, to the label's own control — it activates the nested element instead.
   const LABEL_ESCAPE_SELECTOR = 'a[href], button, input:not([type="hidden"]), select, textarea, details, iframe, embed, audio[controls], video[controls]';
 
