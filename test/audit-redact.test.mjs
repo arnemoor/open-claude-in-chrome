@@ -240,31 +240,79 @@ test("javascript_tool: a bare / (division or otherwise) masks everything from th
   assert.match(s, /^let a = width \[\d+ chars\]$/);
 });
 
-// The re-review's exact adversarial P (postfix ++/--) and K (if/while/await/
-// spread/keyword-as-identifier) families — every one used to desynchronize
-// the old heuristic and leak its own named secret.
+// Fix round 4, item 6: all 61 adversarial inputs of the round-2 re-review,
+// transcribed unaltered with their secret patterns. P2-P7 and K1-K7 leaked
+// through the old regex-vs-division heuristic.
 const NO_LEAK_CASES = [
-  ["P1", "r = a++ / 'x' / 'S3cr3tP1';"],
-  ["P2", "r = a++ / 'x/' + 'S3cr3tP2';"],
-  ["P3", "r = i++ / 2; parts = s.split('/'); pw = 'S3cr3tP3';"],
-  ["P4", "pct = done++ / total; url = base + '/api/login'; fetch(url, {body: 'password=S3cr3tP4'});"],
-  ["P5", "r = n-- / 2; s = 'x/S3cr3tP5';"],
-  ["P6", "r = a++ / 2; // done/it's\npw = 'S3cr3tP6';"],
-  ["P7", "r = i++ / 2;\nconst u = '/v1/users';\nconst pw = 'S3cr3tP7';"],
-  ["K1", "if (ok) /'/.test(s); pw = 'S3cr3tK1';"],
-  ["K2", "x = {} / 2; y = 'a/b'; z = 'S3cr3tK2';"],
-  ["K3", "let of = 4; x = of / 2; s = 'a/b'; t = 'S3cr3tK3';"],
-  ["K4", "x = r.in / 2; s = 'a/b'; t = 'S3cr3tK4';"],
-  ["K5", "async () => { await /'/; pw = 'S3cr3tK5'; }"],
-  ["K6", "a = [.../'/g.exec(s)]; pw = 'S3cr3tK6';"],
-  ["K7", 'while (x) /"/.exec(s); pw = "S3cr3tK7";'],
-  ["K8", "x = ++i / 2; pw = 'S3cr3tK8';"],
+  ["C1 apostrophe in // comment", "// fill in the user's password\ndocument.querySelector('#pw').value = 'S3cr3tA';", /S3cr3tA/],
+  ["C2 apostrophe in /* */", "/* the user's token */ pw.value = 'S3cr3tB';", /S3cr3tB/],
+  ["C3 dquote in /* */", '/* say "hi */ x = "S3cr3tC";', /S3cr3tC/],
+  ["C4 backtick in /* */", "/* a ` b */ x = `S3cr3tD`;", /S3cr3tD/],
+  ["C5 quote in // inside ${}", "x = `${ a // it's\n }S3cr3tE`; y = 'S3cr3tF';", /S3cr3tE|S3cr3tF/],
+  ["R1 regex after return", "function f(s){ return /'/.test(s) } pw.value = 'S3cr3tG';", /S3cr3tG/],
+  ["R2 regex after (", "s = s.replace(/'/g, \"\"); x = 'S3cr3tH';", /S3cr3tH/],
+  ["R3 regex after =", "const re = /\"/g; x = \"S3cr3tI\";", /S3cr3tI/],
+  ["R4 regex after ,", "f(a, /'/g, 'S3cr3tJ');", /S3cr3tJ/],
+  ["R5 regex after =>", "g = s => /'/.test(s); y = 'S3cr3tK';", /S3cr3tK/],
+  ["R6 regex after typeof", "t = typeof /'/; y = 'S3cr3tL';", /S3cr3tL/],
+  ["R7 regex class with / and quotes", "m = s.match(/[/'\"]/g); y = 'S3cr3tM';", /S3cr3tM/],
+  ["R8 regex with escaped /", "m = s.match(/\\/'/g); y = 'S3cr3tN';", /S3cr3tN/],
+  ["R9 regex after }", "function f(){}\n/'/.test(s); y = 'S3cr3tO';", /S3cr3tO/],
+  ["R10 regex after : (object)", "o = {re: /'/g, pw: 'S3cr3tP'};", /S3cr3tP/],
+  ["R11 regex after &&", "ok && /'/.test(s) && (pw = 'S3cr3tQ');", /S3cr3tQ/],
+  ["R12 regex after !", "if (!/'/.test(s)) pw = 'S3cr3tR';", /S3cr3tR/],
+  ["D1 division after )", "x = (a + b) / 2; y = 'S3cr3tS';", /S3cr3tS/],
+  ["D2 division after ) then string with /", "x = (a + b) / 2; y = 'a/b'; z = 'S3cr3tT';", /S3cr3tT/],
+  ["D3 division after ]", "x = arr[0] / 2; y = 'a/b'; z = 'S3cr3tU';", /S3cr3tU/],
+  ["D4 division after number", "x = 10 / 2; y = 'a/b'; z = 'S3cr3tV';", /S3cr3tV/],
+  ["D5 division after string", "x = 'a' / 2; y = 'c/d'; z = 'S3cr3tW';", /S3cr3tW/],
+  ["D6 /= after ident", "x /= 2; y = 'a/b'; z = 'S3cr3tX';", /S3cr3tX/],
+  ["D7 division with comment between", "x = a /* c */ / 2; y = 'a/b'; z = 'S3cr3tY';", /S3cr3tY/],
+  ["P1 a++ / 'x' / 'S'", "r = a++ / 'x' / 'S3cr3tP1';", /S3cr3tP1/],
+  ["P2 a++ / 'x/' + 'S'", "r = a++ / 'x/' + 'S3cr3tP2';", /S3cr3tP2/],
+  ["P3 i++ / 2; split('/')", "r = i++ / 2; parts = s.split('/'); pw = 'S3cr3tP3';", /S3cr3tP3/],
+  ["P4 done++ / total; '/api'", "pct = done++ / total; url = base + '/api/login'; fetch(url, {body: 'password=S3cr3tP4'});", /S3cr3tP4/],
+  ["P5 n-- / 2 then 'x/SECRET'", "r = n-- / 2; s = 'x/S3cr3tP5';", /S3cr3tP5/],
+  ["P6 a++ / 2 then // comment with slash+apostrophe", "r = a++ / 2; // done/it's\npw = 'S3cr3tP6';", /S3cr3tP6/],
+  ["P7 i++ / 2 multi-line", "r = i++ / 2;\nconst u = '/v1/users';\nconst pw = 'S3cr3tP7';", /S3cr3tP7/],
+  ["E1 escaped backslash at string end", "x = 'abc\\\\'; y = 'S3cr3tE1';", /S3cr3tE1/],
+  ["E2 escaped dquote", 'x = "a\\"b"; y = "S3cr3tE2";', /S3cr3tE2/],
+  ["E3 escaped backslash then escaped quote", "x = 'a\\\\\\'b'; y = 'S3cr3tE3';", /S3cr3tE3/],
+  ["E4 trailing backslash at input end", "x = 'S3cr3tE4\\", /S3cr3tE4/],
+  ["E5 escaped backtick in template", "x = `a\\`b`; y = 'S3cr3tE5';", /S3cr3tE5/],
+  ["E6 backslash at end of template", "x = `a\\\\`; y = 'S3cr3tE6';", /S3cr3tE6/],
+  ["T1 ${} with '}' string", "x = `a ${'}'} b S3cr3tT1`;", /S3cr3tT1/],
+  ["T2 ${} with backtick in string", "x = `${\"`\"}S3cr3tT2`; y = 'S3cr3tT2b';", /S3cr3tT2/],
+  ["T3 ${} with object literal", "x = `${ {a: 1}.a } S3cr3tT3`; y = 'S3cr3tT3b';", /S3cr3tT3/],
+  ["T4 ${} with nested braces", "x = `${ JSON.stringify({a: {b: 'c'}}) } S3cr3tT4`; y = 'S3cr3tT4b';", /S3cr3tT4/],
+  ["T5 nested templates x3", "x = `${ `${ `S3cr3tT5` }` }`; y = 'S3cr3tT5b';", /S3cr3tT5/],
+  ["T6 ${} with regex containing }", "x = `${ s.replace(/}/g, '') }S3cr3tT6`; y = 'S3cr3tT6b';", /S3cr3tT6/],
+  ["T7 ${} with ++ division", "x = `${i++ / 2}` + '/' + 'S3cr3tT7';", /S3cr3tT7/],
+  ["T8 ${} with block comment containing }", "x = `${ a /* } */ }S3cr3tT8`; y = 'S3cr3tT8b';", /S3cr3tT8/],
+  ["T9 template after template", "x = `a` + `S3cr3tT9`;", /S3cr3tT9/],
+  ["T10 ${} string with ${", "x = `${ '${' }S3cr3tT10`; y='S3cr3tT10b';", /S3cr3tT10/],
+  ["U1 unterminated string", "pw.value = 'never closes S3cr3tU1", /S3cr3tU1/],
+  ["U2 unterminated template", "x = `S3cr3tU2 ${a}", /S3cr3tU2/],
+  ["U3 unterminated regex", "x = /S3cr3tU3", /S3cr3tU3/],
+  ["U4 unterminated block comment", "/* S3cr3tU4", /S3cr3tU4/],
+  ["U5 unterminated ${", "x = `${ 'a' + S3cr3tU5", /S3cr3tU5/],
+  ["U6 unterminated string in ${", "x = `${ 'S3cr3tU6 }`", /S3cr3tU6/],
+  ["K1 regex after ) of if", "if (ok) /'/.test(s); pw = 'S3cr3tK1';", /S3cr3tK1/],
+  ["K2 division after {} (obj)", "x = {} / 2; y = 'a/b'; z = 'S3cr3tK2';", /S3cr3tK2/],
+  ["K3 of as identifier", "let of = 4; x = of / 2; s = 'a/b'; t = 'S3cr3tK3';", /S3cr3tK3/],
+  ["K4 .in property division", "x = r.in / 2; s = 'a/b'; t = 'S3cr3tK4';", /S3cr3tK4/],
+  ["K5 await regex", "async () => { await /'/; pw = 'S3cr3tK5'; }", /S3cr3tK5/],
+  ["K6 regex after ... spread", "a = [.../'/g.exec(s)]; pw = 'S3cr3tK6';", /S3cr3tK6/],
+  ["K7 regex after ) with dquote", 'while (x) /"/.exec(s); pw = "S3cr3tK7";', /S3cr3tK7/],
+  ["K8 regex after ++ (prefix)", "x = ++i / 2; y = 'a/b'; z = 'S3cr3tK8';", /S3cr3tK8/],
 ];
-for (const [name, code] of NO_LEAK_CASES) {
-  const secret = code.match(/S3cr3t\w+/)[0];
-  test(`javascript_tool: ${name} does not leak its secret literal`, () => {
+test("javascript_tool: the adversarial table holds all 61 inputs", () => {
+  assert.equal(NO_LEAK_CASES.length, 61);
+});
+for (const [label, code, secret] of NO_LEAK_CASES) {
+  test(`javascript_tool: ${label} does not leak its secret literal`, () => {
     const { auditSummary } = load();
-    assert.doesNotMatch(auditSummary("javascript_tool", { text: code }), new RegExp(secret));
+    assert.doesNotMatch(auditSummary("javascript_tool", { text: code }), secret);
   });
 }
 
@@ -296,16 +344,46 @@ test("javascript_tool: an unterminated block comment fails closed instead of ech
   assert.match(s, /^\/\*\[\d+ chars\]$/);
 });
 
-// Item 1's explicit depth bound: with an explicit stack (not recursion), deep
-// nesting can no longer throw a RangeError and drop the whole action — it
-// fails closed past 100 levels instead.
-test("javascript_tool: 200 levels of nested template literals fail closed instead of throwing, and never leak the innermost secret", () => {
+function nestedTemplates(levels, inner) {
+  return "x = " + "`a${".repeat(levels) + inner + "}`".repeat(levels) + "; y = 'S3cr3tAfter';";
+}
+
+// Fix round 4, item 6: the cap counts template levels, as ruled. Round 3
+// pushed two stack frames per level and compared the stack length with 100,
+// so it failed closed from level 51.
+test("javascript_tool: 100 nested template levels still close, the 101st fails closed", () => {
   const { auditSummary } = load();
-  let code = "'SECRET_AT_BOTTOM'";
-  for (let i = 0; i < 200; i++) code = "`L" + i + " ${" + code + "}`";
-  assert.doesNotThrow(() => auditSummary("javascript_tool", { text: code }));
-  assert.doesNotMatch(auditSummary("javascript_tool", { text: code }), /SECRET_AT_BOTTOM/);
+  assert.match(auditSummary("javascript_tool", { text: nestedTemplates(100, "1") }), /^x = `\[\d+ chars\]`; y = '\[11 chars\]';$/);
+  assert.match(auditSummary("javascript_tool", { text: nestedTemplates(101, "1") }), /^x = `\[\d+ chars\]$/);
 });
+
+// The recursive scanner of round 2 threw a RangeError at 10,000 levels, which
+// dropped the whole action from the log.
+test("javascript_tool: 20,000 nested template levels neither throw nor leak", () => {
+  const { auditSummary } = load();
+  let s;
+  assert.doesNotThrow(() => { s = auditSummary("javascript_tool", { text: nestedTemplates(20000, "'SECRET_AT_BOTTOM'") }); });
+  assert.doesNotMatch(s, /SECRET_AT_BOTTOM|S3cr3tAfter/);
+});
+
+// Fix round 4, item 4: JavaScript also ends a line at CR, U+2028 and U+2029.
+// A // comment that ran on to the next LF hid real code from the scanner: at
+// the top level a string after the line end was echoed, and inside ${} the
+// template seemed to close at a later backtick, so the text after it was
+// echoed as code.
+for (const [name, eol] of [["LF", "\n"], ["CR", "\r"], ["U+2028", "\u2028"], ["U+2029", "\u2029"]]) {
+  test(`javascript_tool: a // comment ends at ${name}`, () => {
+    const { auditSummary } = load();
+    assert.equal(auditSummary("javascript_tool", { text: `// note${eol}pw = 'S3CR1';` }), `// note${eol}pw = '[5 chars]';`);
+  });
+
+  test(`javascript_tool: a // comment inside \${} ends at ${name}`, () => {
+    const { auditSummary } = load();
+    const code = "x = `${ a // note" + eol + " }`; function g() {\n}; s = `S3CR2`;";
+    const templateLength = code.indexOf("`;") - 5;
+    assert.equal(auditSummary("javascript_tool", { text: code }), "x = `[" + templateLength + " chars]`; function g() {\n}; s = `[5 chars]`;");
+  });
+}
 
 test("javascript_tool: a plain snippet with no / anywhere keeps its exact code structure", () => {
   const { auditSummary } = load();
@@ -412,6 +490,21 @@ test("scrubUrls consumes ) and ' inside a query or fragment, not just up to them
   const { scrubUrls } = load();
   const s = scrubUrls('Cannot access "https://bank.test/cb?code=abc)PARENSECRET#frag\'more"', 300);
   assert.doesNotMatch(s, /PARENSECRET/);
+  assert.equal(s, 'Cannot access "https://bank.test/cb?…#…"');
+});
+
+// Fix round 4, item 1: round 3 took "?" and "#" out of the host/path run but
+// left "'" in it, so a quote in a query or fragment ended the whole token and
+// the rest of the query stayed in the text.
+test("scrubUrls: a ' inside a query or fragment does not end the URL token", () => {
+  const { scrubUrls } = load();
+  assert.equal(scrubUrls("https://x.test/s?q=it's&token=APOSQ2"), "https://x.test/s?…");
+  assert.equal(scrubUrls("https://x.test/p#state=a'APOSF1"), "https://x.test/p#…");
+});
+
+test("scrubUrls: a ' still ends a URL before any query, e.g. a URL in single quotes", () => {
+  const { scrubUrls } = load();
+  assert.equal(scrubUrls("open 'https://x.test/p' now"), "open 'https://x.test/p' now");
 });
 
 test("scrubUrls still stops a bare URL (no query) at a closing paren, e.g. a parenthetical", () => {
@@ -453,6 +546,17 @@ test("scrubUrls (item 3): a data: URL containing a space is masked to the end of
   const { scrubUrls } = load();
   const s = scrubUrls("data:text/html,<p>my password is DATASPACE1</p>", 300);
   assert.doesNotMatch(s, /DATASPACE1/);
+});
+
+// Fix round 4, item 3: a data: payload can hold any character, so a quote in
+// it does not end the mask either. It runs to the end of the value.
+test("scrubUrls: a data: URL is masked to the end of the value, past any quote in its payload", () => {
+  const { scrubUrls } = load();
+  const apos = "data:text/html,<p>it's DATAAPOS1</p>";
+  assert.equal(scrubUrls(apos), `data:[${apos.length} chars]`);
+  const prefix = 'Cannot access "';
+  const quoted = `${prefix}data:text/html,<a href="x">DATAQUOT1</a>" here`;
+  assert.equal(scrubUrls(quoted), `${prefix}data:[${quoted.length - prefix.length} chars]`);
 });
 
 // Fix round 3, item 2 (new Important): URL_TOKEN_RE's unbounded scheme part
@@ -556,6 +660,48 @@ test("I1/item 4: a style attribute mutation's diff object has its string propert
   const events = [{ type: 3, data: { source: 0, texts: [], removes: [], adds: [], attributes: [{ id: 6, attributes: { style: { "background-image": 'url("https://x.test/i.png?token=STYMUT2")' } } }] } }];
   redactEvents(events, new Map());
   assert.doesNotMatch(JSON.stringify(events), /STYMUT2/);
+});
+
+// Fix round 4, item 2: a style attribute is a string in a snapshot, and also
+// in a mutation whose diff would be longer than the whole value (the usual
+// case for el.style.x = ... on an element without an inline style). A diff
+// value is a string, a [value, priority] array for setProperty(...,
+// "important"), or false for a removed property. The shapes and markers are
+// the ones real rrweb sent in the round 3 re-review.
+test("redactEvents: an inline style string in a full snapshot is scrubbed", () => {
+  const { redactEvents } = load();
+  const events = [{ type: 2, data: { node: { type: 0, id: 1, childNodes: [{ type: 2, tagName: "div", attributes: { style: "background-image: url(https://x.test/i.png?token=STYSNAP1)" }, id: 2, childNodes: [] }] } } }];
+  redactEvents(events, new Map());
+  const style = events[0].data.node.childNodes[0].attributes.style;
+  assert.doesNotMatch(style, /STYSNAP1/);
+  assert.match(style, /^background-image: url\(https:\/\/x\.test\/i\.png\?…/);
+});
+
+test("redactEvents: a style mutation sent as a whole string is scrubbed", () => {
+  const { redactEvents } = load();
+  const events = [{ type: 3, data: { source: 0, texts: [], removes: [], adds: [], attributes: [{ id: 2, attributes: { style: 'background-image: url("https://x.test/i.png?token=STYMUT1");' } }] } }];
+  redactEvents(events, new Map());
+  assert.equal(events[0].data.attributes[0].attributes.style, 'background-image: url("https://x.test/i.png?…");');
+});
+
+test("redactEvents: an !important style diff ([value, priority]) is scrubbed, keeping its priority and removed properties", () => {
+  const { redactEvents } = load();
+  const events = [{ type: 3, data: { source: 0, texts: [], removes: [], adds: [], attributes: [{ id: 6, attributes: { style: { "background-image": ['url("https://x.test/i.png?token=STYIMP1")', "important"], color: false } } }] } }];
+  redactEvents(events, new Map());
+  assert.deepEqual(events[0].data.attributes[0].attributes.style, { "background-image": ['url("https://x.test/i.png?…")', "important"], color: false });
+});
+
+// Fix round 4, item 1: the quote-in-query regression as the walker meets it,
+// on a data-* attribute in a snapshot and in a later setAttribute mutation.
+test("redactEvents: a URL with a ' in its query is scrubbed from a data-x attribute in a snapshot and in a mutation", () => {
+  const { redactEvents } = load();
+  const knownTags = new Map();
+  const snapshot = [{ type: 2, data: { node: { type: 0, id: 1, childNodes: [{ type: 2, tagName: "div", attributes: { id: "apos", "data-x": "https://x.test/s?q=it's&token=APOSSNAP1" }, id: 12, childNodes: [] }] } } }];
+  const mutation = [{ type: 3, data: { source: 0, texts: [], removes: [], adds: [], attributes: [{ id: 12, attributes: { "data-x": "https://x.test/s?q=it's&token=APOSMUT1" } }] } }];
+  redactEvents(snapshot, knownTags);
+  redactEvents(mutation, knownTags);
+  assert.equal(snapshot[0].data.node.childNodes[0].attributes["data-x"], "https://x.test/s?…");
+  assert.equal(mutation[0].data.attributes[0].attributes["data-x"], "https://x.test/s?…");
 });
 
 test("I1: an option's value is left alone, since it is page content, not a typed secret", () => {

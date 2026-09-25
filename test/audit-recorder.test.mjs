@@ -7,11 +7,15 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
+import vm from "node:vm";
 import { chromeAvailable, launchChrome, openPage, evaluate } from "./harness/browser.mjs";
 
 const EXT = path.join(import.meta.dirname, "..", "extension");
 const VENDOR_JS = fs.readFileSync(path.join(EXT, "vendor", "rrweb-record.min.js"), "utf8");
 const RECORDER_JS = fs.readFileSync(path.join(EXT, "audit", "recorder.js"), "utf8");
+const REDACT_JS = fs.readFileSync(path.join(EXT, "audit", "redact.js"), "utf8");
+
+const RECORDER_PAGE = `<!doctype html><title>audit-recorder test</title><input id="t"><input id="p" type="password"><div id="c" contenteditable="true"></div><div id="ce" contenteditable="true"><p id="ce-p">existing</p></div><input type="hidden" id="h1" name="csrf" value="HIDDENLOAD111"><input type="hidden" id="h2" value=""><textarea id="ta">TEXTAREADEFAULT1</textarea>`;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -25,9 +29,9 @@ after(() => browser?.close());
 // ensureRecorder() (audit.js) injects them with in production. A stub
 // chrome.runtime.sendMessage pushes each flushed batch into globalThis.sent instead of
 // actually relaying it to a background page.
-async function withRecorderPage(fn, { skipRecorderEval = false } = {}) {
+async function withRecorderPage(fn, { skipRecorderEval = false, html = RECORDER_PAGE } = {}) {
   const server = http.createServer((req, res) => {
-    res.end(`<!doctype html><title>audit-recorder test</title><input id="t"><input id="p" type="password"><div id="c" contenteditable="true"></div><div id="ce" contenteditable="true"><p id="ce-p">existing</p></div><input type="hidden" id="h1" name="csrf" value="HIDDENLOAD111"><input type="hidden" id="h2" value=""><textarea id="ta">TEXTAREADEFAULT1</textarea>`);
+    res.end(html);
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = server.address().port;
@@ -296,4 +300,53 @@ test("evaluating recorder.js a second time does not start a second recorder", { 
 
     assert.equal(secondCount, firstCount, `re-evaluating recorder.js should not change the event rate (first ${firstCount}, second ${secondCount})`);
   });
+});
+
+// Fix round 4, items 1 and 2: the redactEvents fixtures in audit-redact.test.mjs
+// model rrweb's event shapes by hand, and round 3's style and quote
+// regressions passed them. This walks what real rrweb relays from real Chrome,
+// batch by batch with one tag map, the way Audit.onRecorderEvents does.
+const WALKER_PAGE = `<!doctype html><title>walker test</title>
+<select><option id="opt" value="https://x.test/cb?token=OPTVAL1">o</option></select>
+<button value="https://x.test/b?token=BTNVAL1">b</button>
+<div style="background-image: url(https://x.test/i.png?token=STYSNAP1)">s</div>
+<div id="sty2">s2</div>
+<div id="sty3" style="color: red; margin: 0px; padding: 0px; border: 1px solid black; font-size: 12px; line-height: 20px; letter-spacing: 1px">s3</div>
+<div id="sty4" style="color: red; margin: 0px; padding: 0px; border: 1px solid black; font-size: 12px; line-height: 20px; letter-spacing: 1px">s4</div>
+<div id="apos" data-x="https://x.test/s?q=it's&token=APOSSNAP1">a</div>
+<meta property="og:url" content="https://x.test/a?token=OGQ2">`;
+
+test("the worker-side walker removes URL secrets from every attribute shape real rrweb sends", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  await withRecorderPage(async (page, world) => {
+    await sleep(1300); // the full snapshot goes out in its own batch first
+    await page.evaluate(`
+      document.getElementById("sty2").style.backgroundImage = "url(https://x.test/i.png?token=STYMUT1)";
+      document.getElementById("sty3").style.backgroundImage = "url(https://x.test/i.png?token=STYMUT2)";
+      document.getElementById("sty4").style.setProperty("background-image", "url(https://x.test/i.png?token=STYIMP1)", "important");
+      document.getElementById("opt").setAttribute("value", "https://x.test/cb?token=OPTMUT1");
+      document.getElementById("apos").setAttribute("data-x", "https://x.test/s?q=it's&token=APOSMUT1");
+    `);
+    await sleep(1500);
+
+    const batches = JSON.parse(await world("JSON.stringify(globalThis.sent)")).map((m) => m.events);
+    const raw = JSON.stringify(batches);
+    // A style change arrives as a string (sty2 had no inline style), as a diff
+    // object (sty3) and as a diff holding a [value, priority] array (sty4).
+    const styleShapes = batches.flat()
+      .filter((e) => e.type === 3 && e.data.source === 0)
+      .flatMap((e) => e.data.attributes.map((a) => a.attributes.style))
+      .filter((style) => style !== undefined)
+      .map((style) => (typeof style === "string" ? "string" : Object.values(style).some(Array.isArray) ? "diff with array" : "diff"));
+    assert.deepEqual([...new Set(styleShapes)].sort(), ["diff", "diff with array", "string"]);
+
+    const ctx = vm.createContext({ URL });
+    vm.runInContext(REDACT_JS, ctx, { filename: "redact.js" });
+    const redactEvents = vm.runInContext("redactEvents", ctx);
+    const knownTags = new Map();
+    const walked = JSON.stringify(batches.map((events) => redactEvents(events, knownTags)));
+
+    const markers = ["OPTVAL1", "BTNVAL1", "OPTMUT1", "STYSNAP1", "STYMUT1", "STYMUT2", "STYIMP1", "APOSSNAP1", "APOSMUT1", "OGQ2"];
+    assert.deepEqual(markers.filter((m) => !raw.includes(m)), [], "rrweb must relay every marker raw, or this proves nothing about the walker");
+    assert.deepEqual(markers.filter((m) => walked.includes(m)), []);
+  }, { html: WALKER_PAGE });
 });

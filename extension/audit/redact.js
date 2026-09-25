@@ -6,11 +6,15 @@ const AUDIT_STRING_CLIP = 100;
 const AUDIT_SUMMARY_CLIP = 300;
 const AUDIT_JS_CODE_CLIP = 500;
 
-// A scheme + "://" + a run of characters for the host/path part, continuing
-// through a "?"/"#" query or fragment (fix round 3, item 3: a URL token now
-// ends only at whitespace, a quote, "<" or ">" — "(" no longer ends it early,
-// so a path like "/a(b?token=..." still reaches its own query). Good enough to
-// find a URL embedded in a free-text Chrome error message or a page attribute.
+// A scheme + "://" + the host/path part, then an optional query or fragment.
+// The host/path part ends at whitespace, a quote, "<", ">", "?" or "#". "("
+// and ")" stay in it (fix round 3, item 3), so a path like "/a(b?token=..."
+// still reaches its own query. A query or fragment ends only at whitespace, a
+// double quote, "<" or ">". A "'" is a legal query character, and ending the
+// token there left the rest of the query in the text (fix round 4, item 1).
+// So a "'" ends a URL in single quotes only when the URL has no query. Good
+// enough to find a URL embedded in a free-text Chrome error message or a page
+// attribute.
 //
 // Fix round 3, item 2 (new Important): the scheme's own suffix is bounded to
 // {0,31} (any real scheme name is far shorter), not left unbounded. An
@@ -19,17 +23,14 @@ const AUDIT_JS_CODE_CLIP = 500;
 // O(remaining-length) "no ':' found" backtrack at O(n) different starting
 // points — O(n^2) overall. A 100 KB attribute value cost 4.1s; bounding the
 // scheme caps the work at each starting point to a constant, restoring O(n).
-const URL_TOKEN_RE = /\b[a-z][a-z0-9+.-]{0,31}:\/\/[^\s"'<>]*(?:[?#][^\s"<>]*)?/gi;
+const URL_TOKEN_RE = /\b[a-z][a-z0-9+.-]{0,31}:\/\/[^\s"'<>?#]*(?:[?#][^\s"<>]*)?/gi;
 // A data: URI has no "//" after its scheme, so it never matches URL_TOKEN_RE —
 // scrubbed separately, the same way navigateSummary's own data: rule collapses
 // one to its length instead of leaving it (and whatever it encodes) verbatim.
-// "<"/">" are not excluded: a data:text/html,... payload legitimately contains
-// raw markup, and stopping there would leave it exposed. Nor is whitespace
-// (fix round 3, item 3, pulled): a data:text/html,... payload can legitimately
-// contain spaces (page text), so it is masked to the end of the value (a
-// quote, if this text is quoted, or otherwise the true end of the string) —
-// not just up to the first space, which would leave the rest exposed.
-const DATA_URI_RE = /\bdata:[^"']*/gi;
+// Its payload can hold any character (markup, spaces, quotes), so no character
+// marks where it ends: the mask runs from "data:" to the end of the string or
+// attribute value (fail closed, fix round 4, item 3).
+const DATA_URI_RE = /\bdata:[\s\S]*/i;
 
 function clipTo(s, max) {
   return typeof max === "number" && s.length > max ? `${s.slice(0, max)}…` : s;
@@ -168,7 +169,9 @@ function formInputSummary(args) {
 // backtick without being fooled by a string, a comment, or a further nested
 // template inside the substitution. Comments (// and /* */) are skipped as
 // comments, not scanned for quotes, so a quote inside one no longer
-// desynchronizes the scanner onto a later, real secret.
+// desynchronizes the scanner onto a later, real secret. A // comment ends at
+// any JavaScript line terminator (fix round 4, item 4): LF, CR, U+2028 or
+// U+2029, not only at LF, or the code after a CR would pass as comment text.
 //
 // Fix round 3, item 1 (binding): earlier drafts also tried to guess whether a
 // "/" opened a regex literal or was a division operator, by the token before
@@ -185,11 +188,16 @@ function formInputSummary(args) {
 // unterminated string, template or (top-level) block comment has its
 // remainder, to the end of input, replaced with [N chars] rather than echoed
 // as real code. Nesting inside skipTemplate uses an explicit stack, not
-// recursion, and gives up (failing closed) past MAX_TEMPLATE_DEPTH levels, so
-// a script holding thousands of nested template literals cannot throw a
-// RangeError and drop the whole action unrecorded.
+// recursion, and gives up (failing closed) past MAX_TEMPLATE_DEPTH nested
+// template levels, so a script holding thousands of nested template literals
+// cannot throw a RangeError and drop the whole action unrecorded.
 
 const MAX_TEMPLATE_DEPTH = 100;
+
+function lineCommentEnd(code, i) {
+  while (i < code.length && !"\n\r\u2028\u2029".includes(code[i])) i++;
+  return i;
+}
 
 // Finds the position of a template literal's TRUE matching closing backtick,
 // given the position right after its OPENING one. A "${" inside it starts a
@@ -202,10 +210,16 @@ const MAX_TEMPLATE_DEPTH = 100;
 // any depth — means nothing past it can be trusted either, so the whole
 // search fails closed (returns n, "never closed") from there, same as running
 // out of input while any level is still open.
+//
+// The cap counts template frames only (fix round 4, item 6). A level pushes
+// two frames, its template and the substitution it is nested in, so a cap on
+// the stack length failed closed from level 51. The stack still stays bounded:
+// a substitution frame is only ever pushed onto a template frame.
 function skipTemplate(code, start) {
   const n = code.length;
   let i = start;
   const stack = ["template"];
+  let templates = 1;
   while (i < n) {
     const top = stack[stack.length - 1];
     const ch = code[i];
@@ -215,12 +229,12 @@ function skipTemplate(code, start) {
       if (ch === "`") {
         if (stack.length === 1) return i; // our own outermost template's true close
         stack.pop();
+        templates--;
         i++;
         continue;
       }
       if (ch === "$" && code[i + 1] === "{") {
         i += 2;
-        if (stack.length >= MAX_TEMPLATE_DEPTH) return n;
         stack.push(0);
         continue;
       }
@@ -229,7 +243,7 @@ function skipTemplate(code, start) {
     }
 
     // top is a number: scanning code inside a "${...}" substitution.
-    if (ch === "/" && code[i + 1] === "/") { while (i < n && code[i] !== "\n") i++; continue; }
+    if (ch === "/" && code[i + 1] === "/") { i = lineCommentEnd(code, i); continue; }
     if (ch === "/" && code[i + 1] === "*") {
       const end = code.indexOf("*/", i + 2);
       if (end === -1) return n;
@@ -245,7 +259,8 @@ function skipTemplate(code, start) {
     }
     if (ch === "`") {
       i++;
-      if (stack.length >= MAX_TEMPLATE_DEPTH) return n;
+      if (templates >= MAX_TEMPLATE_DEPTH) return n;
+      templates++;
       stack.push("template");
       continue;
     }
@@ -270,7 +285,7 @@ function maskJsStringLiterals(code) {
     const ch = code[i];
     if (ch === "/" && code[i + 1] === "/") {
       const start = i;
-      while (i < n && code[i] !== "\n") i++;
+      i = lineCommentEnd(code, i);
       out += code.slice(start, i); // comments are kept as-is, never masked
     } else if (ch === "/" && code[i + 1] === "*") {
       const bodyStart = i + 2;
@@ -391,14 +406,24 @@ function redactAttributes(shouldMaskValue, attributes) {
     if (typeof attributes[attr] === "string") attributes[attr] = redactUrl(attributes[attr]);
   }
   if (typeof attributes.srcset === "string") attributes.srcset = redactSrcset(attributes.srcset);
-  // Fix round 3, item 4 (pulled): rrweb represents a style change shorter
-  // than the whole style as a diff object (CSS property -> new value) rather
-  // than a plain string — a framework setting el.style.backgroundImage takes
-  // this path, so a signed image URL's query needs the same scrub either shape
-  // arrives in.
-  if (attributes.style && typeof attributes.style === "object") {
+  // A signed image URL's query can ride in a style value in any shape rrweb
+  // sends (fix round 4, item 2). A style is a string in a snapshot, and in a
+  // mutation whose diff would be longer than the whole value (the usual case
+  // for el.style.x = ... on an element without an inline style). Otherwise it
+  // is a diff object, CSS property -> new value, where a value is a string, a
+  // [value, priority] array for an !important one, or false for a removed
+  // property.
+  if (typeof attributes.style === "string") {
+    attributes.style = scrubUrls(attributes.style);
+  } else if (attributes.style && typeof attributes.style === "object") {
     for (const [prop, value] of Object.entries(attributes.style)) {
-      if (typeof value === "string") attributes.style[prop] = scrubUrls(value);
+      if (typeof value === "string") {
+        attributes.style[prop] = scrubUrls(value);
+      } else if (Array.isArray(value)) {
+        for (let k = 0; k < value.length; k++) {
+          if (typeof value[k] === "string") value[k] = scrubUrls(value[k]);
+        }
+      }
     }
   }
   for (const [name, value] of Object.entries(attributes)) {
