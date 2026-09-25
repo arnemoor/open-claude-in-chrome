@@ -257,7 +257,7 @@ for (const [label, dirName] of [
     fs.mkdirSync(path.dirname(chromeManifestDir(home)), { recursive: true }); // install.sh skips a browser whose folder is missing
     const hostJs = path.join(repo, "host", "native-host.js");
     fs.writeFileSync(hostJs, "process.stdout.write(JSON.stringify(process.argv.slice(1)));\n");
-    runInstall(repo, home);
+    const installOut = runInstall(repo, home);
     assert.ok(!fs.existsSync(path.join(repo, "pwned")), "install.sh must not run anything from the checkout path");
 
     const wrapper = path.join(repo, "host", "native-host-wrapper.sh");
@@ -275,6 +275,14 @@ for (const [label, dirName] of [
     assert.ok(!fs.existsSync(path.join(cwd, "pwned")), "the wrapper must not run anything from the checkout path");
     assert.ifError(runError);
     assert.deepEqual(JSON.parse(out), [hostJs]);
+
+    // The closing hint's command is meant to be pasted into a shell as is.
+    const hint = installOut.split("\n").find((line) => line.includes("claude mcp add"));
+    assert.equal(
+      execFileSync("/bin/sh", ["-c", `printf %s ${hint.split(" -- node ")[1]}`], { cwd: mkdtemp(), env: { ...process.env, HOME: home }, ...EXEC_OPTS }),
+      path.join(repo, "host", "mcp-server.js"),
+      "the printed claude mcp add hint must paste as exactly the mcp-server.js path",
+    );
   });
 }
 
