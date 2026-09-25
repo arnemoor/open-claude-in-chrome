@@ -39,14 +39,24 @@
   // is already instanceof-guarded there (the same rule as offsetParentGet above), so it's not
   // part of the dom object. Two call sites: labelNotes and isOwnLabel.
   const labelControlGet = Object.getOwnPropertyDescriptor(HTMLLabelElement.prototype, "control").get;
-  // Not part of the public dom object (not in E4b's interface): captured the same way, called
-  // directly at their one call site each (both in getPageText).
+  // Not part of the public dom object: captured the same way, called directly at their one
+  // call site each (both in getPageText).
   const cloneNodeFn = Node.prototype.cloneNode;
   const querySelectorAllFn = Element.prototype.querySelectorAll;
 
   function str(value) {
     return typeof value === "string" ? value : "";
   }
+
+  // True when this page is one the agent is never allowed to act on: a local file, or this
+  // extension's own page. background.js's tabAccessError already checks the tab's URL before
+  // dispatching a message here, but the page can navigate in the gap between that check and
+  // this handler actually running (e.g. a timed history.back()) — this re-checks against the
+  // page's own live location as a backstop.
+  function isBlockedPage() {
+    return location.protocol === "file:" || location.origin === `chrome-extension://${chrome.runtime.id}`;
+  }
+  const BLOCKED_PAGE_TEXT = "This tab shows a local file or this extension's own page, which the agent cannot use.";
 
   const dom = {
     tag: (el) => (el ? str(tagNameGet.call(el)).toLowerCase() : ""),
@@ -846,6 +856,11 @@
 
   // --- Message handler ---
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (isBlockedPage()) {
+      sendResponse({ result: { error: BLOCKED_PAGE_TEXT } });
+      return true;
+    }
+
     if (msg.type === "generateAccessibilityTree") {
       const result = generateAccessibilityTree(msg.options || {});
       sendResponse({ result });
