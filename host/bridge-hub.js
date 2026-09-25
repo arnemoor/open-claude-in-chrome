@@ -41,7 +41,7 @@ export class BridgeHub {
     this.runId = crypto.randomBytes(4).toString("hex");
     this._state = "idle";
     this._sessionCounter = 0;
-    this._conns = new Set(); // every accepted connection, ready or not (I1)
+    this._conns = new Set(); // every accepted connection, ready or not
     this._pending = new Map(); // hubId -> { conn, localId }
     this._ino = null;
     this._server = null; // the currently-live listening server, or null
@@ -370,7 +370,7 @@ export class BridgeHub {
     // Once rejected (bad hello) or once we are no longer serving, ignore
     // anything further from this peer: never re-evaluate a later line as a
     // fresh hello, and never welcome or forward while stop() is tearing us
-    // down (I1, M3).
+    // down.
     if (conn.rejected || this._state !== "serving") return;
 
     let msg;
@@ -482,7 +482,7 @@ export class BridgeHub {
     if (this._standbyTimer) { clearTimeout(this._standbyTimer); this._standbyTimer = null; }
     if (this._selfCheckTimer) { clearTimeout(this._selfCheckTimer); this._selfCheckTimer = null; }
 
-    // Destroy every accepted connection — ready or still mid-handshake (I1) —
+    // Destroy every accepted connection — ready or still mid-handshake —
     // before closing the server, so close() never waits on a silent peer.
     this._destroyAllConns();
 

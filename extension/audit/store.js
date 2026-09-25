@@ -278,7 +278,7 @@
     }
     for (const id of toDelete) await deleteSession(id);
 
-    // I4: a session that is still active (recent lastSeen, so it survives above)
+    // A session that is still active (recent lastSeen, so it survives above)
     // can still be holding actions/events from well outside the retention
     // window — age those out independently of which session owns them.
     if (cutoff !== null) {

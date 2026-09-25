@@ -1,8 +1,9 @@
 // Options page: the audit mode switch and the session/replay viewer. Classic
 // script (MV3 extension pages forbid inline script and eval). Reads and writes
-// chrome.storage.local's "audit" key in the same shape Task 15's Audit.settings()
-// reads ({ enabled, retentionDays }), and talks to the audit log only through
-// AuditStore (extension/audit/store.js, loaded before this file).
+// chrome.storage.local's "audit" key in the same shape Audit.settings()
+// (extension/audit/audit.js) reads ({ enabled, retentionDays }), and talks to
+// the audit log only through AuditStore (extension/audit/store.js, loaded
+// before this file).
 
 const DEFAULT_SETTINGS = { enabled: false, retentionDays: 7 };
 const VALID_RETENTIONS = [1, 7, 30];
