@@ -58,6 +58,22 @@ test("computer key replaces each bare-character run inside a mixed sequence with
   assert.equal(s, "key ctrl+a [6 keys] Delete");
 });
 
+// Item 8: shift + one printable character types real text (a capital letter,
+// or a shifted symbol), one key call at a time — the same bypass as I5's bare
+// characters, just with shift held. Count it like a bare character.
+test("computer key: shift plus one printable character counts like a bare character (item 8)", () => {
+  const { auditSummary } = load();
+  const s = auditSummary("computer", { action: "key", text: "shift+h shift+i" });
+  assert.doesNotMatch(s, /shift\+h|shift\+i/);
+  assert.equal(s, "key [2 keys]");
+});
+
+test("computer key: a shift+char run inside a mixed sequence is counted, a real modifier combo is kept", () => {
+  const { auditSummary } = load();
+  const s = auditSummary("computer", { action: "key", text: "ctrl+a shift+h shift+i Delete" });
+  assert.equal(s, "key ctrl+a [2 keys] Delete");
+});
+
 test("computer scroll keeps direction and amount", () => {
   const { auditSummary } = load();
   const s = auditSummary("computer", { action: "scroll", coordinate: [5, 5], scroll_direction: "up", scroll_amount: 4 });
@@ -574,6 +590,16 @@ test("scrubUrls (item 2): a long, colon-less run does not backtrack quadraticall
   assert.ok(elapsed < 200, `expected under 200ms, took ${elapsed}ms (quadratic regex backtracking regression?)`);
 });
 
+// Item 7: a "'" in the host/path part (before any query) used to end the
+// token right there, leaving the query — and any secret in it — in the
+// clear. "'" only ever over-masks, so it now stays in the token the same way
+// "(" and ")" already do.
+test("scrubUrls (item 7): a ' in the path before the query does not leak the query", () => {
+  const { scrubUrls } = load();
+  const s = scrubUrls("see https://x.test/o'brien?token=APOSPATH1 for details", 300);
+  assert.doesNotMatch(s, /APOSPATH1/);
+});
+
 // --- redactEvents (I1/I2): the worker-side walker over rrweb event batches, run
 // in Audit.onRecorderEvents before anything is stored, so a recorder in any
 // document cannot bypass it. `knownTags` is a Map the caller (audit.js) keeps
@@ -795,6 +821,22 @@ test("I1: a new full snapshot resets knownTags, so a stale id from a previous do
   const freshSnapshot = [{ type: 2, data: { node: { type: 0, id: 1, childNodes: [{ type: 2, tagName: "select", attributes: {}, id: 10, childNodes: [{ type: 2, tagName: "option", attributes: { value: "US" }, id: 9, childNodes: [] }] }] } } }];
   redactEvents(freshSnapshot, knownTags);
   assert.equal(knownTags.get(9), "option");
+});
+
+// Item 10: a Meta event (type 4) always starts a fresh document, the same
+// document its own FullSnapshot is about to describe — reset knownTags there
+// too, so a mutation that reaches the walker before that FullSnapshot's own
+// arrival can never be read against a stale, wrong mapping left over from the
+// previous document.
+test("I1/item 10: a Meta event resets knownTags before its own FullSnapshot arrives, so a reused node id is never read from a stale mapping", () => {
+  const { redactEvents } = load();
+  const knownTags = new Map([[9, "div"]]); // previous document: id 9 was a <div>, not maskable
+  const events = [
+    { type: 4, data: { href: "https://x.test/" } }, // the new document begins
+    { type: 3, data: { source: 0, texts: [], removes: [], adds: [], attributes: [{ id: 9, attributes: { value: "REUSEDID9SECRET" } }] } },
+  ];
+  redactEvents(events, knownTags);
+  assert.doesNotMatch(JSON.stringify(events), /REUSEDID9SECRET/);
 });
 
 // --- redactEvents (I2): Meta href, and href/src/action/formaction/poster/srcset
