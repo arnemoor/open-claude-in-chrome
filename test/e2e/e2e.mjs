@@ -8,6 +8,13 @@
 //
 // Skipped unless OCIC_E2E=1, and skipped (not failed) when Google Chrome.app
 // is missing, so `node --test test/` stays fast and never launches a browser.
+// With OCIC_E2E=1 and Chrome present, every other setup failure (the extension
+// does not load, the native host never starts) fails the run. The last block
+// in this file checks that by running the file again as a child, once with a
+// broken extension and once with a native host that exits at once. A third
+// child hangs with Chrome running, and once stopped it must leave nothing
+// behind: on SIGINT or SIGTERM (a Ctrl-C too) a run removes its own Chrome
+// processes and temp dirs before it exits.
 //
 // Run: OCIC_E2E=1 node --test test/e2e/e2e.mjs
 
@@ -30,8 +37,12 @@ const CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const chromeAvailable = fs.existsSync(CHROME);
 
 const WORKTREE = path.resolve(import.meta.dirname, "..", "..");
-const EXTENSION_DIR = path.join(WORKTREE, "extension");
-const NATIVE_HOST_JS = path.join(WORKTREE, "host", "native-host.js");
+// Test-only overrides, set only by the setup-failure block at the end of this
+// file for its own child runs. OCIC_E2E_TMP_ROOT puts the child's temp HOME
+// and Chrome profile under a folder that the parent removes afterwards.
+const EXTENSION_DIR = process.env.OCIC_E2E_EXTENSION_DIR || path.join(WORKTREE, "extension");
+const NATIVE_HOST_JS = process.env.OCIC_E2E_NATIVE_HOST_JS || path.join(WORKTREE, "host", "native-host.js");
+const TMP_ROOT = process.env.OCIC_E2E_TMP_ROOT || "/tmp";
 const MCP_SERVER_JS = path.join(WORKTREE, "host", "mcp-server.js");
 const HOST_NAME = "com.anthropic.open_claude_in_chrome";
 
@@ -40,6 +51,57 @@ const skipReason = !RUN
   : !chromeAvailable
     ? "Google Chrome.app not found"
     : false;
+
+// ps-based process helpers. Every kill below is gated on the target's own
+// command line containing a unique, randomly generated temp path, never a
+// bare process name, so it can never match a live, non-isolated
+// native-host.js or mcp-server.js.
+function cmdlineOf(pid) {
+  try {
+    return execSync(`ps -ww -p ${pid} -o command=`, { encoding: "utf8" }).trim();
+  } catch {
+    return null;
+  }
+}
+
+function pidsWithCmdlineContaining(substring) {
+  let snapshot;
+  try {
+    snapshot = execSync("ps -A -ww -o pid=,command=", { encoding: "utf8" });
+  } catch {
+    return [];
+  }
+  const pids = [];
+  for (const line of snapshot.split("\n")) {
+    const m = line.match(/^\s*(\d+)\s+(.*)$/);
+    if (m && m[2].includes(substring)) pids.push(Number(m[1]));
+  }
+  return pids;
+}
+
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+// A signal ends this process without running any after(): a Ctrl-C, or the
+// setup-failure block stopping a child that hangs. Each block adds a
+// synchronous cleanup for what it started while it runs, and the handler runs
+// them all, then exits non-zero. It stays installed, so a second signal
+// cannot cut a cleanup short.
+const cleanupsOnSignal = new Set();
+
+function onSignal(signal) {
+  console.error(`e2e: ${signal}, removing this run's Chrome processes and temp dirs`);
+  for (const cleanup of cleanupsOnSignal) {
+    try { cleanup(); } catch { /* keep going */ }
+  }
+  process.exit(signal === "SIGINT" ? 130 : 143);
+}
+
+if (!skipReason) {
+  process.on("SIGINT", onSignal);
+  process.on("SIGTERM", onSignal);
+}
 
 describe("end-to-end: real extension in an isolated headless Chrome", { skip: skipReason }, () => {
   // --- small generic helpers ---------------------------------------------
@@ -62,33 +124,6 @@ describe("end-to-end: real extension in an isolated headless Chrome", { skip: sk
 
   function escapeHtml(s) {
     return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-  }
-
-  // ps-based process helpers. Every kill below is gated on the target's own
-  // command line containing our unique, randomly-generated tempHome/profile
-  // path — never a bare process name — so it can never match a live,
-  // non-isolated native-host.js or mcp-server.js.
-  function cmdlineOf(pid) {
-    try {
-      return execSync(`ps -ww -p ${pid} -o command=`, { encoding: "utf8" }).trim();
-    } catch {
-      return null;
-    }
-  }
-
-  function pidsWithCmdlineContaining(substring) {
-    let snapshot;
-    try {
-      snapshot = execSync("ps -A -ww -o pid=,command=", { encoding: "utf8" });
-    } catch {
-      return [];
-    }
-    const pids = [];
-    for (const line of snapshot.split("\n")) {
-      const m = line.match(/^\s*(\d+)\s+(.*)$/);
-      if (m && m[2].includes(substring)) pids.push(Number(m[1]));
-    }
-    return pids;
   }
 
   // The last {event, pid} logged under this name, or null.
@@ -233,11 +268,31 @@ document.getElementById('file-input').addEventListener('change', function (e) {
 
   let tempHome, profile, testServer, base, chromeProc, mcpClient, mcpTransport;
   let extensionId, nativeHostPid, tabId, cdpSend; // cdpSend: step 10 reuses the browser-level CDP pipe
-  let setupError = null; // set only for the documented "loadUnpacked impossible" fallback
+
+  // Takes the place of after() when a signal ends this process: kills the
+  // Chrome this run started and anything naming its temp dirs, by pid, then
+  // removes those dirs. The mcp-server and the native host exit on their own
+  // once their stdin closes.
+  function cleanupNow() {
+    const pids = new Set([
+      ...(tempHome ? pidsWithCmdlineContaining(tempHome) : []),
+      ...(profile ? pidsWithCmdlineContaining(profile) : []),
+    ]);
+    if (chromeProc && chromeProc.exitCode === null && chromeProc.signalCode === null) pids.add(chromeProc.pid);
+    for (const pid of pids) {
+      try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+    }
+    if (pids.size > 0) sleepSync(300);
+    for (const dir of [profile, tempHome]) {
+      if (!dir) continue;
+      try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* best effort */ }
+    }
+  }
 
   before(async () => {
-    tempHome = fs.mkdtempSync("/tmp/ocic-");
-    profile = fs.mkdtempSync("/tmp/ocic-chrome-");
+    cleanupsOnSignal.add(cleanupNow);
+    tempHome = fs.mkdtempSync(path.join(TMP_ROOT, "ocic-"));
+    profile = fs.mkdtempSync(path.join(TMP_ROOT, "ocic-chrome-"));
 
     testServer = await startTestServer();
     base = `http://127.0.0.1:${testServer.address().port}`;
@@ -267,14 +322,20 @@ document.getElementById('file-input').addEventListener('change', function (e) {
     await sleep(500); // let the CDP pipe come up before the first command
     await cdpSend("Browser.getVersion");
 
+    // Test-only, for the setup-failure block: a run that hangs with Chrome up.
+    if (process.env.OCIC_E2E_HANG_AFTER_CHROME === "1") {
+      console.log("e2e: hanging on purpose, with Chrome running");
+      await new Promise(() => {});
+    }
+
     try {
       const result = await cdpSend("Extensions.loadUnpacked", { path: EXTENSION_DIR });
       extensionId = result.id;
     } catch (err) {
-      setupError =
-        `Extensions.loadUnpacked failed on this Chrome build: ${err.message}\n` +
-        `Chrome stderr tail:\n${chromeStderr.slice(-2000)}`;
-      return; // it()s below check setupError and skip themselves
+      throw new Error(
+        `Extensions.loadUnpacked failed: ${err.message}\n` +
+        `Chrome stderr tail:\n${chromeStderr.slice(-2000)}`,
+      );
     }
 
     // Register the native host manifest + wrapper under the ISOLATED
@@ -308,10 +369,10 @@ document.getElementById('file-input').addEventListener('change', function (e) {
     try {
       await waitFor(() => fs.existsSync(sockPath) && fs.existsSync(logPath), { timeoutMs: 20000, intervalMs: 400 });
     } catch {
-      setupError =
+      throw new Error(
         `The isolated native host never came up within 20s (socket or log missing under ${tempHome}).\n` +
-        `Chrome stderr tail:\n${chromeStderr.slice(-2000)}`;
-      return;
+        `Chrome stderr tail:\n${chromeStderr.slice(-2000)}`,
+      );
     }
 
     // --- SAFETY CHECK: this must be OUR host, in OUR worktree, before any
@@ -379,12 +440,12 @@ document.getElementById('file-input').addEventListener('change', function (e) {
     try {
       if (tempHome) fs.rmSync(tempHome, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     } catch { /* best effort */ }
+    cleanupsOnSignal.delete(cleanupNow);
   });
 
   // --- steps ----------------------------------------------------------------
 
-  it("1. tabs_context_mcp with createIfEmpty", { timeout: 15000 }, async (t) => {
-    if (setupError) return t.skip(setupError);
+  it("1. tabs_context_mcp with createIfEmpty", { timeout: 15000 }, async () => {
     const res = await mcpClient.callTool({ name: "tabs_context_mcp", arguments: { createIfEmpty: true } });
     const text = res.content[0].text;
     const parsed = JSON.parse(text.split("\n\n")[0]);
@@ -394,15 +455,13 @@ document.getElementById('file-input').addEventListener('change', function (e) {
     assert.ok(Number.isInteger(tabId), `expected a numeric tabId, got: ${JSON.stringify(parsed)}`);
   });
 
-  it("2. navigate to a local http test page", { timeout: 15000 }, async (t) => {
-    if (setupError) return t.skip(setupError);
+  it("2. navigate to a local http test page", { timeout: 15000 }, async () => {
     const res = await mcpClient.callTool({ name: "navigate", arguments: { url: `${base}/`, tabId } });
     const text = res.content[0].text;
     assert.match(text, new RegExp(`Navigated to ${reEscape(base)}/`), `unexpected navigate reply: ${text}`);
   });
 
-  it("3. find an off-screen button, then left_click by ref: it is scrolled and hit", { timeout: 15000 }, async (t) => {
-    if (setupError) return t.skip(setupError);
+  it("3. find an off-screen button, then left_click by ref: it is scrolled and hit", { timeout: 15000 }, async () => {
     const found = await mcpClient.callTool({ name: "find", arguments: { query: "offscreen action button", tabId } });
     const foundText = found.content[0].text;
     assert.match(foundText, /\[off-screen, click by ref to scroll it into view\]/, `expected the button to be reported off-screen: ${foundText}`);
@@ -425,8 +484,7 @@ document.getElementById('file-input').addEventListener('change', function (e) {
     assert.match(after.content[0].text, /offscreen button clicked/, `expected the click handler to have run: ${after.content[0].text}`);
   });
 
-  it('4. type "Grüße", then key "Enter": the form submits', { timeout: 15000 }, async (t) => {
-    if (setupError) return t.skip(setupError);
+  it('4. type "Grüße", then key "Enter": the form submits', { timeout: 15000 }, async () => {
     await mcpClient.callTool({ name: "navigate", arguments: { url: `${base}/form`, tabId } });
 
     const typed = await mcpClient.callTool({ name: "computer", arguments: { action: "type", text: "Grüße", tabId } });
@@ -447,8 +505,7 @@ document.getElementById('file-input').addEventListener('change', function (e) {
     assert.equal(tab.title, "submitted:Grüße", `expected the server-reflected title to round-trip exactly, got: ${tab.title}`);
   });
 
-  it("5. computer screenshot with save_to_disk: the file exists, mode 0600", { timeout: 15000 }, async (t) => {
-    if (setupError) return t.skip(setupError);
+  it("5. computer screenshot with save_to_disk: the file exists, mode 0600", { timeout: 15000 }, async () => {
     const res = await mcpClient.callTool({ name: "computer", arguments: { action: "screenshot", save_to_disk: true, tabId } });
     const savedBlock = res.content.find((b) => b.type === "text" && b.text.startsWith("Saved to disk:"));
     assert.ok(savedBlock, `expected a "Saved to disk:" block, got: ${JSON.stringify(res.content.map((b) => b.type))}`);
@@ -459,8 +516,7 @@ document.getElementById('file-input').addEventListener('change', function (e) {
     assert.equal(stat.mode & 0o777, 0o600, `expected mode 0600, got ${(stat.mode & 0o777).toString(8)}`);
   });
 
-  it("6. file_upload from Downloads succeeds, from secret.txt is refused", { timeout: 15000 }, async (t) => {
-    if (setupError) return t.skip(setupError);
+  it("6. file_upload from Downloads succeeds, from secret.txt is refused", { timeout: 15000 }, async () => {
     fs.mkdirSync(path.join(tempHome, "Downloads"), { recursive: true });
     const allowedFile = path.join(tempHome, "Downloads", "e2e-upload.txt");
     fs.writeFileSync(allowedFile, "hello e2e");
@@ -476,6 +532,7 @@ document.getElementById('file-input').addEventListener('change', function (e) {
     const refused = await mcpClient.callTool({ name: "file_upload", arguments: { paths: [secretFile], ref, tabId } });
     assert.match(refused.content[0].text, /^Error: Not in an allowed upload folder: /, `expected secret.txt to be refused: ${refused.content[0].text}`);
     assert.ok(refused.content[0].text.includes(secretFile), "expected the refusal to name the rejected path");
+    assert.equal(refused.isError, true, "expected the refusal to be flagged isError");
 
     const uploaded = await mcpClient.callTool({ name: "file_upload", arguments: { paths: [allowedFile], ref, tabId } });
     assert.match(uploaded.content[0].text, /^Uploaded 1 file\(s\) to ref_\d+: /, `expected the Downloads upload to succeed: ${uploaded.content[0].text}`);
@@ -488,8 +545,7 @@ document.getElementById('file-input').addEventListener('change', function (e) {
     assert.match(confirm.content[0].text, /e2e-upload\.txt/, `expected to find the uploaded filename reflected in the page: ${confirm.content[0].text}`);
   });
 
-  it("7. resize_window: the reply shows the real sizes", { timeout: 15000 }, async (t) => {
-    if (setupError) return t.skip(setupError);
+  it("7. resize_window: the reply shows the real sizes", { timeout: 15000 }, async () => {
     const res = await mcpClient.callTool({ name: "resize_window", arguments: { width: 1000, height: 700, tabId } });
     const text = res.content[0].text;
     const m = text.match(/^Resized window to (\d+)x(\d+)/);
@@ -498,8 +554,7 @@ document.getElementById('file-input').addEventListener('change', function (e) {
     assert.equal(Number(m[2]), 700, `expected height 700, got reply: ${text}`);
   });
 
-  it("8. read_network_requests after a redirect", { timeout: 15000 }, async (t) => {
-    if (setupError) return t.skip(setupError);
+  it("8. read_network_requests after a redirect", { timeout: 15000 }, async () => {
     // Enables the Network domain for this tab; requests logged from here on.
     await mcpClient.callTool({ name: "read_network_requests", arguments: { tabId } });
 
@@ -523,8 +578,7 @@ document.getElementById('file-input').addEventListener('change', function (e) {
     assert.match(text, targetHop, `expected the final hop logged with status 200: ${text}`);
   });
 
-  it("9. kill the native host during a wait of 5s: the call fails with LOST, then auto-reconnects", { timeout: 45000 }, async (t) => {
-    if (setupError) return t.skip(setupError);
+  it("9. kill the native host during a wait of 5s: the call fails with LOST, then auto-reconnects", { timeout: 45000 }, async () => {
     const logPath = path.join(tempHome, ".config", "open-claude-in-chrome", "logs", "native-host.log");
     const before9 = lastLogEvent(logPath, "start");
     assert.ok(before9, "expected a prior native-host start event");
@@ -544,6 +598,7 @@ document.getElementById('file-input').addEventListener('change', function (e) {
     const elapsed = Date.now() - started;
     assert.ok(elapsed < 4500, `expected the call to fail promptly on kill, not after the full 5s wait (took ${elapsed}ms)`);
     assert.equal(waitResult.content[0].text, `Error: ${LOST}`, `expected the exact LOST message, got: ${waitResult.content[0].text}`);
+    assert.equal(waitResult.isError, true, "expected the LOST reply to be flagged isError");
 
     // Nothing else restarts the native host: Chrome's own extension retries
     // connectNative() automatically (every ~2s), respawning it from the same
@@ -572,8 +627,7 @@ document.getElementById('file-input').addEventListener('change', function (e) {
     assert.ok(after9 && after9.pid !== killPid, `expected a new native-host pid after the kill, still saw ${killPid}`);
   });
 
-  it("10. audit mode: session appears in the options page with a redacted action list", { timeout: 30000 }, async (t) => {
-    if (setupError) return t.skip(setupError);
+  it("10. audit mode: session appears in the options page with a redacted action list", { timeout: 30000 }, async () => {
 
     const TOKEN_TYPED = "E2ESECRETTYPED";
     const TOKEN_QUERY = "E2ESECRETQ";
@@ -662,5 +716,107 @@ document.getElementById('file-input').addEventListener('change', function (e) {
 
     const newFiles = [...listAuditFiles()].filter((f) => !auditFilesBefore.has(f));
     assert.deepEqual(newFiles, [], `expected no new audit-session-*.json in ${realDownloads}, found: ${newFiles.join(", ")}`);
+  });
+});
+
+// The setup-failure path itself. Each case runs this file again as a child
+// with OCIC_E2E=1 and one test-only override: an extension folder whose
+// manifest is not valid JSON, a native host script that exits at once, or a
+// hang with Chrome running. The child keeps every isolation step of the block
+// above and skips this block. It also gets its own temp root for its HOME,
+// TMPDIR, temp HOME and Chrome profile. When it ends, the parent kills by pid
+// anything still running that names the root, and removes the root, so even
+// a child that died too hard to clean up leaves nothing.
+const isChildRun = Boolean(process.env.OCIC_E2E_TMP_ROOT);
+
+describe("end-to-end: a setup failure fails the run", { skip: skipReason || (isChildRun && "child run") }, () => {
+  let fixtures;
+  const removeFixtures = () => {
+    if (fixtures) fs.rmSync(fixtures, { recursive: true, force: true });
+  };
+
+  before(() => {
+    fixtures = fs.mkdtempSync("/tmp/ocic-");
+    cleanupsOnSignal.add(removeFixtures);
+    fs.mkdirSync(path.join(fixtures, "extension"));
+    fs.writeFileSync(path.join(fixtures, "extension", "manifest.json"), "{ not valid json\n");
+    fs.writeFileSync(path.join(fixtures, "native-host.js"), "process.exit(3);\n");
+  });
+
+  after(() => {
+    removeFixtures();
+    cleanupsOnSignal.delete(removeFixtures);
+  });
+
+  // Kills, by pid, every process whose command line names this root (the
+  // child's Chrome and its helpers do, through --user-data-dir), then removes
+  // the root. Returns how many processes it had to kill.
+  function reap(root) {
+    const pids = pidsWithCmdlineContaining(root + path.sep);
+    for (const pid of pids) {
+      try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+    }
+    if (pids.length > 0) sleepSync(300);
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    return pids.length;
+  }
+
+  // Runs this file as a child under a fresh temp root, then reaps the root.
+  // On a timeout it sends SIGTERM, which the child answers with its own
+  // cleanup, and SIGKILL 5 s later if the child is still running.
+  async function runChild(overrides, timeoutMs) {
+    const root = fs.mkdtempSync("/tmp/ocic-");
+    fs.mkdirSync(path.join(root, "home"));
+    const env = { ...process.env, ...overrides, OCIC_E2E: "1", OCIC_E2E_TMP_ROOT: root, TMPDIR: root, HOME: path.join(root, "home") };
+    // Inherited from this run's own test runner, it would make the child
+    // report to a parent that never reads it, and exit 0 with no output.
+    delete env.NODE_TEST_CONTEXT;
+    const child = spawn(process.execPath, ["--test-reporter=spec", import.meta.filename], { env, stdio: ["ignore", "pipe", "pipe"] });
+    const stopOnSignal = () => {
+      child.kill("SIGKILL");
+      reap(root);
+    };
+    cleanupsOnSignal.add(stopOnSignal);
+    let output = "";
+    let timedOut = false;
+    let killTimer;
+    child.stdout.on("data", (chunk) => { output += chunk; });
+    child.stderr.on("data", (chunk) => { output += chunk; });
+    const termTimer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+      killTimer = setTimeout(() => child.kill("SIGKILL"), 5000);
+    }, timeoutMs);
+    const [status, signal] = await new Promise((resolve) => child.once("close", (...args) => resolve(args)));
+    clearTimeout(termTimer);
+    clearTimeout(killTimer);
+    cleanupsOnSignal.delete(stopOnSignal);
+    const leftDirs = fs.readdirSync(root).filter((name) => name.startsWith("ocic-"));
+    const leftRunning = reap(root);
+    return { status, signal, output, timedOut, leftDirs, leftRunning };
+  }
+
+  for (const [label, overrides, expected] of [
+    ["an extension that does not load", () => ({ OCIC_E2E_EXTENSION_DIR: path.join(fixtures, "extension") }), /Extensions\.loadUnpacked failed: .*Manifest is not valid JSON/],
+    ["a native host that never starts", () => ({ OCIC_E2E_NATIVE_HOST_JS: path.join(fixtures, "native-host.js") }), /The isolated native host never came up within 20s/],
+  ]) {
+    it(`${label} fails the run instead of skipping it`, { timeout: 150000 }, async () => {
+      const run = await runChild(overrides(), 110000);
+      assert.equal(run.timedOut, false, `the child run timed out:\n${run.output}`);
+      assert.ok(run.status !== null && run.status !== 0, `expected the child run to fail by itself, got status ${run.status}, signal ${run.signal}:\n${run.output}`);
+      assert.match(run.output, expected, `expected the setup failure in the child's output:\n${run.output}`);
+      assert.deepEqual(run.leftDirs, [], "the child must remove its own temp HOME and Chrome profile");
+      assert.equal(run.leftRunning, 0, "no process from the child may still be running under its temp root");
+    });
+  }
+
+  it("a child that hangs with Chrome running is stopped by SIGTERM and leaves nothing behind", { timeout: 60000 }, async () => {
+    const run = await runChild({ OCIC_E2E_HANG_AFTER_CHROME: "1" }, 8000);
+    assert.equal(run.timedOut, true, `expected the child to hang until the timeout:\n${run.output}`);
+    assert.match(run.output, /e2e: hanging on purpose, with Chrome running/, "the child must have reached the hang with Chrome up");
+    assert.equal(run.status, 143, `expected the child's own SIGTERM cleanup to exit it, got status ${run.status}, signal ${run.signal}:\n${run.output}`);
+    assert.match(run.output, /e2e: SIGTERM, removing this run's Chrome processes and temp dirs/);
+    assert.deepEqual(run.leftDirs, [], "the child must remove its own temp HOME and Chrome profile");
+    assert.equal(run.leftRunning, 0, "no process from the child may still be running under its temp root");
   });
 });

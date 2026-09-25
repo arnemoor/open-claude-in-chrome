@@ -78,6 +78,12 @@ function textResult(text) {
   return { content: [{ type: "text", text }] };
 }
 
+// Every refusal or failure the host itself reports. A result from the
+// extension keeps its own isError unchanged (see callTool).
+function errorResult(text) {
+  return { content: [{ type: "text", text }], isError: true };
+}
+
 function imageResult(base64, mimeType = "image/png") {
   return { content: [{ type: "image", data: base64, mimeType }] };
 }
@@ -93,8 +99,23 @@ async function callTool(toolName, args) {
     if (result && result.content) return applySaveToDisk(result);
     return textResult(JSON.stringify(result, null, 2));
   } catch (err) {
-    return textResult(`Error: ${err.message}`);
+    return errorResult(`Error: ${err.message}`);
   }
+}
+
+// Applied to a call's own arguments and to each nested browser_batch input.
+function coerceArgs(args) {
+  if (typeof args.tabId === "string") args.tabId = Number(args.tabId);
+  if (typeof args.coordinate === "string") {
+    try { args.coordinate = JSON.parse(args.coordinate); } catch {}
+  }
+  if (typeof args.start_coordinate === "string") {
+    try { args.start_coordinate = JSON.parse(args.start_coordinate); } catch {}
+  }
+  if (typeof args.region === "string") {
+    try { args.region = JSON.parse(args.region); } catch {}
+  }
+  return args;
 }
 
 // --- MCP Server with all 22 official claude-in-chrome tools (drop-in surface) ---
@@ -110,24 +131,27 @@ const server = new McpServer({
   server.server.setRequestHandler = function(schema, handler) {
     return origSetRequestHandler(schema, async (request, extra) => {
       const args = request?.params?.arguments;
-      if (args) {
-        if (typeof args.tabId === "string") args.tabId = Number(args.tabId);
-        if (typeof args.coordinate === "string") {
-          try { args.coordinate = JSON.parse(args.coordinate); } catch {}
-        }
-        if (typeof args.start_coordinate === "string") {
-          try { args.start_coordinate = JSON.parse(args.start_coordinate); } catch {}
-        }
-        if (typeof args.region === "string") {
-          try { args.region = JSON.parse(args.region); } catch {}
-        }
-      }
+      if (args) coerceArgs(args);
       return handler(request, extra);
     });
   };
 }
+
+// Every tool's input schema by name, the same shape the tool is served with,
+// so browser_batch validates a nested action exactly like a standalone call.
+const toolSchemas = new Map();
+
+function registerTool(name, description, shape, handler) {
+  toolSchemas.set(name, z.object(shape));
+  server.tool(name, description, shape, handler);
+}
+
+function describeIssues(error) {
+  return error.issues.map((issue) => `${issue.path.join(".") || "input"}: ${issue.message}`).join(". ");
+}
+
 // 1. tabs_context_mcp
-server.tool(
+registerTool(
   "tabs_context_mcp",
   "Get context information about the current MCP tab group. Returns all tab IDs inside the group if it exists. CRITICAL: You must get the context at least once before using other browser automation tools so you know what tabs exist. Each new conversation should create its own new tab (using tabs_create_mcp) rather than reusing existing tabs, unless the user explicitly asks to use an existing tab.",
   { createIfEmpty: z.boolean().optional().describe("Creates a new MCP tab group if none exists, creates a new Window with a new tab group containing an empty tab (which can be used for this conversation). If a MCP tab group already exists, this parameter has no effect.") },
@@ -135,7 +159,7 @@ server.tool(
 );
 
 // 2. tabs_create_mcp
-server.tool(
+registerTool(
   "tabs_create_mcp",
   "Creates a new empty tab in the MCP tab group. CRITICAL: You must get the context using tabs_context_mcp at least once before using other browser automation tools so you know what tabs exist.",
   {},
@@ -143,7 +167,7 @@ server.tool(
 );
 
 // 3. navigate
-server.tool(
+registerTool(
   "navigate",
   'Navigate to a URL, or go forward/back in browser history. If you don\'t have a valid tab ID, use tabs_context_mcp first to get available tabs.',
   {
@@ -154,7 +178,7 @@ server.tool(
 );
 
 // 4. computer
-server.tool(
+registerTool(
   "computer",
   "Use a mouse and keyboard to interact with a web browser, and take screenshots. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.\n* Whenever you intend to click on an element like an icon, you should consult a screenshot to determine the coordinates of the element before moving the cursor.\n* If you tried clicking on a program or link but it failed to load, even after waiting, try adjusting your click location so that the tip of the cursor visually falls on the element that you want to click.\n* Make sure to click any buttons, links, icons, etc with the cursor tip in the center of the element. Don't click boxes on their edges unless asked.",
   {
@@ -180,7 +204,7 @@ server.tool(
 );
 
 // 5. find
-server.tool(
+registerTool(
   "find",
   'Find elements on the page using natural language. Can search for elements by their purpose (e.g., "search bar", "login button") or by text content (e.g., "organic mango product"). Returns up to 20 matching elements with references that can be used with other tools. If more than 20 matches exist, you\'ll be notified to use a more specific query. If you don\'t have a valid tab ID, use tabs_context_mcp first to get available tabs.',
   {
@@ -191,7 +215,7 @@ server.tool(
 );
 
 // 6. form_input
-server.tool(
+registerTool(
   "form_input",
   "Set values in form elements using element reference ID from the read_page tool. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
   {
@@ -203,7 +227,7 @@ server.tool(
 );
 
 // 7. get_page_text
-server.tool(
+registerTool(
   "get_page_text",
   "Extract raw text content from the page, prioritizing article content. Ideal for reading articles, blog posts, or other text-heavy pages. Returns plain text without HTML formatting. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
   {
@@ -213,7 +237,7 @@ server.tool(
 );
 
 // 8. gif_creator
-server.tool(
+registerTool(
   "gif_creator",
   "Manage GIF recording and export for browser automation sessions. Control when to start/stop recording browser actions (clicks, scrolls, navigation), then export as an animated GIF with visual overlays (click indicators, action labels, progress bar, watermark). All operations are scoped to the tab's group. When starting recording, take a screenshot immediately after to capture the initial state as the first frame. When stopping recording, take a screenshot immediately before to capture the final state as the last frame. For export, either provide 'coordinate' to drag/drop upload to a page element, or set 'download: true' to download the GIF.",
   {
@@ -234,7 +258,7 @@ server.tool(
 );
 
 // 9. javascript_tool
-server.tool(
+registerTool(
   "javascript_tool",
   "Execute JavaScript code in the context of the current page. The code runs in the page's context and can interact with the DOM, window object, and page variables. Returns the result of the last expression or any thrown errors. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
   {
@@ -246,7 +270,7 @@ server.tool(
 );
 
 // 10. read_console_messages
-server.tool(
+registerTool(
   "read_console_messages",
   "Read browser console messages (console.log, console.error, console.warn, etc.) from a specific tab. Useful for debugging JavaScript errors, viewing application logs, or understanding what's happening in the browser console. Returns console messages from the current domain only. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs. IMPORTANT: Always provide a pattern to filter messages - without a pattern, you may get too many irrelevant messages.",
   {
@@ -260,7 +284,7 @@ server.tool(
 );
 
 // 11. read_network_requests
-server.tool(
+registerTool(
   "read_network_requests",
   "Read HTTP network requests (XHR, Fetch, documents, images, etc.) from a specific tab. Useful for debugging API calls, monitoring network activity, or understanding what requests a page is making. Returns all network requests made by the current page, including cross-origin requests. Requests are automatically cleared when the page navigates to a different domain. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
   {
@@ -273,7 +297,7 @@ server.tool(
 );
 
 // 12. read_page
-server.tool(
+registerTool(
   "read_page",
   "Get an accessibility tree representation of elements on the page. By default returns all elements including non-visible ones. Output is limited to 50000 characters by default. If the output exceeds this limit, you will receive an error asking you to specify a smaller depth or focus on a specific element using ref_id. Optionally filter for only interactive elements. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
   {
@@ -287,7 +311,7 @@ server.tool(
 );
 
 // 13. resize_window
-server.tool(
+registerTool(
   "resize_window",
   "Resize the current browser window to specified dimensions. Useful for testing responsive designs or setting up specific screen sizes. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
   {
@@ -299,7 +323,7 @@ server.tool(
 );
 
 // 14. shortcuts_list
-server.tool(
+registerTool(
   "shortcuts_list",
   "List all available shortcuts and workflows (shortcuts and workflows are interchangeable). Returns shortcuts with their commands, descriptions, and whether they are workflows. Use shortcuts_execute to run a shortcut or workflow.",
   {
@@ -309,7 +333,7 @@ server.tool(
 );
 
 // 15. shortcuts_execute
-server.tool(
+registerTool(
   "shortcuts_execute",
   "Execute a shortcut or workflow by running it in a new sidepanel window using the current tab (shortcuts and workflows are interchangeable). Use shortcuts_list first to see available shortcuts. This starts the execution and returns immediately - it does not wait for completion.",
   {
@@ -321,7 +345,7 @@ server.tool(
 );
 
 // 16. switch_browser
-server.tool(
+registerTool(
   "switch_browser",
   "Switch which Chrome browser is used for browser automation. Call this when the user wants to connect to a different Chrome browser. Broadcasts a connection request to all Chrome browsers with the extension installed \u2014 the user clicks 'Connect' in the desired browser.",
   {},
@@ -329,7 +353,7 @@ server.tool(
 );
 
 // 17. upload_image
-server.tool(
+registerTool(
   "upload_image",
   "Upload a previously captured screenshot or user-uploaded image to a file input or drag & drop target. Supports two approaches: (1) ref - for targeting specific elements, especially hidden file inputs, (2) coordinate - for drag & drop to visible locations like Google Docs. Provide either ref or coordinate, not both.",
   {
@@ -343,7 +367,7 @@ server.tool(
 );
 
 // 19. browser_batch
-server.tool(
+registerTool(
   "browser_batch",
   "Execute a sequence of browser tool calls in ONE round trip. Each item is `{name, input}` where input is exactly what you'd pass to that tool standalone. Actions execute SEQUENTIALLY (not in parallel) and stop on the first error. Use this tool extensively to quickly execute work whenever you can predict two or more steps ahead — e.g. navigate, click a field, type, press Return, screenshot. Each tool's own permission check runs per item — if an action navigates to a domain without permission, the next item's check fails and the batch stops. Screenshots and other images are returned interleaved with outputs; coordinates you write in THIS batch refer to the screenshot taken BEFORE this call. browser_batch cannot be nested.",
   {
@@ -358,24 +382,27 @@ server.tool(
     const uploadPolicy = loadUploadPolicy();
     const actions = [];
     for (let i = 0; i < args.actions.length; i++) {
-      const action = args.actions[i];
-      if (action.name === "browser_batch") {
-        return textResult(`Error: Action ${i + 1} (browser_batch): nested browser_batch is not allowed.`);
-      }
-      if (action.name !== "file_upload") {
-        actions.push(action);
+      const { name, input } = args.actions[i];
+      const refuse = (problem) => errorResult(`Error: Action ${i + 1} (${name}): ${problem} No action in this batch was run.`);
+      if (name === "browser_batch") return refuse("nested browser_batch is not allowed.");
+      const schema = toolSchemas.get(name);
+      if (!schema) return refuse("unknown tool.");
+      const parsed = schema.safeParse(coerceArgs(input));
+      if (!parsed.success) return refuse(`invalid input. ${describeIssues(parsed.error)}.`);
+      if (name !== "file_upload") {
+        actions.push({ name, input: parsed.data });
         continue;
       }
-      const check = checkUploadPaths(action.input?.paths, uploadPolicy);
-      if (!check.ok) return textResult(`Error: Action ${i + 1} (file_upload): ${check.error}`);
-      actions.push({ ...action, input: { ...action.input, paths: check.resolved } });
+      const check = checkUploadPaths(parsed.data.paths, uploadPolicy);
+      if (!check.ok) return refuse(check.error);
+      actions.push({ name, input: { ...parsed.data, paths: check.resolved } });
     }
     return callTool("browser_batch", { ...args, actions });
   }
 );
 
 // 20. file_upload
-server.tool(
+registerTool(
   "file_upload",
   "Upload one or multiple files to a file input element on the page. Do not click on file upload buttons or file inputs — clicking opens a native file picker dialog that you cannot see or interact with. Instead, use read_page or find to locate the file input element, then use this tool with its ref to upload files directly. Only files inside the allowed upload folders can be uploaded (by default ~/Downloads and ~/Desktop, configurable with fileUploadAllowedDirs in ~/.config/open-claude-in-chrome/config.json); other paths will be rejected. The combined size of all files in a single call must stay under 10 MB.",
   {
@@ -385,13 +412,13 @@ server.tool(
   },
   async (args) => {
     const check = checkUploadPaths(args.paths, loadUploadPolicy());
-    if (!check.ok) return textResult(`Error: ${check.error}`);
+    if (!check.ok) return errorResult(`Error: ${check.error}`);
     return callTool("file_upload", { ...args, paths: check.resolved });
   }
 );
 
 // 21. list_connected_browsers
-server.tool(
+registerTool(
   "list_connected_browsers",
   'List all Chrome browsers (extension instances) currently connected to this account. Returns each browser\'s deviceId, display name, OS platform, and whether it appears to be on this computer. Use this before select_browser to present choices to the user. Before any browser action, you MUST call the AskUserQuestion tool with a question listing EVERY connected browser as a separate option (use the display name as the label, and include the deviceId in parentheses), plus one final option labeled exactly: "Open a confirmation screen in every connected Chrome extension and let me select the right one there." Do not skip any connected browser and do not pick one yourself. If the user picks a specific browser, call select_browser with that browser\'s deviceId. If the user picks the final option, call switch_browser — this sends a confirmation prompt to every connected Chrome extension and waits for the user to click Connect in the one they want; it also lets them name that browser.',
   {},
@@ -399,7 +426,7 @@ server.tool(
 );
 
 // 22. select_browser
-server.tool(
+registerTool(
   "select_browser",
   "Select a specific Chrome browser by deviceId for browser automation, without broadcasting a pairing request. Use this after list_connected_browsers when the user has chosen one from the list.",
   {
@@ -409,7 +436,7 @@ server.tool(
 );
 
 // 23. tabs_close_mcp
-server.tool(
+registerTool(
   "tabs_close_mcp",
   "Close a tab in the MCP tab group by its ID. Use to clean up tabs you're done with. Only tabs in this session's group are closable; call tabs_context_mcp first to get valid IDs. If you close the group's last tab, Chrome auto-removes the group — the next tabs_context_mcp with createIfEmpty starts fresh.",
   {

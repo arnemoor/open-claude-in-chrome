@@ -8,7 +8,7 @@
   <em>Official Claude in Chrome gives you 58 blocked domains and two browsers.<br/>
   <strong>Open Claude in Chrome gives you the whole web.</strong></em>
   <br/>
-  <sub>Clean-room reimplementation of Anthropic's browser extension. No blocklist. Any Chromium browser. The full 22-tool surface.</sub>
+  <sub>Clean-room reimplementation of Anthropic's browser extension. No blocklist. Chrome, Edge and Brave. The full 22-tool surface.</sub>
   <br/>
   <sub>by <a href="https://noemica.io">noemica</a></sub>
 </p>
@@ -40,7 +40,7 @@ The official [Claude in Chrome](https://code.claude.com/docs/en/chrome) extensio
 | | Claude in Chrome | Open Claude in Chrome |
 |---|---|---|
 | **Domain blocklist** | 58 blocked domains across 11 categories | No blocklist. Navigate anywhere. |
-| **Browser support** | Chrome and Edge only | Any Chromium browser (Chrome, Edge, Brave, Arc, Opera, Vivaldi, etc.) |
+| **Browser support** | Chrome and Edge only | Chrome, Edge and Brave |
 | **Source code** | Closed source | Open source (MIT) |
 | **Tools** | 22 MCP tools | Same 22-tool surface (a few advanced tools are stubs, see below) |
 | **Performance** | Baseline | Identical |
@@ -87,7 +87,7 @@ To move an existing install to this version:
 1. Pull the latest code.
 2. Reinstall host dependencies: `cd host && npm install && cd ..`.
 3. Quit the browser with Cmd+Q, or at least reload the extension (next step). Closing every window alone does not quit a Chrome-based browser, which keeps running in the background. Either way, both sides need to restart together: an old native host and a new MCP server (or the other way around) cannot talk to each other.
-4. Reload the extension in `chrome://extensions` so it picks up the new `background.js` and `content.js`.
+4. Reload the extension in `chrome://extensions` so it picks up the new `background.js` and `content.js`. After the reload, or after a browser restart, the extension does not reuse the old MCP tab group, and a call on one of its tab ids is refused. Only the next `tabs_context_mcp` with `createIfEmpty: true`, or a `tabs_create_mcp`, creates a new group. You can close the old group by hand (see Troubleshooting).
 5. Clear out stale MCP server processes and reconnect each Claude Code session:
    ```bash
    pkill -f "node.*open-claude-in-chrome/host/mcp-server"
@@ -102,7 +102,7 @@ No manual cleanup is required beyond that. A leftover `port` key in `~/.config/o
 ### Prerequisites
 
 - **Node.js** v18+
-- **Any Chromium browser** (Chrome, Edge, Brave, Arc, Opera, Vivaldi, etc.)
+- **Google Chrome, Microsoft Edge or Brave**. `install.sh` registers the native messaging host for these three browsers only.
 - **Claude Code** v2.0.73+
 
 ### Step 1: Install dependencies
@@ -129,7 +129,7 @@ cd ..
 If you use multiple browsers, pass all IDs:
 
 ```bash
-./install.sh <chrome-id> <brave-id> <arc-id>
+./install.sh <chrome-id> <edge-id> <brave-id>
 ```
 
 This also links an agent-facing skill describing this fork's tool quirks into `~/.claude/skills/open-claude-in-chrome`, as long as `~/.claude/skills` already exists on your machine.
@@ -144,10 +144,10 @@ Quit with **Cmd+Q**, or at least reload the extension in `chrome://extensions`. 
 claude mcp add open-claude-in-chrome -- node /absolute/path/to/host/mcp-server.js
 ```
 
-Find the absolute path with:
+To print this command for your checkout, run this from the repository root. It puts the path in single quotes, the same way `install.sh` prints it at the end, so a path with spaces or other special characters pastes as is:
 
 ```bash
-echo "node $(pwd)/host/mcp-server.js"
+printf "claude mcp add open-claude-in-chrome -- node '%s'\n" "$(pwd | sed "s/'/'\\\\''/g")/host/mcp-server.js"
 ```
 
 ## Verification
@@ -209,7 +209,7 @@ A few things about `computer` and `navigate` that aren't obvious from the tool d
 
 **navigate.** A bare host like `example.com` gets `https://` added automatically. These schemes are kept exactly as given: `http:`, `https:`, `data:`, `about:`, `chrome:`, `brave:`, `edge:`, `view-source:`, `blob:`, `ftp:`, and `chrome-extension:` for another extension's id. Anything else with a 1-5 letter scheme followed by a slash is treated as a mistyped protocol: that prefix is stripped and `https://` takes its place (`ws://h` becomes `https://h`). A longer or different unknown scheme instead gets `https://` prefixed onto the whole original string (`webcal://h` becomes `https://webcal://h`, `mailto:a@b` becomes `https://mailto:a@b`), so don't rely on an unlisted scheme surviving as written. `javascript:` URLs are refused (use `javascript_tool` instead), and so is navigating to this extension's own pages, even wrapped in `view-source:` or `blob:`. That unwrapping only guards the extension's own pages: a `javascript:` URL hidden behind `view-source:`, for example `view-source:javascript:alert(1)`, is not caught by the `javascript:` refusal itself.
 
-**Local files.** `file:` URLs are blocked outright, also when wrapped in `view-source:` or `blob:`: the reply is `file: URLs are blocked: the agent cannot open local files.` This is by design, not a missing permission. Chrome grants unpacked extensions access to `file://` pages by default, and once granted, a page read (`get_page_text`, `read_page`, a screenshot) would let the agent pull the contents of any file the browser can read, regardless of what `fileUploadAllowedDirs` says. Turning on "Allow access to file URLs" for this extension in `chrome://extensions` does not change this behavior. You can still turn that switch off there for defense in depth. Every other tool also refuses to act on a tab that's currently showing a `file://` page or one of this extension's own pages: the reply is `Tab <id> shows a local file or this extension's own page, which the agent cannot use.`
+**Local files.** `file:` URLs are blocked outright, also when wrapped in `view-source:` or `blob:`: the reply is `file: URLs are blocked: the agent cannot open local files.` This is by design, not a missing permission. Chrome grants unpacked extensions access to `file://` pages by default, and once granted, a page read (`get_page_text`, `read_page`, a screenshot) would let the agent pull the contents of any file the browser can read, regardless of what `fileUploadAllowedDirs` says. Turning on "Allow access to file URLs" for this extension in `chrome://extensions` does not change this behavior. You can still turn that switch off there for defense in depth. Every other tool except `tabs_close_mcp` also refuses to act on a tab that's currently showing a `file://` page or one of this extension's own pages: the reply is `Tab <id> shows a local file or this extension's own page, which the agent cannot use.` `tabs_close_mcp` can still close such a tab, so the agent can clean it up.
 
 **Typing and keys.** `type` presses real keys, with real keydown/keyup events, only for characters on a US keyboard layout (letters, digits, common punctuation). Every other character (umlauts, ß, emoji, CJK) is inserted as text instead, one character at a time, with no key events at all, though the field's value ends up exactly right either way. A line break in the typed text becomes a real line break only when a `textarea` or a contenteditable element is focused. In a single-line `<input>` it's dropped, and the reply notes that. Use the `key` action with `text: "Enter"` to submit a form. Some shifted punctuation can't be built as a `key` combination (for example `shift+1` presses Shift and 1, not `!`). Type that character directly instead.
 
@@ -219,9 +219,9 @@ A few things about `computer` and `navigate` that aren't obvious from the tool d
 
 The extension can keep a local, opt-in audit log of what an agent does in the browser, for the user's own oversight. It's off by default. Only the extension's own options page (`chrome://extensions` > Open Claude in Chrome > Details > Extension options) can turn it on or change its retention period (1, 7 or 30 days). No MCP tool can read or change this setting. An audit failure never changes a tool's result, and audit writes happen in the background, except that the first audited call on a given page can wait up to about 2 seconds while that page's recorder starts.
 
-When it's on, each session's tool calls are recorded as a redacted summary. `type` text and `form_input` values are kept only as a character count, never the value, but a boolean form value is kept as `checked=true` or `checked=false`. A `key` action keeps named keys and modifier combos (like `Enter` or `ctrl+a`) as given, since they aren't secrets, but a run of plain character keys is stored only as a count (`[N keys]`), the same protection `type` gets. Any stored URL, including inside an error message, has its query string and fragment removed everywhere. The path stays. `javascript_tool` code is kept up to 500 characters, but the text of any string literal inside it is replaced with `[N chars]`, and so is everything after the first `/` that isn't part of a comment (a division sign or the start of a regex), since telling those apart isn't reliable. `find` queries and file paths (upload paths, URL paths) are kept as given.
+When it's on, each session's tool calls are recorded as a redacted summary. `type` text and `form_input` values are kept only as a character count, never the value, but a boolean form value is kept as `checked=true` or `checked=false`. A `key` action keeps named keys and modifier combos (like `Enter` or `ctrl+a`) as given, since they aren't secrets, but a run of plain character keys is stored only as a count (`[N keys]`), the same protection `type` gets. Query strings and fragments are removed from every stored URL, from the action summaries and from error texts. That includes a URL inside a `find` query and a URL inside `javascript_tool` code, even in a comment. The path stays. `javascript_tool` code is kept up to 500 characters, but the text of any string literal inside it is replaced with `[N chars]`, and so is everything after the first `/` that isn't part of a comment (a division sign or the start of a regex), since telling those apart isn't reliable. Apart from that URL rule, `find` queries and file paths (upload paths, URL paths) are kept as given.
 
-Alongside that summary, a masked DOM replay (via rrweb, not a screen recording) of the tabs the session touched masks every input, textarea, select and password value, and any contenteditable text, to asterisks of the same length. Hidden inputs are left out of the replay entirely. A URL captured in the replay itself, the page's own address or a link's href, also has its query and fragment stripped, but ordinary page text and link text are recorded as they are. It doesn't inline canvas content or images, and a page this extension can't script at all (a `chrome://` page, the Web Store) gets no replay. Only tabs in the MCP tab group are ever recorded. Viewing a replay never loads anything over the network: the options page only ever uses its own bundled resources.
+Alongside that summary, a masked DOM replay (via rrweb, not a screen recording) of the tabs the session touched masks every input, textarea, select and password value, and any contenteditable text, to asterisks of the same length. Only those values are masked. All other page text is recorded as it is, link text included. So when a page copies what is typed into an ordinary element, for example a live preview of a message, the replay records that copy as page text. Hidden inputs are left out of the replay entirely. A URL captured in the replay itself, the page's own address or a link's href, also has its query and fragment stripped, but a URL written in the page text keeps them. It doesn't inline canvas content or images, and a page this extension can't script at all (a `chrome://` page, the Web Store) gets no replay. Only tabs in the MCP tab group are ever recorded. Viewing a replay never loads anything over the network: the options page only ever uses its own bundled resources.
 
 Everything lives in the browser profile's own IndexedDB and never leaves the machine. Entries older than the retention period are deleted every hour and each time the browser starts, even after audit mode is switched off, as long as it was ever turned on, and at most 200 sessions are kept regardless of age.
 
@@ -240,11 +240,11 @@ No build step. All files are plain JavaScript. After pulling or editing code:
 | What changed | What to do |
 |---|---|
 | `extension/background.js`, `extension/content.js`, `extension/manifest.json`, anything under `extension/audit/` or `extension/vendor/`, or the `extension/options.*` files | Reload the extension: `brave://extensions` > click the reload icon |
-| `host/*.js` (`native-host.js`, `mcp-server.js`, `bridge-hub.js`, `bridge-client.js`, `bridge-endpoint.js`, `log.js`) | Restart the browser (new native host), then `pkill -f "node.*open-claude-in-chrome/host/mcp-server"` and `/mcp` in each Claude Code session |
+| `host/*.js` (`native-host.js`, `mcp-server.js`, `bridge-hub.js`, `bridge-client.js`, `bridge-endpoint.js`, `log.js`) | Quit the browser completely with Cmd+Q, or reload the extension (either starts a new native host), then `pkill -f "node.*open-claude-in-chrome/host/mcp-server"` and `/mcp` in each Claude Code session |
 | `host/upload-policy.js`, `host/save-to-disk.js` | `pkill -f "node.*open-claude-in-chrome/host/mcp-server"` and `/mcp` in each Claude Code session, no browser restart needed |
-| `install.sh` or native host name changed | Re-run `./install.sh <extension-id>`, restart browser, re-add MCP |
+| `install.sh` or native host name changed | Re-run `./install.sh <extension-id>`, quit the browser completely with Cmd+Q or reload the extension, re-add MCP |
 
-> Old and new versions of the bridge cannot talk to each other, so after changing `native-host.js`, `mcp-server.js`, `bridge-hub.js`, `bridge-client.js`, `bridge-endpoint.js` or `log.js`, refresh **both** sides: restart the browser (spawns a fresh native host) **and** `pkill` + `/mcp` in every session (spawns fresh MCP servers). `log.js` is imported by the native host too, so a change there only reaches `native-host.log` once a fresh native host starts. Reloading the extension also applies any manifest change (a dropped or added permission, a new options page, and so on).
+> Old and new versions of the bridge cannot talk to each other, so after changing `native-host.js`, `mcp-server.js`, `bridge-hub.js`, `bridge-client.js`, `bridge-endpoint.js` or `log.js`, refresh **both** sides: quit the browser completely with Cmd+Q, or reload the extension (either spawns a fresh native host), **and** `pkill` + `/mcp` in every session (spawns fresh MCP servers). Closing every window does not quit a Chrome-based browser. `log.js` is imported by the native host too, so a change there only reaches `native-host.log` once a fresh native host starts. Reloading the extension also applies any manifest change (a dropped or added permission, a new options page, and so on).
 
 ### Quick reset (nuclear option)
 
@@ -257,7 +257,8 @@ pkill -f "node.*open-claude-in-chrome/host/mcp-server"
 # 2. Re-run install
 ./install.sh <your-extension-id>
 
-# 3. Restart browser (close all windows, reopen)
+# 3. Quit the browser completely (Cmd+Q) and reopen it, or at least do step 4.
+#    Closing every window does not quit a Chrome-based browser.
 
 # 4. Reload extension in brave://extensions
 
@@ -267,7 +268,7 @@ pkill -f "node.*open-claude-in-chrome/host/mcp-server"
 
 ## Multiple Sessions
 
-Any number of Claude Code sessions can share the same browser. Each session's MCP server connects to the native host's hub as an equal client. No client owns the link, so one session ending never disconnects the others, and none needs to be promoted when another exits.
+Any number of Claude Code sessions can share the same browser. Each session's MCP server connects to the native host's hub as an equal client. No client owns the link, so one session ending never disconnects the others, and none needs to be promoted when another exits. All sessions also share one MCP tab group, so each session can see and act on the other sessions' tabs, even though the `tabs_close_mcp` tool description speaks of "this session's group".
 
 ## Troubleshooting
 
@@ -275,7 +276,7 @@ Any number of Claude Code sessions can share the same browser. Each session's MC
 
 1. Verify the extension is loaded and enabled
 2. Check that `./install.sh` was run with the correct extension ID
-3. Restart the browser completely (all windows)
+3. Quit the browser completely with Cmd+Q and reopen it, or reload the extension in `chrome://extensions`. Closing every window does not quit a Chrome-based browser.
 4. Verify the native messaging host manifest exists:
    - **Chrome (macOS)**: `~/Library/Application Support/Google/Chrome/NativeMessagingHosts/com.anthropic.open_claude_in_chrome.json`
    - **Brave (macOS)**: `~/Library/Application Support/BraveSoftware/Brave-Browser/NativeMessagingHosts/com.anthropic.open_claude_in_chrome.json`
@@ -297,6 +298,10 @@ The MCP server is running, but no native host is serving the bridge socket. Chec
 4. Check service worker logs: `chrome://extensions` > "Inspect views: service worker".
 5. Verify `host/native-host-wrapper.sh` exists and its `node` path is valid.
 
+### A second MCP tab group after a reload or restart
+
+The extension reuses only the tab group it created itself. It remembers that group's id in the browser's session storage, which the browser clears on every extension reload or update and on every browser restart. It never takes over a group because the group is titled "MCP", so a group of your own with that title stays yours. After a reload or restart, the old MCP group is therefore not reused, and a call on one of its tab ids is refused. Only the next `tabs_context_mcp` with `createIfEmpty: true`, or a `tabs_create_mcp`, creates a new group. Close the old group by hand once you no longer need its tabs.
+
 ### Socket permission error
 
 The native host creates `~/.config/open-claude-in-chrome/run` with mode `0700` each time it starts, and tightens it back to `0700` automatically if it finds looser permissions there, as long as the directory is a real directory you own. It refuses to serve the bridge instead, and logs why as a `start_failed` entry in `~/.config/open-claude-in-chrome/logs/native-host.log`, only when the path genuinely isn't usable:
@@ -306,11 +311,11 @@ The native host creates `~/.config/open-claude-in-chrome/run` with mode `0700` e
 - something other than a socket already sits at the `bridge.sock` path itself
 - the full socket path is too long for a Unix socket (over 103 bytes on macOS, 107 on Linux, which a long home directory path can trigger)
 
-Remove or fix whatever is at that path (or shorten your home directory path), then restart the browser.
+Remove or fix whatever is at that path (or shorten your home directory path), then quit the browser completely with Cmd+Q, or reload the extension.
 
 ### `navigate` refuses `file://` URLs
 
-This is by design, not a bug or a missing setting: see Tool behavior notes above. There's no config flag or extension permission that turns it back on, including "Allow access to file URLs" in `chrome://extensions`. If you need to work with a local file in the browser yourself, open it in a regular tab outside the agent's control. The agent can't navigate there, and can't act on a tab that's already showing one.
+This is by design, not a bug or a missing setting: see Tool behavior notes above. There's no config flag or extension permission that turns it back on, including "Allow access to file URLs" in `chrome://extensions`. If you need to work with a local file in the browser yourself, open it in a regular tab outside the agent's control. The agent can't navigate there, and can't act on a tab that's already showing one, except to close it.
 
 ### EPERM on `save_to_disk` or `file_upload`
 
