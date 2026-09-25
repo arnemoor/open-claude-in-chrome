@@ -4,11 +4,13 @@ import { loadBackground } from "./harness/fake-chrome.mjs";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-test("tabs_create_mcp opens the tab in the group's window", async () => {
+// about:blank, not the default New Tab Page: chrome.debugger refuses to attach to a chrome://
+// page, and tabs_create_mcp attaches the new tab right away (see dialog.test.mjs).
+test("tabs_create_mcp opens the tab in the group's window, on about:blank", async () => {
   const bg = await loadBackground();
   await bg.handlers.tabs_create_mcp({});
   const create = bg.calls.find((c) => c[0] === "tabs.create");
-  assert.deepEqual({ ...create[1] }, { windowId: 1, active: true }); // spread: vm-realm objects fail strict deepEqual
+  assert.deepEqual({ ...create[1] }, { windowId: 1, active: true, url: "about:blank" }); // spread: vm-realm objects fail strict deepEqual
 });
 
 // Minor 8: when the group's tab closed in the gap since ensureTabGroup last checked (Chrome
@@ -33,7 +35,7 @@ test("tabs_create_mcp retries group creation instead of creating a windowless ta
   });
   await bg.handlers.tabs_create_mcp({});
   const create = bg.calls.find((c) => c[0] === "tabs.create");
-  assert.deepEqual({ ...create[1] }, { windowId: 1, active: true });
+  assert.deepEqual({ ...create[1] }, { windowId: 1, active: true, url: "about:blank" });
 });
 
 test("tabs_create_mcp fails clearly if the MCP group still has no tab after retrying, instead of creating a stray tab", async () => {

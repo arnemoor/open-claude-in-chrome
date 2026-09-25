@@ -6,6 +6,7 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { loadBackground } from "./harness/fake-chrome.mjs";
 import { chromeAvailable, launchChrome, openPage, evaluate, injectContentScript } from "./harness/browser.mjs";
 
@@ -143,6 +144,24 @@ test("navigate still works when the pre-navigate attach fails", async () => {
   assert.match(r.content[0].text, /^Navigated to/);
 });
 
+// On a tab frozen by a dialog the extension never saw, the pre-navigate attach hangs (its
+// Emulation call waits out the 30s CDP timeout). Navigating away is how the agent frees such a
+// tab, so navigate must not wait that out: it navigates once its short attach budget runs out.
+test("navigate still navigates promptly when its pre-navigate attach never settles", { timeout: 10000 }, async () => {
+  let bg;
+  const update = async (...a) => { bg.calls.push(["tabs.update", ...a]); setTimeout(() => bg.chrome.tabs.onUpdated.fire(bg.tabId, { status: "complete" }), 0); };
+  bg = await loadBackground({ overrides: { tabs: { update }, debugger: { attach: () => new Promise(() => {}) } } });
+  const start = Date.now();
+  const r = await Promise.race([
+    bg.handlers.navigate({ url: "https://example.com", tabId: bg.tabId }),
+    delay(6000, null, { ref: false }),
+  ]);
+  assert.ok(r, "navigate waited for an attach that never settles");
+  assert.match(r.content[0].text, /^Navigated to/);
+  assert.ok(bg.calls.some((c) => c[0] === "tabs.update"), "expected a tabs.update call");
+  assert.ok(Date.now() - start < 4000, `expected navigate within the attach budget, took ${Date.now() - start}ms`);
+});
+
 let browser;
 before(async () => { if (chromeAvailable) browser = await launchChrome(); }, { timeout: 30000 });
 after(() => browser?.close());
@@ -261,4 +280,53 @@ test("real Chrome: a dialog just after navigate is tracked promptly, not after a
   assert.ok(Date.now() - start < 3000, `expected the dialog to already be tracked, took ${Date.now() - start}ms`);
 
   await send("Page.handleJavaScriptDialog", { accept: true });
+});
+
+// From tab creation on: the tab tabs_create_mcp makes must accept the attach, or a dialog on
+// the first page it loads goes untracked and the next CDP call waits out 30s on the frozen page.
+// chrome.debugger refuses every chrome:// page, the default New Tab Page included. This harness
+// drives Chrome over CDP, which has no such rule, so the fake attach below refuses the same way
+// while the tab shows a chrome:// URL. Every CDP command after the attach runs in real Chrome.
+test("real Chrome: a dialog on the first page a tabs_create_mcp tab loads is tracked, not a 30s wait", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  await browser.send("Browser.setDownloadBehavior", { behavior: "deny" });
+  const { targetId } = await browser.send("Target.createTarget", { url: "about:blank" });
+  const { sessionId } = await browser.send("Target.attachToTarget", { targetId, flatten: true });
+  const send = (method, params) => browser.send(method, params, sessionId);
+  const page = { targetId, sessionId, send, browser, evaluate: (expr) => evaluate(send, expr) };
+  // A second session only watches for the dialog: CDP sends events per session, so enabling
+  // Page here tracks nothing for the extension's own session.
+  const { sessionId: watchId } = await browser.send("Target.attachToTarget", { targetId, flatten: true });
+  await browser.send("Page.enable", {}, watchId);
+  const dialogOn = (id) => new Promise((resolve) => {
+    const off = browser.onEvent((m) => {
+      if (m.sessionId === id && m.method === "Page.javascriptDialogOpening") { off(); resolve(true); }
+    });
+  });
+  const watched = dialogOn(watchId);
+  const tracked = dialogOn(sessionId);
+
+  let bg;
+  let tabUrl = "";
+  const create = async (p) => { tabUrl = p.url ?? "chrome://newtab/"; return { id: bg.tabId, windowId: 1 }; };
+  const attach = async () => { if (tabUrl.startsWith("chrome://")) throw new Error("Cannot access a chrome:// URL"); };
+  const update = async (id, { url }) => {
+    tabUrl = url;
+    send("Page.navigate", { url }).catch(() => {});
+    setTimeout(() => bg.chrome.tabs.onUpdated.fire(bg.tabId, { status: "complete" }), 100);
+  };
+  bg = await loadBackground({ page, overrides: { tabs: { create, update }, debugger: { attach } } });
+
+  await bg.handlers.tabs_create_mcp({});
+  await bg.handlers.navigate({ url: `data:text/html;charset=utf-8,${encodeURIComponent("<script>alert('first page')</script>")}`, tabId: bg.tabId });
+  await watched;
+  await Promise.race([tracked, delay(1000, false, { ref: false })]); // the extension's copy of the same event, if its session gets one
+
+  const shot = await Promise.race([
+    bg.handlers.computer({ action: "screenshot", tabId: bg.tabId }),
+    delay(3000, null, { ref: false }),
+  ]);
+  assert.ok(shot, "the screenshot waited on the frozen page: the dialog was never tracked");
+  assert.match(shot.content[0].text, /^A JavaScript dialog is open on this tab \("first page"\)/);
+
+  await browser.send("Page.handleJavaScriptDialog", { accept: true }, watchId);
 });
