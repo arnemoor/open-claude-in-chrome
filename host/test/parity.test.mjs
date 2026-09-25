@@ -131,7 +131,7 @@ async function waitForRoute(client, timeoutMs = 15000) {
   while (Date.now() - start < timeoutMs) {
     try {
       const res = await client.callTool({ name: "tabs_context_mcp", arguments: {} });
-      if (JSON.stringify(res).includes("ok")) return true;
+      if (res?.content?.[0]?.type === "text" && res.content[0].text === "ok") return true;
     } catch { /* server up, native host not attached yet */ }
     await sleep(250);
   }

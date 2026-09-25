@@ -40,7 +40,7 @@ async function waitForRoute(client, timeoutMs = 15000) {
   while (Date.now() - start < timeoutMs) {
     try {
       const res = await client.callTool({ name: "tabs_context_mcp", arguments: {} });
-      if (JSON.stringify(res).includes("ok")) return true;
+      if (res?.content?.[0]?.type === "text" && res.content[0].text === "ok") return true;
     } catch { /* server up, hub not attached yet */ }
     await sleep(250);
   }
@@ -71,15 +71,15 @@ describe("an extension tool_error is routed through the hub and client to the MC
     session = await startSession(iso.env);
     assert.ok(await waitForRoute(session.client), "mock native host should be connected and routing tool calls");
     ready = true;
-  });
+  }, { timeout: 20000 });
 
   after(async () => {
     if (session) await session.transport.close().catch(() => {});
     if (hub) await hub.stop("test");
     try { fs.rmSync(home, { recursive: true, force: true }); } catch {}
-  });
+  }, { timeout: 10000 });
 
-  it("returns the error as the MCP tool result text", async () => {
+  it("returns the error as the MCP tool result text", { timeout: 10000 }, async () => {
     const result = await session.client.callTool({ name: "navigate", arguments: { url: "https://example.com", tabId: 1 } });
     assert.equal(textOf(result), "Error: boom from the extension");
   });
@@ -106,15 +106,15 @@ describe("applySaveToDisk is wired through callTool", () => {
     session = await startSession(iso.env);
     assert.ok(await waitForRoute(session.client), "mock native host should be connected and routing tool calls");
     ready = true;
-  });
+  }, { timeout: 20000 });
 
   after(async () => {
     if (session) await session.transport.close().catch(() => {});
     if (hub) await hub.stop("test");
     try { fs.rmSync(home, { recursive: true, force: true }); } catch {}
-  });
+  }, { timeout: 10000 });
 
-  it("writes the file and reports the path for a standalone call", async () => {
+  it("writes the file and reports the path for a standalone call", { timeout: 10000 }, async () => {
     const result = await session.client.callTool({ name: "computer", arguments: { action: "screenshot", tabId: 1, save_to_disk: true } });
     const text = textOf(result);
     assert.match(text, /Saved to disk: .*screenshot_.*\.jpg/);
@@ -123,7 +123,7 @@ describe("applySaveToDisk is wired through callTool", () => {
     assert.ok(saved.startsWith(path.join(home, "Downloads", "open-claude-in-chrome")));
   });
 
-  it("also applies inside browser_batch", async () => {
+  it("also applies inside browser_batch", { timeout: 10000 }, async () => {
     const result = await session.client.callTool({
       name: "browser_batch",
       arguments: { actions: [{ name: "computer", input: { action: "screenshot", tabId: 1, save_to_disk: true } }] },
@@ -135,7 +135,7 @@ describe("applySaveToDisk is wired through callTool", () => {
 // --- M7: the bridge's connect grace, from a real mcp-server.js ---------------
 
 describe("the bridge's connect grace, observed through a real mcp-server.js", () => {
-  it("a tool call fails after the grace period with an actionable message, well under the 60s request timeout", async (t) => {
+  it("a tool call fails after the grace period with an actionable message, well under the 60s request timeout", { timeout: 15000 }, async (t) => {
     const iso = isolatedEnv({ OCIC_CONNECT_GRACE_MS: "500" });
     const session = await startSession(iso.env); // no hub is ever started
     t.after(async () => {
@@ -150,7 +150,7 @@ describe("the bridge's connect grace, observed through a real mcp-server.js", ()
     assert.ok(elapsed < 5000, `should fail within the grace period, not the 60s request timeout (took ${elapsed}ms)`);
   });
 
-  it("a hub that appears within the grace period still serves the waiting call", async (t) => {
+  it("a hub that appears within the grace period still serves the waiting call", { timeout: 15000 }, async (t) => {
     const iso = isolatedEnv({ OCIC_CONNECT_GRACE_MS: "3000" });
     const session = await startSession(iso.env);
     t.after(async () => {
