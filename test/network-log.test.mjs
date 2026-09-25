@@ -21,8 +21,11 @@ test("real Chrome: a server-side redirect is logged hop by hop", { skip: !chrome
   }).listen(0, "127.0.0.1");
   await new Promise((r) => server.once("listening", r));
   const base = `http://127.0.0.1:${server.address().port}`;
-  const browser = await launchChrome();
+  // launchChrome() itself is inside the try too: if it throws, the server (already listening
+  // above) must still be closed, not leaked.
+  let browser;
   try {
+    browser = await launchChrome();
     const page = await openPage(browser);
     const bg = await loadBackground({ page });
     await bg.handlers.read_network_requests({ tabId: bg.tabId });
@@ -32,7 +35,7 @@ test("real Chrome: a server-side redirect is logged hop by hop", { skip: !chrome
     assert.match(text, new RegExp(`GET ${base}/final → 200`));
     assert.doesNotMatch(text, new RegExp(`${base}/(r|final) \\(pending\\)`)); // the favicon may still be in flight
   } finally {
-    await browser.close();
+    if (browser) await browser.close();
     server.close();
   }
 });

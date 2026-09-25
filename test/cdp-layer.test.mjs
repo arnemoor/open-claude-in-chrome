@@ -93,7 +93,7 @@ test("a hung CDP command times out instead of hanging the call", { timeout: 5000
   await assert.rejects(bg.get("cdp")(bg.tabId, "Hang.me", {}, 50), /CDP Hang\.me timed out/);
 });
 
-test("real Chrome: the viewport follows a window resize and screenshots stay 1x on a 2x display", { skip: !chromeAvailable }, async () => {
+test("real Chrome: the viewport follows a window resize and screenshots stay 1x on a 2x display", { skip: !chromeAvailable, timeout: 20000 }, async () => {
   const browser = await launchChrome({ args: ["--force-device-scale-factor=2"] });
   try {
     const page = await openPage(browser, { html: "<body style='margin:0'>x</body>" });
@@ -110,11 +110,11 @@ test("real Chrome: the viewport follows a window resize and screenshots stay 1x 
     await new Promise((r) => setTimeout(r, 300));
     assert.equal(await page.evaluate("innerWidth"), 900);
   } finally {
-    browser.close();
+    await browser.close();
   }
 });
 
-test("real Chrome: close() removes the profile directory", { skip: !chromeAvailable }, async () => {
+test("real Chrome: close() removes the profile directory", { skip: !chromeAvailable, timeout: 20000 }, async () => {
   const browser = await launchChrome();
   const { profile } = browser;
   assert.equal(typeof profile, "string");
