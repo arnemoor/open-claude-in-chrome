@@ -128,17 +128,36 @@ esac
 # such as a dotfiles checkout) is left alone. A failure here is reported, not
 # fatal, so it can't stop the native messaging setup above from taking effect.
 
-# Prints the absolute path to the shared .git directory for the repository
-# containing $1 (the same result for every worktree of one repository), or
-# nothing if $1 doesn't exist or isn't inside a git repository.
+# Prints the PHYSICAL absolute path to the shared .git directory for the
+# repository containing $1 (the same result for every worktree of one
+# repository), or nothing if $1 doesn't exist or isn't inside a git
+# repository. Always resolved with `pwd -P`, not bash's own logical `pwd`:
+# comparing two logical paths can disagree on whether they're the same
+# directory when only one of them was reached through a symlink (e.g. /tmp
+# vs. /private/tmp on macOS), even though `cd` itself always lands on the
+# real one either way.
 repo_common_dir() {
   local dir="$1" common
   [ -d "$dir" ] || return 0
   common=$(git -C "$dir" rev-parse --git-common-dir 2>/dev/null) || return 0
-  case "$common" in
-    /*) printf '%s\n' "$common" ;;
-    *) (cd "$dir" && cd "$common" 2>/dev/null && pwd) ;;
-  esac
+  (cd "$dir" && cd "$common" 2>/dev/null && pwd -P)
+}
+
+# Prints the physical form of $1 (an absolute path that may not exist).
+# Resolves symlinks and any .. segments through the longest existing
+# ancestor directory (with `cd`/`pwd -P`, same as repo_common_dir above),
+# then appends the remaining, not-yet-existing tail components unchanged.
+# A dangling symlink's target has no real filesystem entry left to resolve
+# by the usual means, but its existing ancestors still need to be physical
+# for a same-repo comparison to be meaningful.
+physical_path() {
+  local target="$1" tail="" dir="$1"
+  while [ "$dir" != "/" ] && ! [ -d "$dir" ]; do
+    tail="$(basename "$dir")${tail:+/$tail}"
+    dir="$(dirname "$dir")"
+  done
+  dir="$(cd "$dir" && pwd -P)" || { printf '%s\n' "$target"; return; }
+  if [ -n "$tail" ]; then printf '%s/%s\n' "$dir" "$tail"; else printf '%s\n' "$dir"; fi
 }
 
 echo ""
@@ -170,8 +189,13 @@ if [ -d "$CLAUDE_SKILLS_DIR" ]; then
       # Dangling: its directory is gone (e.g. a removed worktree), so git can
       # no longer tell us its repo. Fall back to a structural check instead:
       # every worktree of this repo lives under this same repo's own root.
+      # Physically resolved on both sides: a lexical prefix match would both
+      # miss a relative target's ".." segments and wrongly accept an absolute
+      # target that escapes the repo through its own "..", e.g.
+      # <repo>/../elsewhere/... (M9 a, b).
       REPO_ROOT=$(dirname "$NEW_COMMON")
-      case "$OLD_TARGET_ABS" in
+      OLD_TARGET_PHYS=$(physical_path "$OLD_TARGET_ABS")
+      case "$OLD_TARGET_PHYS" in
         "$REPO_ROOT"|"$REPO_ROOT"/*) SAME_REPO=true ;;
         *) REASON="is dangling and not clearly part of this repository" ;;
       esac
@@ -197,7 +221,7 @@ fi
 echo ""
 echo "Done! Next steps:"
 echo ""
-echo "  1. Restart your browser (close all windows and reopen)"
+echo "  1. Quit your browser with Cmd+Q, or reload the extension in chrome://extensions"
 echo "  2. Add the MCP server to Claude Code:"
 echo ""
 echo "     claude mcp add open-claude-in-chrome -- node $HOST_DIR/mcp-server.js"
