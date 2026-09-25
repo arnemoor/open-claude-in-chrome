@@ -209,6 +209,19 @@ test("real Chrome: read_page on about:blank and on a text-only page with filter 
   assert.match(r2.content[0].text, /^No interactive elements found\.\n\nViewport: \d+x\d+$/);
 });
 
+// Real V8 puts only "Uncaught" in exceptionDetails.text. The error itself is in the exception's
+// description.
+test("real Chrome: javascript_tool replies with the exception's description", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  const page = await openPage(browser, { html: "<p>x</p>" });
+  const bg = await loadBackground({ page });
+  const thrown = await bg.handlers.javascript_tool({ text: "throw new Error('boom from the page')", tabId: bg.tabId });
+  assert.equal(thrown.isError, true);
+  assert.match(thrown.content[0].text, /^Error: Error: boom from the page/);
+  const parse = await bg.handlers.javascript_tool({ text: "JSON.parse('{not json')", tabId: bg.tabId });
+  assert.equal(parse.isError, true);
+  assert.match(parse.content[0].text, /^Error: SyntaxError: .*JSON/);
+});
+
 test("real Chrome: read_page with an unknown ref_id replies with isError", { skip: !chromeAvailable, timeout: 20000 }, async () => {
   const page = await openPage(browser, { html: "<button>Go</button>" });
   const cs = await injectContentScript(page, CONTENT);

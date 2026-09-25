@@ -1269,3 +1269,14 @@ test("real Chrome: the same typed code inside browser_batch is in neither the ac
   assert.doesNotMatch(JSON.stringify(fakeStore.calls), /493817/);
   await page.send("Page.handleJavaScriptDialog", { accept: true });
 });
+
+// javascript_tool replies with the exception's description, which quotes a string literal of the
+// script. Audit keeps withholding the text.
+test("real Chrome: a javascript_tool exception's description is withheld from the audit log", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  const { bg, fakeStore } = await auditedPage("<p>x</p>");
+  bg.deliver({ type: "tool_request", id: "1.s1.1", tool: "javascript_tool", args: { text: "JSON.parse('SECRETJS4111')", tabId: bg.tabId }, session: SESSION });
+  const reply = await nthReply(bg, 1);
+  assert.match(reply.result.content[0].text, /^Error: SyntaxError: .*SECRETJS4111/);
+  assert.equal(fakeStore.actions[0].outcome, WITHHELD);
+  assert.doesNotMatch(JSON.stringify(fakeStore.calls), /SECRETJS4111/);
+});

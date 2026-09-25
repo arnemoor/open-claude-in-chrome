@@ -1397,7 +1397,10 @@ const toolHandlers = {
       }, 55000);
 
       if (result.exceptionDetails) {
-        return errorResult(`Error: ${result.exceptionDetails.text || JSON.stringify(result.exceptionDetails)}`);
+        // The exception's description names its type and message, where the text is only
+        // "Uncaught".
+        const { exception, text: summary } = result.exceptionDetails;
+        return errorResult(`Error: ${exception?.description || summary || JSON.stringify(result.exceptionDetails)}`);
       }
 
       const val = result.result;
