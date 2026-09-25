@@ -115,7 +115,7 @@ case "$(uname)" in
     ;;
   *)
     echo "Error: Unsupported platform $(uname). This script supports macOS and Linux."
-    echo "For Windows, manually create the registry entries and host manifest."
+    echo "Windows is not supported: the bridge is built on Unix domain sockets and process.getuid(), which Windows doesn't have."
     exit 1
     ;;
 esac
@@ -128,17 +128,36 @@ esac
 # such as a dotfiles checkout) is left alone. A failure here is reported, not
 # fatal, so it can't stop the native messaging setup above from taking effect.
 
-# Prints the absolute path to the shared .git directory for the repository
-# containing $1 (the same result for every worktree of one repository), or
-# nothing if $1 doesn't exist or isn't inside a git repository.
+# Prints the PHYSICAL absolute path to the shared .git directory for the
+# repository containing $1 (the same result for every worktree of one
+# repository), or nothing if $1 doesn't exist or isn't inside a git
+# repository. Always resolved with `pwd -P`, not bash's own logical `pwd`:
+# comparing two logical paths can disagree on whether they're the same
+# directory when only one of them was reached through a symlink (e.g. /tmp
+# vs. /private/tmp on macOS), even though `cd` itself always lands on the
+# real one either way.
 repo_common_dir() {
   local dir="$1" common
   [ -d "$dir" ] || return 0
   common=$(git -C "$dir" rev-parse --git-common-dir 2>/dev/null) || return 0
-  case "$common" in
-    /*) printf '%s\n' "$common" ;;
-    *) (cd "$dir" && cd "$common" 2>/dev/null && pwd) ;;
-  esac
+  (cd "$dir" && cd "$common" 2>/dev/null && pwd -P)
+}
+
+# Prints the physical form of $1 (an absolute path that may not exist).
+# Resolves symlinks and any .. segments through the longest existing
+# ancestor directory (with `cd`/`pwd -P`, same as repo_common_dir above),
+# then appends the remaining, not-yet-existing tail components unchanged.
+# A dangling symlink's target has no real filesystem entry left to resolve
+# by the usual means, but its existing ancestors still need to be physical
+# for a same-repo comparison to be meaningful.
+physical_path() {
+  local target="$1" tail="" dir="$1"
+  while [ "$dir" != "/" ] && ! [ -d "$dir" ]; do
+    tail="$(basename "$dir")${tail:+/$tail}"
+    dir="$(dirname "$dir")"
+  done
+  dir="$(cd "$dir" && pwd -P)" || { printf '%s\n' "$target"; return; }
+  if [ -n "$tail" ]; then printf '%s/%s\n' "$dir" "$tail"; else printf '%s\n' "$dir"; fi
 }
 
 echo ""
@@ -149,22 +168,44 @@ if [ -d "$CLAUDE_SKILLS_DIR" ]; then
   SKILL_LINK="$CLAUDE_SKILLS_DIR/open-claude-in-chrome"
   if [ -L "$SKILL_LINK" ]; then
     OLD_TARGET=$(readlink "$SKILL_LINK")
+    # A relative target (some older installs made one) resolves against the
+    # link's own directory, the same way the OS resolves it, not against
+    # wherever this script happens to be invoked from.
+    case "$OLD_TARGET" in
+      /*) OLD_TARGET_ABS="$OLD_TARGET" ;;
+      *) OLD_TARGET_ABS="$CLAUDE_SKILLS_DIR/$OLD_TARGET" ;;
+    esac
+    NEW_COMMON=$(repo_common_dir "$SCRIPT_DIR")
     SAME_REPO=false
-    if [ "$OLD_TARGET" = "$SKILL_SRC" ]; then
+    REASON="already points elsewhere"
+    if [ "$OLD_TARGET_ABS" = "$SKILL_SRC" ]; then
       SAME_REPO=true
-    else
-      OLD_COMMON=$(repo_common_dir "$(dirname "$OLD_TARGET")")
-      NEW_COMMON=$(repo_common_dir "$SCRIPT_DIR")
+    elif [ -d "$(dirname "$OLD_TARGET_ABS")" ]; then
+      OLD_COMMON=$(repo_common_dir "$(dirname "$OLD_TARGET_ABS")")
       if [ -n "$OLD_COMMON" ] && [ "$OLD_COMMON" = "$NEW_COMMON" ]; then
         SAME_REPO=true
       fi
+    else
+      # Dangling: its directory is gone (e.g. a removed worktree), so git can
+      # no longer tell us its repo. Fall back to a structural check instead:
+      # every worktree of this repo lives under this same repo's own root.
+      # Physically resolved on both sides: a lexical prefix match would both
+      # miss a relative target's ".." segments and wrongly accept an absolute
+      # target that escapes the repo through its own "..", e.g.
+      # <repo>/../elsewhere/... (M9 a, b).
+      REPO_ROOT=$(dirname "$NEW_COMMON")
+      OLD_TARGET_PHYS=$(physical_path "$OLD_TARGET_ABS")
+      case "$OLD_TARGET_PHYS" in
+        "$REPO_ROOT"|"$REPO_ROOT"/*) SAME_REPO=true ;;
+        *) REASON="is dangling and not clearly part of this repository" ;;
+      esac
     fi
     if [ "$SAME_REPO" = true ]; then
       ln -sfn "$SKILL_SRC" "$SKILL_LINK" \
         && echo "  Relinked skill: $SKILL_LINK (was -> $OLD_TARGET) -> $SKILL_SRC" \
         || echo "  Could not relink skill at $SKILL_LINK: check permissions on $CLAUDE_SKILLS_DIR."
     else
-      echo "  Skipping skill link: $SKILL_LINK already points elsewhere (-> $OLD_TARGET), leaving it alone."
+      echo "  Skipping skill link: $SKILL_LINK $REASON (-> $OLD_TARGET), leaving it alone."
     fi
   elif [ -e "$SKILL_LINK" ]; then
     echo "  Skipping skill link: $SKILL_LINK already exists and was not made by this installer."
@@ -180,7 +221,7 @@ fi
 echo ""
 echo "Done! Next steps:"
 echo ""
-echo "  1. Restart your browser (close all windows and reopen)"
+echo "  1. Quit your browser with Cmd+Q, or reload the extension in chrome://extensions"
 echo "  2. Add the MCP server to Claude Code:"
 echo ""
 echo "     claude mcp add open-claude-in-chrome -- node $HOST_DIR/mcp-server.js"

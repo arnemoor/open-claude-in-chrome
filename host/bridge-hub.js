@@ -94,7 +94,16 @@ export class BridgeHub {
         tmpServer.once("listening", onOk);
         tmpServer.listen(tmpPath);
       });
-      fs.chmodSync(tmpPath, 0o600);
+      try {
+        fs.chmodSync(tmpPath, 0o600);
+      } catch (e) {
+        // Same cleanup as the contended/hard-failure path below: without it,
+        // a persistent chmod failure would leak one listening server and one
+        // .t* file per 30s start-retry (native-host.js) forever.
+        await this._closeServer(tmpServer);
+        try { fs.unlinkSync(tmpPath); } catch { /* ignore */ }
+        throw e;
+      }
 
       if (this._state === "stopped") {
         await this._closeServer(tmpServer);

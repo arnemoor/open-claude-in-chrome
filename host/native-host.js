@@ -8,7 +8,7 @@
 
 import fs from "node:fs";
 import { BridgeHub } from "./bridge-hub.js";
-import { bridgePath, BridgeSecurityError } from "./bridge-endpoint.js";
+import { bridgePath } from "./bridge-endpoint.js";
 import { createLogger } from "./log.js";
 
 function readNativeMessages(buffer) {
@@ -83,8 +83,12 @@ try {
 }
 log("start", { version, node: process.version });
 
-// An unsafe bridge directory must not crash-loop us: the extension would respawn this
-// process every 2 s. Stay alive and retry, so the problem shows up in the log.
+// A start failure of ANY kind — an unsafe bridge directory, a stray EACCES
+// from a linkSync or a probe connect, or anything else — must not crash-loop
+// us: the extension would respawn this process every 2 s. Stay alive and
+// retry, so the problem shows up in the log instead of being rotated away
+// within the hour.
+const START_RETRY_MS = Number(process.env.OCIC_START_RETRY_MS) || 30000;
 let lastStartFailedKey = null;
 async function startHub() {
   try {
@@ -97,8 +101,7 @@ async function startHub() {
       lastStartFailedKey = key;
       log("start_failed", { message: err.message });
     }
-    if (err instanceof BridgeSecurityError) setTimeout(startHub, 30000);
-    else exit(1, `start failed: ${err.message}`);
+    setTimeout(startHub, START_RETRY_MS);
   }
 }
 startHub();

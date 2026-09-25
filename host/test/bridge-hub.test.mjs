@@ -554,3 +554,32 @@ test("a serving hub whose self-check fails logs standby exactly once, including 
     "the self-check's fallback to standby (a real serving-to-standby role switch) must log once, and the retries that follow must not log again",
   );
 });
+
+// --- Round 2 fix: N2 (chmodSync failure on the temp socket must not leak) --
+
+test("a chmodSync failure on the temp socket cleans up that attempt's server and file", { timeout: 10000 }, async (t) => {
+  const home = tmpHome();
+  const dir = bridgeDir(home);
+  const origChmod = fs.chmodSync;
+  fs.chmodSync = (p, mode) => {
+    if (path.basename(p).startsWith(".t")) {
+      throw Object.assign(new Error("EPERM (simulated)"), { code: "EPERM" });
+    }
+    return origChmod(p, mode);
+  };
+  t.after(() => { fs.chmodSync = origChmod; });
+
+  const hub = new BridgeHub({ sockPath: bridgePath(home), sendToExtension: () => {} });
+  t.after(() => hub.stop("cleanup").catch(() => {}));
+  await assert.rejects(hub.start(), (e) => e.code === "EPERM");
+
+  const leftoverTemp = fs.readdirSync(dir).filter((f) => f.startsWith(".t"));
+  assert.deepEqual(leftoverTemp, [], "no leaked .t* temp socket file from the failed attempt");
+
+  // With the failure gone, a fresh start() must still succeed cleanly: this
+  // is only true if the failed attempt's server released the temp name and
+  // didn't leave anything else behind that would collide or hold a handle.
+  fs.chmodSync = origChmod;
+  const state = await hub.start();
+  assert.equal(state, "serving");
+});
