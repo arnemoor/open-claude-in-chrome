@@ -235,7 +235,7 @@ function schemaProblems(served, fixture) {
   return problems;
 }
 
-// Mirror mcp-server.js pre-validation coercion (mcp-server.js:107-128) so the
+// Mirror mcp-server.js pre-validation coercion (coerceArgs in mcp-server.js) so the
 // dispatch expectation matches what the server actually forwards to the native
 // host (e.g. a string tabId is coerced to a number before validation).
 function expectedArgs(input, name) {
