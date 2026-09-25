@@ -11,11 +11,17 @@ function expandHome(entry, home) {
   return entry.startsWith("~/") ? path.join(home, entry.slice(2)) : entry;
 }
 
+const KNOWN_CONFIG_KEYS = new Set(["fileUploadAllowedDirs", "port"]);
+
 // Reads fileUploadAllowedDirs from config.json.
 // - Missing file, or valid JSON without the key: { dirs: null, error: null } (defaults apply).
 // - Unreadable file, invalid JSON, or the key present but not an array:
 //   { dirs: null, error: "<reason>" } (caller fails closed instead of falling back).
-function readConfiguredDirs(home) {
+// Also warns once (via `warn`) if the file has any top-level key other than
+// fileUploadAllowedDirs or the old port — most often a typo like
+// fileUploadAllowedDir, which would otherwise silently widen the allowlist to
+// the defaults instead of the folders the user meant to configure.
+function readConfiguredDirs(home, warn) {
   const configPath = path.join(home, ".config", "open-claude-in-chrome", "config.json");
 
   let raw;
@@ -31,6 +37,13 @@ function readConfiguredDirs(home) {
     config = JSON.parse(raw);
   } catch {
     return { dirs: null, error: "config file is not valid JSON" };
+  }
+
+  if (config && typeof config === "object" && !Array.isArray(config)) {
+    const unknown = Object.keys(config).filter((k) => !KNOWN_CONFIG_KEYS.has(k));
+    if (unknown.length) {
+      warn(`open-claude-in-chrome: ignoring unknown config.json key(s): ${unknown.join(", ")}. Known keys: fileUploadAllowedDirs (and the old port).\n`);
+    }
   }
 
   const value = config?.fileUploadAllowedDirs;
@@ -65,7 +78,7 @@ export function loadUploadPolicy({ home = os.homedir(), warn = (m) => process.st
   // working directory instead of the user's home: fail closed instead.
   if (!path.isAbsolute(home)) return { allowedDirs: [], lexicalDirs: [], configError: null };
 
-  const { dirs: configured, error: configError } = readConfiguredDirs(home);
+  const { dirs: configured, error: configError } = readConfiguredDirs(home, warn);
   if (configError) {
     warn(`open-claude-in-chrome: ${configError} in ~/.config/open-claude-in-chrome/config.json; no upload folder is allowed until it is fixed\n`);
     return { allowedDirs: [], lexicalDirs: [], configError };

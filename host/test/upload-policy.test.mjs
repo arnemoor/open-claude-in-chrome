@@ -176,3 +176,47 @@ test("a config with a non-array fileUploadAllowedDirs fails closed and names the
   assert.match(r.error, /Upload policy config is invalid/);
   assert.match(r.error, /fileUploadAllowedDirs/);
 });
+
+// M5: a typo'd key (missing the trailing "s") must not be silently read as
+// fileUploadAllowedDirs, which would widen the allowlist with no warning.
+test("an unknown top-level config key (e.g. a typo'd fileUploadAllowedDir) warns once and the defaults still apply", () => {
+  const h = home();
+  fs.mkdirSync(path.join(h, "work"));
+  fs.writeFileSync(path.join(h, "work", "w.txt"), "w");
+  fs.writeFileSync(
+    path.join(h, ".config", "open-claude-in-chrome", "config.json"),
+    JSON.stringify({ fileUploadAllowedDir: ["~/work"] })
+  );
+  const warnings = [];
+  const p = loadUploadPolicy({ home: h, warn: (m) => warnings.push(m) });
+  assert.equal(warnings.length, 1, "one warning for the whole load, not one per key");
+  assert.match(warnings[0], /fileUploadAllowedDir\b/);
+
+  // The typo is simply unknown, not read as fileUploadAllowedDirs: it must not
+  // silently widen who can reach ~/work (the regression ledger:150 guards against).
+  assert.equal(checkUploadPaths([path.join(h, "work", "w.txt")], p).ok, false);
+  assert.equal(checkUploadPaths([path.join(h, "Downloads", "ok.txt")], p).ok, true);
+});
+
+// Known keys must never warn, even together, and an unrecognized key still
+// warns even when fileUploadAllowedDirs itself is also present and honored.
+test("known keys (fileUploadAllowedDirs, the old port) never warn; an unknown key alongside a valid one still does", () => {
+  const h = home();
+  fs.writeFileSync(
+    path.join(h, ".config", "open-claude-in-chrome", "config.json"),
+    JSON.stringify({ fileUploadAllowedDirs: ["~/Downloads"], port: 18765 })
+  );
+  const noWarnings = [];
+  loadUploadPolicy({ home: h, warn: (m) => noWarnings.push(m) });
+  assert.equal(noWarnings.length, 0);
+
+  fs.writeFileSync(
+    path.join(h, ".config", "open-claude-in-chrome", "config.json"),
+    JSON.stringify({ fileUploadAllowedDirs: ["~/Downloads"], typoKey: true })
+  );
+  const warnings = [];
+  const p = loadUploadPolicy({ home: h, warn: (m) => warnings.push(m) });
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /typoKey/);
+  assert.equal(checkUploadPaths([path.join(h, "Downloads", "ok.txt")], p).ok, true);
+});
