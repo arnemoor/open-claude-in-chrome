@@ -156,19 +156,88 @@ test("a tab moved into another group is released the same way, and a tab dragged
   assert.equal(bg.get("tabGroupTabs").has(11), true);
 });
 
+const keyEvents = (bg) => bg.calls.filter((c) => c[0] === "cdp" && c[1] === "Input.dispatchKeyEvent").length;
+const attaches = (bg) => bg.calls.filter((c) => c[0] === "debugger.attach").length;
+
+async function untilFirstKeyEvent(bg) {
+  while (keyEvents(bg) === 0) await flush(2);
+}
+
 // The call already passed its group check, so only the release can stop it: its next CDP command
 // would otherwise attach the debugger again and go on typing into the tab the user took back.
 test("a type call in flight when its tab leaves the group sends no further key event", async () => {
   const bg = await loadBackground();
-  const keyEvents = () => bg.calls.filter((c) => c[0] === "cdp" && c[1] === "Input.dispatchKeyEvent").length;
   const typing = bg.handlers.computer({ action: "type", text: "abcdefghijklmnopqrstuvwxyz", tabId: 11 });
-  await flush(80); // a few characters in
+  await untilFirstKeyEvent(bg);
   bg.chrome.tabs.onUpdated.fire(11, { groupId: -1 }, { ...TAB, id: 11, groupId: -1 });
-  const sentAtLeave = keyEvents();
+  const sentAtLeave = keyEvents(bg);
   await assert.rejects(typing, /Tab 11 is not in the MCP group/);
   assert.ok(sentAtLeave > 0 && sentAtLeave < 52, `expected the typing to be under way, sent ${sentAtLeave}`);
-  assert.equal(keyEvents(), sentAtLeave, "no key event after the tab left the group");
+  assert.equal(keyEvents(bg), sentAtLeave, "no key event after the tab left the group");
   assert.equal(bg.get("attachedTabs").has(11), false);
+});
+
+// Another session's tabs_context_mcp can refresh the cache after the tab left but before Chrome's
+// groupId event reaches the extension. The release must not depend on the cache still holding it.
+test("a tab in flight is released on leaving the group even after another call refreshed the cache", async () => {
+  let groupId = 7;
+  const bg = await loadBackground({
+    overrides: {
+      tabs: {
+        get: async (id) => ({ ...TAB, id, groupId }),
+        query: async ({ groupId: queried } = {}) => (queried === groupId ? [{ ...TAB, id: 11, groupId, title: "t" }] : []),
+      },
+    },
+  });
+  const typing = bg.handlers.computer({ action: "type", text: "abcdefghijklmnopqrstuvwxyz", tabId: 11 });
+  await untilFirstKeyEvent(bg);
+  groupId = -1; // the tab leaves the group
+  await bg.handlers.tabs_context_mcp({}); // another call's refresh lands first
+  assert.equal(bg.get("tabGroupTabs").has(11), false, "the refresh dropped tab 11 from the cache");
+  bg.chrome.tabs.onUpdated.fire(11, { groupId: -1 }, { ...TAB, id: 11, groupId: -1 });
+  const sentAtLeave = keyEvents(bg);
+  await assert.rejects(typing, /Tab 11 is not in the MCP group/);
+  assert.equal(keyEvents(bg), sentAtLeave, "no key event after the tab left the group");
+  assert.equal(attaches(bg), 1, "the debugger is not attached again");
+  assert.equal(bg.get("attachedTabs").has(11), false);
+});
+
+// A group check that read groupId 7 just before the leave event, and finishes after it, must not
+// bring the tab back: only Chrome's own report that the tab is back in the group does.
+test("a group check answered before the leave event does not bring the released tab back", async () => {
+  let gated = false;
+  let openGate;
+  const gate = new Promise((resolve) => { openGate = resolve; });
+  const bg = await loadBackground({
+    overrides: { tabs: { get: async (id) => { const tab = { ...TAB, id, groupId: 7 }; if (gated) await gate; return tab; } } },
+  });
+  await flush();
+  gated = true;
+  const call = bg.handlers.computer({ action: "screenshot", tabId: 11 });
+  await flush();
+  bg.chrome.tabs.onUpdated.fire(11, { groupId: -1 }, { ...TAB, id: 11, groupId: -1 });
+  openGate();
+  const r = await call;
+  assert.equal(r.isError, true, JSON.stringify(r));
+  assert.equal(r.content[0].text, "Tab 11 is not in the MCP group.");
+  assert.equal(bg.get("releasedTabs").has(11), true);
+  assert.equal(bg.calls.filter((c) => c[1] === "Page.captureScreenshot").length, 0);
+});
+
+test("a released tab that comes back into the group can be used again", async () => {
+  let groupId = 7;
+  const bg = await loadBackground({ overrides: { tabs: { get: async (id) => ({ ...TAB, id, groupId }) } } });
+  await bg.handlers.computer({ action: "screenshot", tabId: 11 });
+  groupId = -1;
+  bg.chrome.tabs.onUpdated.fire(11, { groupId: -1 }, { ...TAB, id: 11, groupId: -1 });
+  assert.equal(bg.get("releasedTabs").has(11), true);
+  groupId = 7;
+  bg.chrome.tabs.onUpdated.fire(11, { groupId: 7 }, { ...TAB, id: 11, groupId: 7 });
+  assert.equal(bg.get("releasedTabs").has(11), false);
+  const shot = await bg.handlers.computer({ action: "screenshot", tabId: 11 });
+  assert.equal("isError" in shot, false, JSON.stringify(shot));
+  assert.equal(attaches(bg), 2, "attached again after coming back");
+  assert.equal(bg.get("attachedTabs").has(11), true);
 });
 
 test("a tab that leaves the group while its debugger is still attaching is detached once the attach completes", async () => {

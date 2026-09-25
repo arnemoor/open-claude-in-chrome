@@ -143,6 +143,9 @@ async function ensureTabGroup(createIfEmpty) {
   await chrome.tabGroups.update(groupId, { title: "MCP", color: "blue" });
   tabGroupId = groupId;
   tabGroupTabs = new Set([tab.id]);
+  // Chrome can report the tab's new group before tabGroupId holds its id, and that event
+  // released the tab as one that joined some other group.
+  releasedTabs.delete(tab.id);
   await chrome.storage.session.set({ [TAB_GROUP_ID_KEY]: groupId });
 }
 
@@ -194,10 +197,9 @@ async function tabAccessError(tabId, { allowBlockedUrl = false, allowDialog = fa
 
   // Only the tab's live groupId counts, never the tabGroupTabs cache: a tab the user dragged out
   // of the group, or popped into its own window, has groupId -1 at once, before any event has
-  // updated the cache.
-  if (tab.groupId !== tabGroupId) return `Tab ${tabId} is not in the MCP group.`;
-  tabGroupTabs.add(tabId);
-  releasedTabs.delete(tabId);
+  // updated the cache. A released tab stays refused until Chrome reports it back in the group,
+  // also when this read of its groupId was answered just before the leave event arrived.
+  if (tab.groupId !== tabGroupId || releasedTabs.has(tabId)) return `Tab ${tabId} is not in the MCP group.`;
 
   if (!allowBlockedUrl && isBlockedUrl(tab.url, chrome.runtime.id)) {
     return `Tab ${tabId} shows a local file or this extension's own page, which the agent cannot use.`;
@@ -335,7 +337,10 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 
 // A tab that leaves the MCP group (dragged out, popped into its own window, moved to another
 // group, or ungrouped) is released at once, on top of tabAccessError refusing it by its live
-// groupId. A tab dragged into the group is tracked like one created there.
+// groupId. Any other groupId counts, not only tabs in tabGroupTabs: another call's
+// tabs_context_mcp can refresh that cache before this event arrives. tabs.onRemoved keeps
+// releasedTabs bounded by the open tabs. A tab dragged into the group is tracked like one
+// created there.
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (!("groupId" in changeInfo)) return;
   if (tabGroupId !== null && changeInfo.groupId === tabGroupId) {
@@ -343,7 +348,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
     tabGroupTabs.add(tabId);
     return;
   }
-  if (tabGroupTabs.has(tabId)) releasedTabs.add(tabId);
+  releasedTabs.add(tabId);
   forgetTab(tabId);
 });
 
