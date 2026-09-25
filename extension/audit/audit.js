@@ -25,7 +25,7 @@
   // stops a recording. Defaults to "every tab", so callers that don't pass one
   // (existing tests, and any future caller) keep today's behaviour.
   let isTabAllowed = async () => true;
-  const inputFreeErrors = new WeakSet(); // results and errors background.js marked as holding no tool input
+  const auditTexts = new WeakMap(); // result or error background.js marked as holding no tool input -> a text to store instead, or null for its own
   const tabOwners = new Map(); // tabId -> "<runId>.<session.id>", the last session to act on that tab
   const tabOwnerSetAt = new Map(); // tabId -> Date.now() when tabOwners was last set, for the retry below
   const knownTagsByTab = new Map(); // tabId -> Map(rrweb node id -> lowercase tagName, or a text node's marker), for redactEvents
@@ -290,21 +290,31 @@
   // query after a space, a V8 message quotes a string literal), so for a call
   // whose summary hides input (summaryHidesInput) the text is stored only when
   // background.js marked it as holding none: the shared refusals, fixed texts,
-  // and timeout, dialog and transport failures. The reply itself is unchanged.
+  // and timeout, dialog and transport failures. A text that quotes page text
+  // the call can produce (a JavaScript dialog's message) is marked with a fixed
+  // text to store instead, for every tool. The reply itself is unchanged.
   function errorOutcome(tool, args, text, source) {
-    if (summaryHidesInput(tool, args) && !isInputFree(source)) return "error (text withheld)";
+    const stored = auditTextFor(source, text);
+    if (stored !== null) return `error: ${scrubUrls(stored, AUDIT_ERROR_CLIP)}`;
+    if (summaryHidesInput(tool, args)) return "error (text withheld)";
     return `error: ${scrubUrls(text, AUDIT_ERROR_CLIP)}`;
   }
 
   // Marks a tool result or a thrown error whose text holds no tool input, so
-  // errorOutcome may store it. Returns what it was given.
-  function markInputFree(resultOrError) {
-    if (resultOrError && typeof resultOrError === "object") inputFreeErrors.add(resultOrError);
+  // errorOutcome may store it, or store auditText instead when one is given.
+  // An earlier mark is kept, so an error re-thrown through another marking
+  // layer keeps its fixed text. Returns what it was given.
+  function markInputFree(resultOrError, auditText = null) {
+    if (resultOrError && typeof resultOrError === "object" && !auditTexts.has(resultOrError)) auditTexts.set(resultOrError, auditText);
     return resultOrError;
   }
 
-  function isInputFree(resultOrError) {
-    return !!resultOrError && typeof resultOrError === "object" && inputFreeErrors.has(resultOrError);
+  // What errorOutcome may store for a marked result or error: its fixed text,
+  // or ownText. null when it is not marked.
+  function auditTextFor(resultOrError, ownText) {
+    if (!auditTexts.has(resultOrError)) return null;
+    const fixed = auditTexts.get(resultOrError);
+    return fixed === null ? ownText : fixed;
   }
 
   // The owner is set synchronously in wrapHandlers,
@@ -363,5 +373,5 @@
     tabOwnerSetAt.delete(tabId);
   }
 
-  globalThis.Audit = { init, wrapHandlers, onRecorderEvents, settings, dropOwner, markInputFree, isInputFree };
+  globalThis.Audit = { init, wrapHandlers, onRecorderEvents, settings, dropOwner, markInputFree, auditTextFor };
 })();

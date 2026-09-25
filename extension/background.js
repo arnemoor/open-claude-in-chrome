@@ -31,7 +31,9 @@ class DialogOpenedDuringCall extends Error {
   constructor(message) {
     super(`A JavaScript dialog opened during this call ("${message}").`);
     this.dialogMessage = message;
-    Audit.markInputFree(this);
+    // The message is page text that the call's own input can produce (a page that alerts the
+    // typed code), so audit stores this fixed text instead of it.
+    Audit.markInputFree(this, "A JavaScript dialog opened during this call.");
   }
 }
 
@@ -179,7 +181,7 @@ function formatTabContext(tabs) {
 // Single check used by every tool handler that takes a tabId: not in the MCP group, showing a
 // local file or this extension's own page (also reached via back/forward, or a tab dragged into
 // the group by hand — see isBlockedUrl below), or blocked behind an open JS dialog. Returns null
-// when tabId is fine to use, or the exact refusal text to show the agent otherwise.
+// when tabId is fine to use, or the refusal reply to send otherwise (see inputFreeError).
 //   allowBlockedUrl: skip the file:/own-origin check (tabs_close_mcp only — closing such a tab
 //     doesn't read or act on it, so it's harmless, and it's the agent's only way to clean one up).
 //   allowDialog: skip the open-dialog check, for tools that don't need the page to be responsive
@@ -192,21 +194,26 @@ async function tabAccessError(tabId, { allowBlockedUrl = false, allowDialog = fa
   try {
     tab = await chrome.tabs.get(tabId);
   } catch {
-    return `Tab ${tabId} is not in the MCP group.`;
+    return inputFreeError(`Tab ${tabId} is not in the MCP group.`);
   }
 
   // Only the tab's live groupId counts, never the tabGroupTabs cache: a tab the user dragged out
   // of the group, or popped into its own window, has groupId -1 at once, before any event has
   // updated the cache. A released tab stays refused until Chrome reports it back in the group,
   // also when this read of its groupId was answered just before the leave event arrived.
-  if (tab.groupId !== tabGroupId || releasedTabs.has(tabId)) return `Tab ${tabId} is not in the MCP group.`;
+  if (tab.groupId !== tabGroupId || releasedTabs.has(tabId)) return inputFreeError(`Tab ${tabId} is not in the MCP group.`);
 
   if (!allowBlockedUrl && isBlockedUrl(tab.url, chrome.runtime.id)) {
-    return `Tab ${tabId} shows a local file or this extension's own page, which the agent cannot use.`;
+    return inputFreeError(`Tab ${tabId} shows a local file or this extension's own page, which the agent cannot use.`);
   }
 
   if (!allowDialog && openDialogs.has(tabId)) {
-    return `A JavaScript dialog is open on this tab ("${openDialogs.get(tabId)}"). It blocks the page until the user closes it.`;
+    // Audit stores the refusal without the dialog's message, for the same reason as
+    // DialogOpenedDuringCall.
+    return inputFreeError(
+      `A JavaScript dialog is open on this tab ("${openDialogs.get(tabId)}"). It blocks the page until the user closes it.`,
+      "A JavaScript dialog is open on this tab. It blocks the page until the user closes it.",
+    );
   }
 
   return null;
@@ -868,8 +875,18 @@ function errorResult(text) {
 // with at most arguments the audit summary shows. Only a call whose summary hides input
 // (summaryHidesInput in audit/redact.js) looks at the mark: audit stores its error text only
 // when it is marked, and "error (text withheld)" otherwise. The reply is the same either way.
-function inputFreeError(text) {
-  return Audit.markInputFree(errorResult(text));
+// An auditText is stored instead of text for every tool: text quotes page text that the call's
+// own input can produce (a JavaScript dialog's message).
+function inputFreeError(text, auditText) {
+  return Audit.markInputFree(errorResult(text), auditText);
+}
+
+// Marks result, whose text quotes err's message as quote(err.message), the way err is marked:
+// with quote() of the fixed text audit stores instead of the message, as input-free, or not at
+// all.
+function markQuotedError(result, err, quote) {
+  const auditText = Audit.auditTextFor(err, err.message);
+  return auditText === null ? result : Audit.markInputFree(result, quote(auditText));
 }
 
 const toolHandlers = {
@@ -917,7 +934,7 @@ const toolHandlers = {
   async tabs_close_mcp(args) {
     const { tabId } = args;
     const tabError = await tabAccessError(tabId, { allowBlockedUrl: true, allowDialog: true });
-    if (tabError) return inputFreeError(tabError);
+    if (tabError) return tabError;
     // chrome.tabs.onRemoved cleans up our per-tab state (attached debugger,
     // console/network buffers). Chrome auto-removes the tab group when its last
     // tab is closed, so no extra group teardown is needed here.
@@ -928,7 +945,7 @@ const toolHandlers = {
   async navigate(args) {
     const { url, tabId } = args;
     const tabError = await tabAccessError(tabId, { allowDialog: true });
-    if (tabError) return inputFreeError(tabError);
+    if (tabError) return tabError;
 
     // Attach before navigating, not after: otherwise a page that opens a dialog on load is
     // never seen, and every CDP call then hangs for the full 30s until the user closes it.
@@ -1000,7 +1017,7 @@ const toolHandlers = {
   async computer(args) {
     const { action, tabId } = args;
     const tabError = await tabAccessError(tabId);
-    if (tabError) return inputFreeError(tabError);
+    if (tabError) return tabError;
 
     let coordinate = args.coordinate;
     // Click actions and hover accept either a ref or a coordinate: a ref is resolved (and
@@ -1249,7 +1266,7 @@ const toolHandlers = {
   async read_page(args) {
     const { tabId } = args;
     const tabError = await tabAccessError(tabId);
-    if (tabError) return inputFreeError(tabError);
+    if (tabError) return tabError;
 
     const resp = await sendContentMessage(tabId, {
       type: "generateAccessibilityTree",
@@ -1276,7 +1293,7 @@ const toolHandlers = {
   async get_page_text(args) {
     const { tabId } = args;
     const tabError = await tabAccessError(tabId);
-    if (tabError) return inputFreeError(tabError);
+    if (tabError) return tabError;
 
     const resp = await sendContentMessage(tabId, { type: "getPageText" });
     if (resp?.result?.error) return errorResult(resp.result.error);
@@ -1300,7 +1317,7 @@ const toolHandlers = {
   async find(args) {
     const { query, tabId } = args;
     const tabError = await tabAccessError(tabId);
-    if (tabError) return inputFreeError(tabError);
+    if (tabError) return tabError;
 
     const resp = await sendContentMessage(tabId, { type: "findElements", query });
     if (resp?.result?.error) return errorResult(resp.result.error);
@@ -1323,7 +1340,7 @@ const toolHandlers = {
   async form_input(args) {
     const { ref, value, tabId } = args;
     const tabError = await tabAccessError(tabId);
-    if (tabError) return inputFreeError(tabError);
+    if (tabError) return tabError;
 
     const resp = await sendContentMessage(tabId, { type: "setFormValue", ref, value });
     const result = resp?.result;
@@ -1335,7 +1352,7 @@ const toolHandlers = {
   async javascript_tool(args) {
     const { text, tabId } = args;
     const tabError = await tabAccessError(tabId);
-    if (tabError) return inputFreeError(tabError);
+    if (tabError) return tabError;
 
     await ensureAttached(tabId);
     try {
@@ -1358,14 +1375,14 @@ const toolHandlers = {
         content: [{ type: "text", text: val.value !== undefined ? JSON.stringify(val.value) : val.description || String(val) }],
       };
     } catch (e) {
-      return Audit.isInputFree(e) ? inputFreeError(`Error: ${e.message}`) : errorResult(`Error: ${e.message}`);
+      return markQuotedError(errorResult(`Error: ${e.message}`), e, (message) => `Error: ${message}`);
     }
   },
 
   async read_console_messages(args) {
     const { tabId, pattern, limit = 100, onlyErrors, clear } = args;
     const tabError = await tabAccessError(tabId);
-    if (tabError) return inputFreeError(tabError);
+    if (tabError) return tabError;
 
     // Ensure console domain is enabled
     await ensureAttached(tabId);
@@ -1408,7 +1425,7 @@ const toolHandlers = {
   async read_network_requests(args) {
     const { tabId, urlPattern, limit = 100, clear } = args;
     const tabError = await tabAccessError(tabId);
-    if (tabError) return inputFreeError(tabError);
+    if (tabError) return tabError;
 
     // Ensure network domain is enabled
     await ensureAttached(tabId);
@@ -1440,7 +1457,7 @@ const toolHandlers = {
   async resize_window(args) {
     const { width, height, tabId } = args;
     const tabError = await tabAccessError(tabId, { allowDialog: true });
-    if (tabError) return inputFreeError(tabError);
+    if (tabError) return tabError;
 
     const tab = await chrome.tabs.get(tabId);
     const windowId = tab.windowId;
@@ -1498,11 +1515,10 @@ const toolHandlers = {
 
     const content = [];
     // Audit stores the batch's last line. It names the action and quotes no input, except a
-    // thrown action's message, which counts only when that error was marked input-free itself.
-    const fail = (text, inputFree = true) => {
+    // thrown action's message, which audit treats the way that error is marked.
+    const fail = (text) => {
       content.push({ type: "text", text });
-      const result = { content, isError: true };
-      return inputFree ? Audit.markInputFree(result) : result;
+      return Audit.markInputFree({ content, isError: true });
     };
     for (let i = 0; i < actions.length; i++) {
       const name = actions[i]?.name;
@@ -1517,7 +1533,9 @@ const toolHandlers = {
       try {
         result = await handler(input, ctx);
       } catch (err) {
-        return fail(`Action ${i + 1} (${name}) failed: ${err.message}`, Audit.isInputFree(err));
+        const line = (message) => `Action ${i + 1} (${name}) failed: ${message}`;
+        content.push({ type: "text", text: line(err.message) });
+        return markQuotedError({ content, isError: true }, err, line);
       }
       if (result?.content) content.push(...result.content);
       if (result?.isError) return fail(`Action ${i + 1} (${name}) failed, so the batch stopped.`);
@@ -1529,7 +1547,7 @@ const toolHandlers = {
   async upload_image(args) {
     const { imageId, ref, coordinate, filename, tabId } = args;
     const tabError = await tabAccessError(tabId);
-    if (tabError) return inputFreeError(tabError);
+    if (tabError) return tabError;
 
     // Only screenshots captured by the computer tool this session are stored.
     // "user-uploaded" images have no equivalent here (no Claude.ai file channel).
@@ -1563,7 +1581,7 @@ const toolHandlers = {
   async file_upload(args) {
     const { paths, ref, tabId } = args;
     const tabError = await tabAccessError(tabId);
-    if (tabError) return inputFreeError(tabError);
+    if (tabError) return tabError;
     if (!ref) return errorResult("file_upload requires a 'ref' to a file input.");
     if (!Array.isArray(paths) || paths.length === 0) {
       return errorResult("file_upload requires 'paths' to be a non-empty array of absolute file paths.");

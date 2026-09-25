@@ -1197,3 +1197,75 @@ test("real Chrome: a card number given to form_input on a select with no such op
   assert.equal(fakeStore.actions[0].outcome, "error (text withheld)");
   assert.doesNotMatch(JSON.stringify(fakeStore.calls), /4111|cvc 123/);
 });
+
+// --- A JavaScript dialog's message is page text that the call's own input can
+// produce (a page that alerts the typed code). Audit stores fixed texts that say
+// a dialog was involved, never the message. The replies keep it. ---
+
+async function auditedPage(html) {
+  const page = await openPage(browser, { html });
+  const cs = await injectContentScript(page, CONTENT);
+  const fakeStore = makeFakeStore();
+  const bg = await loadBackground({ page, content: cs, beforeRun: injectFakeStore(fakeStore) });
+  await flush();
+  await bg.chrome.storage.local.set({ audit: { enabled: true, retentionDays: 7 } });
+  return { page, bg, fakeStore };
+}
+
+async function nthReply(bg, n) {
+  while (bg.posted.length < n) await flush(10);
+  await flush(50); // let the audit record land
+  return bg.posted[n - 1];
+}
+
+const OPENED_DURING_CALL = "A JavaScript dialog opened during this call.";
+const OPEN_ON_TAB = "A JavaScript dialog is open on this tab. It blocks the page until the user closes it.";
+
+test("real Chrome: a dialog a javascript_tool call opens is stored without its message", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  const { page, bg, fakeStore } = await auditedPage("<p>x</p>");
+  bg.deliver({ type: "tool_request", id: "1.s1.1", tool: "javascript_tool", args: { text: "alert('SECRETDIALOG4111')", tabId: bg.tabId }, session: SESSION });
+  const reply = await nthReply(bg, 1);
+  assert.match(reply.result.content[0].text, /SECRETDIALOG4111/, "the reply keeps the dialog's message");
+  assert.equal(fakeStore.actions[0].outcome, `error: Error: ${OPENED_DURING_CALL}`);
+  assert.doesNotMatch(JSON.stringify(fakeStore.calls), /SECRETDIALOG4111/);
+  await page.send("Page.handleJavaScriptDialog", { accept: true });
+});
+
+test("real Chrome: a typed code a page alerts is stored neither for the call nor for the calls the open dialog refuses", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  const { page, bg, fakeStore } = await auditedPage(`<input id="code" oninput="if (this.value.length === 6) alert('Checking code ' + this.value)">`);
+  await page.evaluate("document.getElementById('code').focus()");
+  bg.deliver({ type: "tool_request", id: "1.s1.1", tool: "computer", args: { action: "type", text: "493817", tabId: bg.tabId }, session: SESSION });
+  const typed = await nthReply(bg, 1);
+  assert.equal(typed.type, "tool_error");
+  assert.match(typed.error, /Checking code 493817/, "the error to the agent keeps the dialog's message");
+  assert.equal(fakeStore.actions[0].summary, "type [6 chars]");
+  assert.equal(fakeStore.actions[0].outcome, `error: ${OPENED_DURING_CALL}`);
+
+  // The dialog stays open: later calls are refused, and the refusal quotes the message.
+  bg.deliver({ type: "tool_request", id: "1.s1.2", tool: "computer", args: { action: "key", text: "Enter", tabId: bg.tabId }, session: SESSION });
+  bg.deliver({ type: "tool_request", id: "1.s1.3", tool: "form_input", args: { ref: "ref_1", value: "x", tabId: bg.tabId }, session: SESSION });
+  bg.deliver({ type: "tool_request", id: "1.s1.4", tool: "get_page_text", args: { tabId: bg.tabId }, session: SESSION });
+  await nthReply(bg, 4);
+  for (const r of bg.posted.slice(1)) assert.match(r.result.content[0].text, /^A JavaScript dialog is open on this tab \("Checking code 493817"\)/);
+  assert.deepEqual(fakeStore.actions.slice(1).map((a) => [a.tool, a.outcome]), [
+    ["computer", `error: ${OPEN_ON_TAB}`],
+    ["form_input", `error: ${OPEN_ON_TAB}`],
+    ["get_page_text", `error: ${OPEN_ON_TAB}`],
+  ]);
+  assert.doesNotMatch(JSON.stringify(fakeStore.calls), /493817/);
+  await page.send("Page.handleJavaScriptDialog", { accept: true });
+});
+
+test("real Chrome: the same typed code inside browser_batch is in neither the action's row nor the batch's", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  const { page, bg, fakeStore } = await auditedPage(`<input id="code" oninput="if (this.value.length === 6) alert('Checking code ' + this.value)">`);
+  await page.evaluate("document.getElementById('code').focus()");
+  bg.deliver({ type: "tool_request", id: "1.s1.1", tool: "browser_batch", args: { actions: [{ name: "computer", input: { action: "type", text: "493817", tabId: bg.tabId } }] }, session: SESSION });
+  const reply = await nthReply(bg, 1);
+  assert.match(reply.result.content.at(-1).text, /^Action 1 \(computer\) failed: .*Checking code 493817/, "the batch's reply keeps the message");
+  assert.deepEqual(fakeStore.actions.map((a) => [a.tool, a.outcome]), [
+    ["computer", `error: ${OPENED_DURING_CALL}`],
+    ["browser_batch", `error: Action 1 (computer) failed: ${OPENED_DURING_CALL}`],
+  ]);
+  assert.doesNotMatch(JSON.stringify(fakeStore.calls), /493817/);
+  await page.send("Page.handleJavaScriptDialog", { accept: true });
+});
