@@ -91,22 +91,30 @@ test("real Chrome: form_input sets a contenteditable element and one inside an e
   assert.equal(await page.evaluate("document.getElementById('h').textContent"), "New");
 });
 
+// The page logs every input and change event, so a test can check which ones a call fired.
+const EVENT_LOG = `<script>window.formEvents = []; for (const type of ["input", "change"]) document.addEventListener(type, (e) => window.formEvents.push(e.target.id + ":" + type), true);</script>`;
+const takeEvents = (page) => page.evaluate("window.formEvents.splice(0)");
+
 // A change that did not take is an error too: a checkbox or radio that does not end at the requested
 // state, or a value the field's sanitization turned into nothing. A value the field only normalizes
 // (color case, range clamping) is kept, so that stays a success with the actual value.
 test("real Chrome: form_input reports a checkbox or radio that did not end at the requested state", { skip: !chromeAvailable, timeout: 20000 }, async () => {
-  const { page, cs } = await setup(`<input type="radio" name="r" aria-label="First" id="r1" checked><input type="radio" name="r" aria-label="Second" id="r2">
+  const { page, cs } = await setup(`${EVENT_LOG}<input type="radio" name="r" aria-label="First" id="r1" checked><input type="radio" name="r" aria-label="Second" id="r2">
     <input type="checkbox" aria-label="Blocked" id="blocked" onclick="return false"><input type="checkbox" aria-label="Plain" id="plain">`);
   const set = async (label, role, value) => (await cs.invoke({ type: "setFormValue", ref: await refOf(cs, new RegExp(`${role} "${label}" \\[(ref_\\d+)\\]`)), value })).result;
   const checked = (id) => page.evaluate(`document.getElementById(${JSON.stringify(id)}).checked`);
 
   assert.match((await set("First", "radio", false)).error || "", /radio button/);
   assert.equal(await checked("r1"), true);
+  assert.deepEqual(await takeEvents(page), [], "no input or change event for a radio that did not change");
   assert.match((await set("Blocked", "checkbox", true)).error || "", /still unchecked/);
   assert.equal(await checked("blocked"), false);
+  assert.deepEqual(await takeEvents(page), [], "no input or change event for a blocked checkbox");
 
   assert.deepEqual({ ...(await set("Plain", "checkbox", true)) }, { success: true, checked: true });
+  assert.deepEqual(await takeEvents(page), ["plain:input", "plain:change"]);
   assert.deepEqual({ ...(await set("Second", "radio", "true")) }, { success: true, checked: true });
+  assert.deepEqual(await takeEvents(page), ["r2:input", "r2:change"]);
   assert.equal(await checked("r1"), false);
 
   const bg = await loadBackground({ page, content: cs });
@@ -116,7 +124,7 @@ test("real Chrome: form_input reports a checkbox or radio that did not end at th
 });
 
 test("real Chrome: form_input reports a value the field rejected and keeps the old one, but keeps a normalized value", { skip: !chromeAvailable, timeout: 20000 }, async () => {
-  const { page, cs } = await setup(`<input type="date" aria-label="Day" id="day" value="2024-01-02"><input type="number" aria-label="Count" id="count" value="5">
+  const { page, cs } = await setup(`${EVENT_LOG}<input type="date" aria-label="Day" id="day" value="2024-01-02"><input type="number" aria-label="Count" id="count" value="5">
     <input type="color" aria-label="Color" id="color"><input type="range" aria-label="Level" id="level" min="0" max="100">`);
   const set = async (label, role, value) => (await cs.invoke({ type: "setFormValue", ref: await refOf(cs, new RegExp(`${role} "${label}" \\[(ref_\\d+)\\]`)), value })).result;
   const valueOf = (id) => page.evaluate(`document.getElementById(${JSON.stringify(id)}).value`);
@@ -125,11 +133,16 @@ test("real Chrome: form_input reports a value the field rejected and keeps the o
   assert.equal(await valueOf("day"), "2024-01-02");
   assert.match((await set("Count", "spinbutton", "abc")).error || "", /did not accept the value/);
   assert.equal(await valueOf("count"), "5");
+  assert.deepEqual(await takeEvents(page), [], "no input or change event for a rejected value");
 
   assert.deepEqual({ ...(await set("Day", "textbox", "2024-05-06")) }, { success: true, value: "2024-05-06" });
+  assert.deepEqual(await takeEvents(page), ["day:input", "day:change"]);
   assert.deepEqual({ ...(await set("Color", "textbox", "#FF0000")) }, { success: true, value: "#ff0000" });
+  assert.deepEqual(await takeEvents(page), ["color:input", "color:change"]);
   assert.deepEqual({ ...(await set("Level", "slider", "150")) }, { success: true, value: "100" });
+  assert.deepEqual(await takeEvents(page), ["level:input", "level:change"]);
   assert.deepEqual({ ...(await set("Count", "spinbutton", "")) }, { success: true, value: "" });
+  assert.deepEqual(await takeEvents(page), ["count:input", "count:change"]);
 
   const bg = await loadBackground({ page, content: cs });
   const r = await bg.handlers.form_input({ ref: await refOf(cs, /textbox "Day" \[(ref_\d+)\]/), value: "not-a-date", tabId: bg.tabId });
