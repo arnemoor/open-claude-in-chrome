@@ -95,6 +95,19 @@ test("a stored group id that still exists is adopted after a worker restart", as
   assert.ok(!w.log.some(([op]) => op === "windows.create" || op === "tabs.group"), "no new group was created");
 });
 
+test("removing the MCP group forgets its stored id, and the next call creates a new group", async () => {
+  const w = await restartedWorker({ stored: { mcpTabGroupId: 7 }, groups: [{ id: 7, title: "MCP", tabIds: [11] }] });
+  w.bg.chrome.tabGroups.onRemoved.fire({ id: 99 }); // someone else's group: nothing changes
+  assert.equal(w.session.mcpTabGroupId, 7);
+  w.tabs[11].groupId = -1; // the user ungrouped the MCP group
+  w.bg.chrome.tabs.onUpdated.fire(11, { groupId: -1 }, w.tabs[11]);
+  w.bg.chrome.tabGroups.onRemoved.fire({ id: 7 });
+  assert.equal("mcpTabGroupId" in w.session, false);
+  assert.equal((await w.bg.handlers.get_page_text({ tabId: 11 })).content[0].text, "Tab 11 is not in the MCP group.");
+  assert.equal(listedTabs(await w.bg.handlers.tabs_context_mcp({ createIfEmpty: true })).tabGroupId, 8);
+  assert.equal(w.session.mcpTabGroupId, 8);
+});
+
 // --- Access follows the tab's live group membership ---
 
 test("a cached tab that is no longer in the MCP group is refused", async () => {

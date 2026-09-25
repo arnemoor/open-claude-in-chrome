@@ -399,7 +399,7 @@ test("I5: a tab inside the MCP group still gets a recorder", async () => {
 });
 
 // A tab's recorder keeps running (and keeps sending batches) after the tab
-// leaves the MCP group — nothing tells the content script to stop. Those
+// leaves the MCP group. Nothing tells the content script to stop. Those
 // batches must stop being stored the moment isTabAllowed(tabId) goes false,
 // and the stale owner must be cleared, not just gated: if the tab later
 // rejoins the group with no new audited call re-establishing ownership, a

@@ -80,7 +80,7 @@ export async function loadBackground({ page = null, content = null, tab = {}, wi
         throw new Error("The message port closed before a response was received.");
       },
     },
-    tabGroups: { get: async (id) => ({ id, title: "MCP" }), query: async () => [{ id: GROUP_ID, title: "MCP" }], update: async () => {} },
+    tabGroups: { get: async (id) => ({ id, title: "MCP" }), query: async () => [{ id: GROUP_ID, title: "MCP" }], update: async () => {}, onRemoved: event() },
     windows: {
       get: async (id) => ({ id, width: 1200, height: 800, state: "normal", ...window }),
       create: async (p) => { calls.push(["windows.create", p]); return { id: WINDOW_ID, tabs: [{ id: TAB_ID }] }; },

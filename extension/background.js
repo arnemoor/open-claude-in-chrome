@@ -343,6 +343,15 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   forgetTab(tabId);
 });
 
+// The MCP group is gone: its last tab closed or left it, or the user ungrouped it. Its tabs are
+// released by their own events above. Forgetting its id, the stored one too, makes the next
+// tabs_context_mcp or tabs_create_mcp create a new group.
+chrome.tabGroups.onRemoved.addListener((group) => {
+  if (group.id !== tabGroupId) return;
+  tabGroupId = null;
+  chrome.storage.session.remove(TAB_GROUP_ID_KEY).catch(() => {});
+});
+
 // Handle user dismissing debugger bar
 chrome.debugger.onDetach.addListener((source, reason) => {
   attachedTabs.delete(source.tabId);
