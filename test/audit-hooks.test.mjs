@@ -2,13 +2,15 @@
 // nativePort -> handleToolRequest -> ctx plumbing, and the audit-prune alarm. The
 // real extension/audit/store.js is never loaded here (vm contexts have no
 // indexedDB) — beforeRun swaps in an in-memory fake before background.js runs.
-import { test } from "node:test";
+import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
 import { loadBackground } from "./harness/fake-chrome.mjs";
+import { chromeAvailable, launchChrome, openPage, injectContentScript } from "./harness/browser.mjs";
 
+const CONTENT = path.join(import.meta.dirname, "..", "extension", "content.js");
 const FIXTURE = path.join(import.meta.dirname, "..", "host", "test", "claude-in-chrome-tools.schema.json");
 const PREFIX = "mcp__claude-in-chrome__";
 
@@ -807,22 +809,22 @@ test("a refused call is recorded with outcome error: and its text", async () => 
   assert.equal(bg.posted[0].result.isError, true);
 });
 
+// read_page's summary hides none of its input, so its error text is stored as
+// it is, scrubbed of URL queries.
 test("an error result's outcome is scrubbed of a URL's query and fragment", async () => {
   const fakeStore = makeFakeStore();
-  const bg = await loadBackground({
-    beforeRun: injectFakeStore(fakeStore),
-    overrides: { tabs: { update: async () => { throw new Error("boom"); } } },
-  });
+  const content = { invoke: async () => ({ result: { error: "Could not read https://x.test/reset?token=SECRET#frag" } }) };
+  const bg = await loadBackground({ content, beforeRun: injectFakeStore(fakeStore) });
   await flush();
   await bg.chrome.storage.local.set({ audit: { enabled: true, retentionDays: 7 } });
 
-  bg.deliver({ type: "tool_request", id: "1.s1.1", tool: "navigate", args: { url: "https://x.test/reset?token=SECRET#frag", tabId: bg.tabId }, session: SESSION });
+  bg.deliver({ type: "tool_request", id: "1.s1.1", tool: "read_page", args: { tabId: bg.tabId }, session: SESSION });
   await flush(100);
 
   assert.equal(fakeStore.actions.length, 1);
   const { outcome } = fakeStore.actions[0];
   assert.doesNotMatch(outcome, /SECRET|frag/);
-  assert.match(outcome, /^error: Could not navigate to https:\/\/x\.test\/reset\?…#…/);
+  assert.equal(outcome, "error: Could not read https://x.test/reset?…#…");
 });
 
 test("a batch that stops on an error result is recorded as an error, and so is the failed action, and the rest is not run", async () => {
@@ -845,9 +847,125 @@ test("a batch that stops on an error result is recorded as an error, and so is t
 
   assert.deepEqual(fakeStore.actions.map((a) => [a.tool, a.outcome]), [
     ["computer", "ok"],
-    ["form_input", "error: Error: Element ref_99 not found or was garbage collected."],
+    ["form_input", "error (text withheld)"],
     ["browser_batch", "error: Action 2 (form_input) failed, so the batch stopped."],
   ]);
+});
+
+// --- An error text can quote input that the call's summary masks. For such a
+// call audit stores the text only when it is known to hold no input (a shared
+// refusal or a fixed text), and "error (text withheld)" otherwise. The reply to
+// the agent keeps the full text. ---
+
+const WITHHELD = "error (text withheld)";
+
+async function auditedCall(tool, args, { content = null, overrides = {}, wait = 100 } = {}) {
+  const fakeStore = makeFakeStore();
+  const bg = await loadBackground({ content, overrides, beforeRun: injectFakeStore(fakeStore) });
+  await flush();
+  await bg.chrome.storage.local.set({ audit: { enabled: true, retentionDays: 7 } });
+  bg.deliver({ type: "tool_request", id: "1.s1.1", tool, args, session: SESSION });
+  await flush(wait);
+  return { bg, fakeStore, stored: JSON.stringify(fakeStore.calls), reply: bg.posted[0] };
+}
+
+test("a form_input value quoted by a select miss is in no stored field, only in the reply", async () => {
+  const value = "4111 1111 1111 1111 exp 12/29 cvc 123";
+  const content = { invoke: async (msg) => (msg.type === "setFormValue" ? { result: { error: `No option with the value or text "${msg.value}" in this select.` } } : { result: [] }) };
+  const { fakeStore, stored, reply } = await auditedCall("form_input", { ref: "ref_3", value, tabId: 11 }, { content });
+  assert.equal(fakeStore.actions[0].outcome, WITHHELD);
+  assert.equal(fakeStore.actions[0].summary, "ref_3 value [37 chars]");
+  assert.doesNotMatch(stored, /4111|cvc 123/);
+  assert.match(reply.result.content[0].text, /4111 1111 1111 1111/, "the reply to the agent is unchanged");
+});
+
+test("an unparseable navigate URL's query is in no stored field", async () => {
+  const unparseable = await auditedCall("navigate", { url: "https://exa mple.test/reset?token=SECRETNAV", tabId: 11 });
+  assert.equal(unparseable.fakeStore.actions[0].outcome, WITHHELD);
+  assert.doesNotMatch(unparseable.stored, /SECRETNAV/);
+  assert.match(unparseable.reply.result.content[0].text, /^Invalid URL: .*SECRETNAV/);
+
+  // A space in the path parses, but the text of a failed tabs.update quotes the raw URL, and the
+  // free-text URL scrubber stops at the space.
+  const failed = await auditedCall("navigate", { url: "https://exa/ mple.test/reset?token=SECRETNAV", tabId: 11 }, {
+    overrides: { tabs: { update: async () => { throw new Error("boom"); } } },
+  });
+  assert.equal(failed.fakeStore.actions[0].outcome, WITHHELD);
+  assert.doesNotMatch(failed.stored, /SECRETNAV/);
+  assert.match(failed.reply.result.content[0].text, /^Could not navigate to .*SECRETNAV/);
+});
+
+test("a key the parser rejects is in no stored field", async () => {
+  const { fakeStore, stored, reply } = await auditedCall("computer", { action: "key", text: "a ü ñ é", tabId: 11 });
+  assert.equal(fakeStore.actions[0].outcome, WITHHELD);
+  assert.equal(fakeStore.actions[0].summary, "key [4 keys]");
+  assert.doesNotMatch(stored, /[üñé]/);
+  assert.equal(reply.result.content[0].text, "Unknown key: ü");
+});
+
+test("a javascript_tool exception that quotes a string literal is in no stored field", async () => {
+  const sendCommand = async (t, m, p) => (m === "Runtime.evaluate"
+    ? { exceptionDetails: { text: `Uncaught SyntaxError: Unexpected token 'S', "SECRETJS4111" is not valid JSON` } }
+    : {});
+  const { fakeStore, stored, reply } = await auditedCall("javascript_tool", { text: "JSON.parse('SECRETJS4111')", tabId: 11 }, { overrides: { debugger: { sendCommand } } });
+  assert.equal(fakeStore.actions[0].outcome, WITHHELD);
+  assert.equal(fakeStore.actions[0].summary, "JSON.parse('[12 chars]')");
+  assert.doesNotMatch(stored, /SECRETJS4111/);
+  assert.match(reply.result.content[0].text, /SECRETJS4111/);
+});
+
+test("a type call refused mid-way stores the shared refusal, and none of the typed text", async () => {
+  const fakeStore = makeFakeStore();
+  const bg = await loadBackground({ beforeRun: injectFakeStore(fakeStore) });
+  await flush();
+  await bg.chrome.storage.local.set({ audit: { enabled: true, retentionDays: 7 } });
+  bg.deliver({ type: "tool_request", id: "1.s1.1", tool: "computer", args: { action: "type", text: "SECRETTYPEDPASSWORD", tabId: 11 }, session: SESSION });
+  while (!bg.calls.some((c) => c[0] === "cdp" && c[1] === "Input.dispatchKeyEvent")) await flush(5);
+  bg.chrome.tabs.onUpdated.fire(11, { groupId: -1 }, { id: 11, groupId: -1 }); // the tab leaves the group mid-way
+  while (bg.posted.length === 0) await flush(5);
+  await flush();
+
+  assert.equal(bg.posted[0].type, "tool_error");
+  assert.equal(fakeStore.actions[0].summary, "type [19 chars]");
+  assert.equal(fakeStore.actions[0].outcome, "error: Tab 11 is not in the MCP group.");
+  assert.doesNotMatch(JSON.stringify(fakeStore.calls), /SECRETTYPED|PASSWORD/);
+});
+
+test("a thrown error of a call that hides input is withheld unless it is known to hold none", async () => {
+  const sendCommand = async (t, m) => {
+    if (m === "Input.dispatchKeyEvent") throw new Error("Input.dispatchKeyEvent failed for SECRETCDP");
+    return {};
+  };
+  const { fakeStore, stored, reply } = await auditedCall("computer", { action: "type", text: "SECRETCDP", tabId: 11 }, { overrides: { debugger: { sendCommand } } });
+  assert.equal(reply.type, "tool_error");
+  assert.match(reply.error, /SECRETCDP/, "the error to the agent is unchanged");
+  assert.equal(fakeStore.actions[0].outcome, WITHHELD);
+  assert.doesNotMatch(stored, /SECRETCDP/);
+});
+
+test("a batch stores its own failure line, and a failed action's quoted input in no field", async () => {
+  const keys = await auditedCall("browser_batch", { actions: [{ name: "computer", input: { action: "key", text: "a é", tabId: 11 } }] });
+  assert.deepEqual(keys.fakeStore.actions.map((a) => [a.tool, a.outcome]), [
+    ["computer", WITHHELD],
+    ["browser_batch", "error: Action 1 (computer) failed, so the batch stopped."],
+  ]);
+  assert.doesNotMatch(keys.stored, /é/);
+
+  // A thrown action's message ends the batch's own reply, so the batch withholds it too.
+  const sendCommand = async (t, m) => {
+    if (m === "Input.dispatchKeyEvent") throw new Error("Input.dispatchKeyEvent failed for SECRETCDP");
+    return {};
+  };
+  const thrown = await auditedCall("browser_batch", { actions: [{ name: "computer", input: { action: "type", text: "SECRETCDP", tabId: 11 } }] }, { overrides: { debugger: { sendCommand } } });
+  assert.deepEqual(thrown.fakeStore.actions.map((a) => [a.tool, a.outcome]), [["computer", WITHHELD], ["browser_batch", WITHHELD]]);
+  assert.doesNotMatch(thrown.stored, /SECRETCDP/);
+});
+
+test("a shared refusal keeps its informative text for a call that hides input", async () => {
+  const { fakeStore } = await auditedCall("form_input", { ref: "ref_3", value: "hunter2", tabId: 99 }, {
+    overrides: { tabs: { get: async (id) => ({ id, windowId: 1, status: "complete", url: "https://example.test/", groupId: 8 }) } },
+  });
+  assert.equal(fakeStore.actions[0].outcome, "error: Tab 99 is not in the MCP group.");
 });
 
 // M8: audit.js must not leak its internal helpers into the shared worker scope.
@@ -1023,4 +1141,34 @@ test("chrome.tabs.onRemoved clears the tab's known-tags map too, not just its ow
   const addEventsCalls = fakeStore.calls.filter((c) => c[0] === "addEvents");
   const lastStored = JSON.stringify(addEventsCalls[addEventsCalls.length - 1][3]);
   assert.doesNotMatch(lastStored, /FRESHDOC9SECRET/, "id 9's stale \"option\" tag must not survive the tab close");
+});
+
+// --- The same select miss end to end: real Chrome, the real content script. ---
+
+let browser;
+before(async () => {
+  if (!chromeAvailable) return;
+  browser = await launchChrome();
+  await browser.send("Browser.setDownloadBehavior", { behavior: "deny" });
+}, { timeout: 30000 });
+after(async () => { await browser?.close(); });
+
+test("real Chrome: a card number given to form_input on a select with no such option is in no stored field", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  const page = await openPage(browser, { html: `<select aria-label="Country"><option value="ch">Switzerland</option></select>` });
+  const cs = await injectContentScript(page, CONTENT);
+  const tree = (await cs.invoke({ type: "generateAccessibilityTree", options: {} })).result;
+  const ref = tree.match(/combobox "Country" \[(ref_\d+)\]/)[1];
+  const fakeStore = makeFakeStore();
+  const bg = await loadBackground({ page, content: cs, beforeRun: injectFakeStore(fakeStore) });
+  await flush();
+  await bg.chrome.storage.local.set({ audit: { enabled: true, retentionDays: 7 } });
+
+  bg.deliver({ type: "tool_request", id: "1.s1.1", tool: "form_input", args: { ref, value: "4111 1111 1111 1111 exp 12/29 cvc 123", tabId: bg.tabId }, session: SESSION });
+  while (bg.posted.length === 0) await flush(10);
+  await flush(50);
+
+  assert.equal(bg.posted[0].result.isError, true);
+  assert.match(bg.posted[0].result.content[0].text, /4111 1111 1111 1111/, "the reply to the agent is unchanged");
+  assert.equal(fakeStore.actions[0].outcome, "error (text withheld)");
+  assert.doesNotMatch(JSON.stringify(fakeStore.calls), /4111|cvc 123/);
 });

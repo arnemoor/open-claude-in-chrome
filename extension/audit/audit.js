@@ -25,6 +25,7 @@
   // stops a recording. Defaults to "every tab", so callers that don't pass one
   // (existing tests, and any future caller) keep today's behaviour.
   let isTabAllowed = async () => true;
+  const inputFreeErrors = new WeakSet(); // results and errors background.js marked as holding no tool input
   const tabOwners = new Map(); // tabId -> "<runId>.<session.id>", the last session to act on that tab
   const tabOwnerSetAt = new Map(); // tabId -> Date.now() when tabOwners was last set, for the retry below
   const knownTagsByTab = new Map(); // tabId -> Map(rrweb node id -> lowercase tagName, or a text node's marker), for redactEvents
@@ -253,12 +254,12 @@
           // Fire-and-forget — safeRecord never rejects (its own try/catch
           // guarantees that), and a stalled store write must never delay the
           // tool's actual response to the host.
-          safeRecord(name, args, ctx, `error: ${scrubUrls(String(err.message), AUDIT_ERROR_CLIP)}`, ms);
+          safeRecord(name, args, ctx, errorOutcome(name, args, String(err.message), err), ms);
           throw err;
         }
         const ms = Date.now() - started;
         if (allowed) ensureRecorder(tabId);
-        const outcome = result && result.isError === true ? `error: ${scrubUrls(errorResultText(result), AUDIT_ERROR_CLIP)}` : "ok";
+        const outcome = result && result.isError === true ? errorOutcome(name, args, errorResultText(result), result) : "ok";
         safeRecord(name, args, ctx, outcome, ms);
         return result;
       };
@@ -272,6 +273,28 @@
   function errorResultText(result) {
     const texts = (Array.isArray(result.content) ? result.content : []).filter((c) => c && c.type === "text" && typeof c.text === "string");
     return texts.length > 0 ? texts[texts.length - 1].text : "";
+  }
+
+  // The stored outcome of a failed call. An error text can quote the call's
+  // input (a select miss quotes the form value, an unparseable URL keeps its
+  // query after a space, a V8 message quotes a string literal), so for a call
+  // whose summary hides input (summaryHidesInput) the text is stored only when
+  // background.js marked it as holding none: the shared refusals, fixed texts,
+  // and timeout, dialog and transport failures. The reply itself is unchanged.
+  function errorOutcome(tool, args, text, source) {
+    if (summaryHidesInput(tool, args) && !isInputFree(source)) return "error (text withheld)";
+    return `error: ${scrubUrls(text, AUDIT_ERROR_CLIP)}`;
+  }
+
+  // Marks a tool result or a thrown error whose text holds no tool input, so
+  // errorOutcome may store it. Returns what it was given.
+  function markInputFree(resultOrError) {
+    if (resultOrError && typeof resultOrError === "object") inputFreeErrors.add(resultOrError);
+    return resultOrError;
+  }
+
+  function isInputFree(resultOrError) {
+    return !!resultOrError && typeof resultOrError === "object" && inputFreeErrors.has(resultOrError);
   }
 
   // The owner is set synchronously in wrapHandlers,
@@ -330,5 +353,5 @@
     tabOwnerSetAt.delete(tabId);
   }
 
-  globalThis.Audit = { init, wrapHandlers, onRecorderEvents, settings, dropOwner };
+  globalThis.Audit = { init, wrapHandlers, onRecorderEvents, settings, dropOwner, markInputFree, isInputFree };
 })();

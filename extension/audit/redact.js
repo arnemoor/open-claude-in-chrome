@@ -659,3 +659,26 @@ function auditSummary(tool, args) {
     default: return genericSummary(args);
   }
 }
+
+// Whether auditSummary masks, drops or clips part of this call's input beyond
+// URL scrubbing: typed text and key presses, a form value, a navigate URL, code,
+// a find query, upload_image's filename and every nested action of a batch. An
+// error text of such a call can quote that input, so audit stores it only when
+// it is known to hold none (see audit.js). The generic summary and file_upload's
+// show every argument, only clipped for size, and so do navigate back/forward
+// and a boolean form_input value.
+function summaryHidesInput(tool, args) {
+  args = args || {};
+  switch (tool) {
+    case "computer": return args.action === "type" || args.action === "key";
+    case "navigate": return args.url !== "back" && args.url !== "forward";
+    case "form_input": return typeof args.value !== "boolean";
+    case "javascript_tool":
+    case "find":
+    case "upload_image":
+    case "browser_batch":
+      return true;
+    default:
+      return false;
+  }
+}
