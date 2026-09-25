@@ -26,6 +26,7 @@
   const tabOwners = new Map(); // tabId -> "<runId>.<session.id>", the last session to act on that tab
   const tabOwnerSetAt = new Map(); // tabId -> Date.now() when tabOwners was last set, for the retry below
   const knownTagsByTab = new Map(); // tabId -> Map(rrweb node id -> lowercase tagName), for redactEvents (I1)
+  const failedRecorderStarts = new Map(); // tabId -> the tab's url when a recorder start last failed there, for item 16
 
   async function settings() {
     const { audit } = await chrome.storage.local.get("audit");
@@ -80,6 +81,14 @@
       tabOwners.delete(tabId);
       tabOwnerSetAt.delete(tabId);
       knownTagsByTab.delete(tabId);
+      failedRecorderStarts.delete(tabId);
+    });
+    // Item 16: a failed start is remembered only for the document it failed
+    // on (see ensureRecorder) — a navigation (or an in-page URL change) means
+    // a fresh document that deserves its own attempt, so drop the memory of
+    // the old one rather than wait for its url to happen to differ.
+    chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+      if (changeInfo.status === "loading" || changeInfo.url) failedRecorderStarts.delete(tabId);
     });
   }
 
@@ -147,10 +156,21 @@
   // of awaiting it unbounded — matching background.js's own rule for renderer
   // round-trips (readViewport, focusedFieldKind, resize_window all bound theirs
   // the same way, for the same reason).
+  //
+  // Item 16: a chrome:// page, the Web Store, or any other page that refuses
+  // injection outright would otherwise pay this same probe+inject timeout
+  // budget on every audited call to that tab (before AND after, per
+  // wrapHandlers below) for as long as it stays on that document. Remembers
+  // a failed start keyed by the tab's own url, and skips straight past both
+  // attempts while the tab is still showing the document that failed —
+  // chrome.tabs.onUpdated (init, above) forgets it on the next navigation.
   async function ensureRecorder(tabId) {
+    let tab;
     try {
       const { enabled } = await settings();
       if (!enabled) return;
+      tab = await chrome.tabs.get(tabId);
+      if (failedRecorderStarts.get(tabId) === tab.url) return;
       const [check] = await withTimeout(
         chrome.scripting.executeScript({
           target: { tabId },
@@ -159,7 +179,7 @@
         }),
         ENSURE_RECORDER_PROBE_TIMEOUT_MS,
       );
-      if (check?.result) return;
+      if (check?.result) { failedRecorderStarts.delete(tabId); return; }
       await withTimeout(
         chrome.scripting.executeScript({
           target: { tabId },
@@ -168,8 +188,12 @@
         }),
         ENSURE_RECORDER_INJECT_TIMEOUT_MS,
       );
+      failedRecorderStarts.delete(tabId);
     } catch {
-      // Best-effort only; see comment above.
+      // Best-effort only; see comment above. `tab` is unset only when
+      // settings()/chrome.tabs.get() itself is what failed (a tab that
+      // closed mid-call, for example) — nothing to key a cache entry on.
+      if (tab) failedRecorderStarts.set(tabId, tab.url);
     }
   }
 

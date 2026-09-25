@@ -431,6 +431,40 @@ test("item 9: recorder events stop and the owner is cleared once a tab leaves th
   assert.equal(fakeStore.calls.filter((c) => c[0] === "addEvents").length, 1, "the owner was cleared on leaving, so rejoining alone must not resume storing under the old owner");
 });
 
+// Item 16: a chrome:// page, the Web Store, or any other page that refuses
+// injection makes ensureRecorder pay its full probe (up to 300ms) plus inject
+// (up to 2s) timeout budget on every audited call to that tab, before and
+// after — every call, for as long as the tab stays on that document.
+// Remembers a failed start per (tabId, url) and skips both attempts until a
+// navigation, so the cost is paid once per document, not once per call.
+test("item 16: a failed recorder start is remembered per tab+url and skipped until navigation", async () => {
+  const fakeStore = makeFakeStore();
+  let executeScriptCalls = 0;
+  const bg = await loadBackground({
+    beforeRun: injectFakeStore(fakeStore),
+    overrides: { scripting: { executeScript: async () => { executeScriptCalls++; throw new Error("Cannot access a chrome:// URL"); } } },
+  });
+  await flush();
+  await bg.chrome.storage.local.set({ audit: { enabled: true, retentionDays: 7 } });
+
+  bg.deliver({ type: "tool_request", id: "1.s1.1", tool: "gif_creator", args: { tabId: bg.tabId }, session: SESSION });
+  await flush();
+  const afterFirstCall = executeScriptCalls;
+  assert.ok(afterFirstCall > 0, "expected at least one probe attempt on the first call");
+
+  bg.deliver({ type: "tool_request", id: "1.s1.2", tool: "gif_creator", args: { tabId: bg.tabId }, session: SESSION });
+  await flush();
+  assert.equal(executeScriptCalls, afterFirstCall, "a second call on the same document must make no executeScript call at all");
+
+  bg.chrome.tabs.onUpdated.fire(bg.tabId, { status: "loading" }, {});
+  bg.deliver({ type: "tool_request", id: "1.s1.3", tool: "gif_creator", args: { tabId: bg.tabId }, session: SESSION });
+  await flush();
+  assert.ok(executeScriptCalls > afterFirstCall, "a navigation must re-enable the probe/inject attempt");
+
+  // The tool call itself must still succeed despite the recorder never starting.
+  assert.equal(bg.posted.filter((p) => p.type === "tool_response").length, 3);
+});
+
 // M1: `started` used to be captured after the before-hook but `ms` was computed
 // after the after-hook too, so a slow ensureRecorder call (a large page's full
 // snapshot, or now I4's own timeout budget) inflated the recorded duration of
