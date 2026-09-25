@@ -74,6 +74,16 @@ test("computer key: a shift+char run inside a mixed sequence is counted, a real 
   assert.equal(s, "key ctrl+a [2 keys] Delete");
 });
 
+// background.js's parseKeyCombo trims each part and matches modifiers case-
+// insensitively, so each of these types one character, the same as "shift+h".
+test("computer key: shift in any case, repeated or padded, plus one character counts as a typed key", () => {
+  const { auditSummary } = load();
+  const s = auditSummary("computer", { action: "key", text: "Shift+h SHIFT+I shift+shift+j \tk \tShift+l" });
+  assert.doesNotMatch(s, /hift/i);
+  assert.equal(s, "key [5 keys]");
+  assert.equal(auditSummary("computer", { action: "key", text: "Shift+Tab ctrl+Shift+a" }), "key Shift+Tab ctrl+Shift+a");
+});
+
 test("computer scroll keeps direction and amount", () => {
   const { auditSummary } = load();
   const s = auditSummary("computer", { action: "scroll", coordinate: [5, 5], scroll_direction: "up", scroll_amount: 4 });
@@ -182,6 +192,28 @@ test("redactUrl recognizes a data: URL case-insensitively and after leading whit
   const { redactUrl } = load();
   const url = "  DATA:text/plain,RECOVERY-CODE-HREF2";
   assert.equal(redactUrl(url), `data:[${url.length} chars]`);
+});
+
+// The URL parser drops a tab or newline anywhere and C0 controls at the ends,
+// so these parse as data: URLs although they do not start with "data:".
+test("redactUrl masks an input the URL parser turns into a data: URL", () => {
+  const { redactUrl } = load();
+  for (const url of ["da\tta:text/plain,TABSCHEME1", "\u0001data:text/plain,C0LEAD1", "d\nata:text/plain,NEWLINESCHEME1"]) {
+    assert.equal(redactUrl(url), `data:[${url.length} chars]`);
+  }
+});
+
+test("redactEvents: an href the URL parser reads as data: is masked", () => {
+  const { redactEvents } = load();
+  const events = [{
+    type: 2,
+    data: { node: { type: 0, id: 1, childNodes: [
+      { type: 2, tagName: "a", attributes: { href: "da\tta:text/plain,TABSCHEME2" }, id: 2, childNodes: [] },
+      { type: 2, tagName: "img", attributes: { src: "\u0001data:image/png;base64,C0LEAD2" }, id: 3, childNodes: [] },
+    ] } },
+  }];
+  redactEvents(events, new Map());
+  assert.doesNotMatch(JSON.stringify(events), /TABSCHEME2|C0LEAD2/);
 });
 
 // --- form_input ---
@@ -795,6 +827,106 @@ test("item 13: a plain https: URL inside _cssText still has its query redacted",
   redactEvents(events, new Map());
   const scrubbed = events[0].data.node.childNodes[0].attributes._cssText;
   assert.doesNotMatch(scrubbed, /token=CSSFONT1/);
+});
+
+function cssEvents(attributes) {
+  return [{ type: 2, data: { node: { type: 0, id: 1, childNodes: [{ type: 2, tagName: "div", attributes, id: 2, childNodes: [] }] } } }];
+}
+
+function walkCss(name, text) {
+  const { redactEvents } = load();
+  const events = cssEvents({ [name]: text });
+  redactEvents(events, new Map());
+  return events[0].data.node.childNodes[0].attributes[name];
+}
+
+// A data: URI can sit outside a url() token, where nothing bounds it, or in a
+// url() token that never closes. Real rrweb stored the first four markers raw
+// in the re-review.
+const CSS_DATA_OUTSIDE_URL_CASES = [
+  ["a custom property string in a style attribute", "style", '--recovery: "data:text/plain,SECRETCUSTOM1"; color: red', /SECRETCUSTOM1/],
+  ["a custom property string in _cssText", "_cssText", '.x { --code: "data:text/plain,SECRETCUSTOM2"; } .after { color: blue; }', /SECRETCUSTOM2/],
+  ["an image-set() string in a style attribute", "style", 'background-image: image-set("data:image/png;base64,SECRETIMGSET1" 1x)', /SECRETIMGSET1/],
+  ["an @import string in _cssText", "_cssText", '@import "data:text/css,.q{--k:SECRETIMPORT1}"; .after { color: blue; }', /SECRETIMPORT1/],
+  ["an unterminated quoted url(", "style", 'background: url("data:text/plain,SECRETUNTERM1', /SECRETUNTERM1/],
+  ["an unterminated bare url(", "style", "background: url(data:text/plain,SECRETUNTERM2", /SECRETUNTERM2/],
+];
+for (const [label, name, text, secret] of CSS_DATA_OUTSIDE_URL_CASES) {
+  test(`CSS text: a data: URI in ${label} is masked to the end of the text`, () => {
+    const scrubbed = walkCss(name, text);
+    assert.doesNotMatch(scrubbed, secret);
+    assert.match(scrubbed, /data:\[\d+ chars\]$/);
+  });
+}
+
+// CSS does not allow a space in a bare url(), so this one is masked to the end.
+test("CSS text: a bare url(data:...) with a space in its payload is masked", () => {
+  assert.doesNotMatch(walkCss("style", "background: url(data:text/plain,a SECRETSPACE1) no-repeat"), /SECRETSPACE1/);
+});
+
+test("CSS text: a style mutation's custom property holding a data: string is masked", () => {
+  const { redactEvents } = load();
+  const events = [{ type: 3, data: { source: 0, texts: [], removes: [], adds: [], attributes: [{ id: 6, attributes: { style: { "--k": '"data:text/plain,SECRETCUSTOMMUT1"', color: "blue" } } }] } }];
+  redactEvents(events, new Map());
+  const style = events[0].data.attributes[0].attributes.style;
+  assert.doesNotMatch(JSON.stringify(style), /SECRETCUSTOMMUT1/);
+  assert.equal(style.color, "blue");
+});
+
+// CSS escapes a ")" in a bare url() and a quote in a quoted one with "\". The
+// escaped character is part of the payload, not its end.
+test("CSS text: an escaped ) in a bare url(data:...) is part of the masked payload, and the rules after it are kept", () => {
+  const payload = "data:text/plain,AB\\)SECRETESC1";
+  const scrubbed = walkCss("_cssText", `.d{background:url(${payload})}.after{x:y}`);
+  assert.equal(scrubbed, `.d{background:url(data:[${payload.length} chars])}.after{x:y}`);
+});
+
+test('CSS text: an escaped " in a quoted url("data:...") is part of the masked payload, and the rules after it are kept', () => {
+  const payload = 'data:text/plain,AB\\")SECRETESC2';
+  const scrubbed = walkCss("_cssText", `.e{background:url("${payload}")}.after{x:y}`);
+  assert.equal(scrubbed, `.e{background:url("data:[${payload.length} chars]")}.after{x:y}`);
+});
+
+// One pass masks every url(data:) token and any data: left over, so a masked
+// "data:[N chars]" is never matched again as a leftover data: URI.
+test("CSS text: two data: url() tokens are each masked, keeping the rules between and after them", () => {
+  const scrubbed = walkCss("_cssText", ".a{background:url(data:,SECRETTWO1)}.mid{x:y}.b{background:url('data:,SECRETTWO2')}.after{x:y}");
+  assert.equal(scrubbed, ".a{background:url(data:[16 chars])}.mid{x:y}.b{background:url('data:[16 chars]')}.after{x:y}");
+});
+
+// The re-review timed a lazy [\s\S]*? with a backreference at 96 s for 1 MB of
+// unclosed url("data:. These are that input and the rest of its family: url(
+// tokens that never close the way the bounded match expects.
+const CSS_WORST_CASES = [
+  ['url("data:', "_cssText"],
+  ['url("data:', "style"],
+  ["url(data:", "_cssText"],
+  ["url('data:x\"", "_cssText"],
+  ["url( data:a ", "_cssText"],
+  ['url("data:\\"', "_cssText"],
+  ["url(data:\\)", "_cssText"],
+  ["url('data:url(\"data:url(data:", "_cssText"],
+];
+for (const [unit, name] of CSS_WORST_CASES) {
+  test(`CSS text: 1 MB of ${JSON.stringify(unit)} in ${name} is scrubbed in under 200 ms`, () => {
+    const text = unit.repeat(Math.ceil(1_000_000 / unit.length)).slice(0, 1_000_000);
+    const start = performance.now();
+    const scrubbed = walkCss(name, text);
+    const elapsed = performance.now() - start;
+    assert.ok(elapsed < 200, `expected under 200ms, took ${elapsed.toFixed(0)}ms`);
+    assert.doesNotMatch(scrubbed, /data:(?!\[\d+ chars\])/i, "every data: left in the text must be a mask");
+  });
+}
+
+test("CSS text: a 1 MB stylesheet with many closed data: icons is scrubbed in under 200 ms and keeps its rules", () => {
+  const unit = `.btn{display:inline-block}.sel{background:#fff url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg'%3e%3cpath fill='%23343a40'/%3e%3c/svg%3e") no-repeat}.icon{background-image:url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==)}.navbar{position:relative}`;
+  const text = unit.repeat(Math.ceil(1_000_000 / unit.length));
+  const start = performance.now();
+  const scrubbed = walkCss("_cssText", text);
+  const elapsed = performance.now() - start;
+  assert.ok(elapsed < 200, `expected under 200ms, took ${elapsed.toFixed(0)}ms`);
+  assert.equal(scrubbed.split(".navbar{position:relative}").length - 1, Math.ceil(1_000_000 / unit.length));
+  assert.doesNotMatch(scrubbed, /iVBORw0|%3csvg/);
 });
 
 // Fix round 4, item 1: the quote-in-query regression as the walker meets it,
