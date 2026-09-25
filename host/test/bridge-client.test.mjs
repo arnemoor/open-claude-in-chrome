@@ -123,13 +123,17 @@ test("a grace-timeout rejection drops its waiter instead of leaking it until the
 
 test("a hub that appears late in the grace window is not missed by a grown backoff", { timeout: 10000 }, async (t) => {
   const home = tmpHome();
-  const c = client(home, { graceMs: 1000, retryMinMs: 50, retryMaxMs: 400 });
+  // Round 2 (N3): the margin here must survive CPU load, not just an idle
+  // machine. With retryMinMs at its production default (250) and
+  // retryMaxMs=1600, the old exponential backoff's last attempt before a
+  // 3000ms deadline lands at t=1750, next at t=3350 (too late) — a hub
+  // starting at t=2000 falls into that gap with roughly a second of margin
+  // on either side, empirically confirmed (5/5) against the pre-fix code,
+  // instead of round 1's ~150ms margin (which failed 6/20 under full load).
+  const c = client(home, { graceMs: 3000, retryMinMs: 250, retryMaxMs: 1600 });
   t.after(() => c.close());
   const p = c.request("find", {});
-  // Past where the old exponential backoff (capped at retryMaxMs=400) would
-  // already have spread out its retries to every 400ms: its last attempt
-  // before the 1000ms deadline lands at t=750, next at t=1150 (too late).
-  await sleep(850);
+  await sleep(2000);
   const { hub, ext } = await startHub(home);
   t.after(() => hub.stop("cleanup").catch(() => {}));
   await waitFor(() => ext.received.length === 1);
