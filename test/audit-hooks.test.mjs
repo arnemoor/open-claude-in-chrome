@@ -968,6 +968,31 @@ test("a shared refusal keeps its informative text for a call that hides input", 
   assert.equal(fakeStore.actions[0].outcome, "error: Tab 99 is not in the MCP group.");
 });
 
+// The after-hook runs once the handler returned. A tab that left the MCP group
+// during the call gets no recorder probe or injection then.
+test("the after-hook does not probe or inject the recorder into a tab that left the group during the call", async () => {
+  const fakeStore = makeFakeStore();
+  let groupId = 7;
+  const bg = await loadBackground({
+    beforeRun: injectFakeStore(fakeStore),
+    overrides: {
+      tabs: { get: async (id) => ({ id, windowId: 1, status: "complete", url: "https://example.test/", groupId }) },
+      debugger: { sendCommand: async (t, m) => {
+        if (m === "Page.captureScreenshot") { groupId = -1; return { data: "AAAA" }; } // the tab leaves while the screenshot is taken
+        return m === "Runtime.evaluate" ? { result: { value: [1200, 713] } } : {};
+      } },
+    },
+  });
+  await flush();
+  await bg.chrome.storage.local.set({ audit: { enabled: true, retentionDays: 7 } });
+
+  bg.deliver({ type: "tool_request", id: "1.s1.1", tool: "computer", args: { action: "screenshot", tabId: bg.tabId }, session: SESSION });
+  await flush(200);
+
+  assert.equal(bg.posted[0].type, "tool_response");
+  assert.equal(ensureRecorderCalls(bg).length, 2, "only the before-hook's probe and injection, none after the call");
+});
+
 // M8: audit.js must not leak its internal helpers into the shared worker scope.
 test("audit.js exposes only globalThis.Audit, not its internal helpers", async () => {
   const bg = await loadBackground({ beforeRun: injectFakeStore(makeFakeStore()) });

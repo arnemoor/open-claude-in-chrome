@@ -250,7 +250,7 @@
           // ensureRecorder), so a slow or timed-out ensureRecorder call never
           // inflates the tool's own recorded duration.
           const ms = Date.now() - started;
-          if (allowed) ensureRecorder(tabId);
+          if (allowed) ensureRecorderIfAllowed(tabId);
           // Fire-and-forget — safeRecord never rejects (its own try/catch
           // guarantees that), and a stalled store write must never delay the
           // tool's actual response to the host.
@@ -258,13 +258,23 @@
           throw err;
         }
         const ms = Date.now() - started;
-        if (allowed) ensureRecorder(tabId);
+        if (allowed) ensureRecorderIfAllowed(tabId);
         const outcome = result && result.isError === true ? errorOutcome(name, args, errorResultText(result), result) : "ok";
         safeRecord(name, args, ctx, outcome, ms);
         return result;
       };
     }
     return handlers;
+  }
+
+  // The after-hook. The tab can have left the MCP group during the call, and
+  // then it gets no recorder probe or injection.
+  async function ensureRecorderIfAllowed(tabId) {
+    try {
+      if (await isTabAllowed(tabId)) await ensureRecorder(tabId);
+    } catch (err) {
+      console.error("[audit] after-call recorder check failed:", err);
+    }
   }
 
   // A refusal or a failure comes back as a result with isError, not a throw.
