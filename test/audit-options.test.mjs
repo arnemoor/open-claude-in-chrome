@@ -63,6 +63,7 @@ function storageStubSource(initialState = {}, delayMs = 0) {
   return `(() => {
     const state = ${JSON.stringify(initialState)};
     globalThis.__storageState = state;
+    globalThis.__storageWrites = [];
     globalThis.chrome = {
       storage: {
         local: {
@@ -83,6 +84,7 @@ function storageStubSource(initialState = {}, delayMs = 0) {
             }, ${delayMs}));
           },
           set(items) {
+            globalThis.__storageWrites.push(JSON.parse(JSON.stringify(items)));
             return Promise.resolve().then(() => { Object.assign(state, items); });
           },
         },
@@ -105,14 +107,16 @@ function serveExtension() {
 }
 
 // A server that only counts requests, standing in for an attacker-controlled
-// host that a recorded page's DOM might reference (I1).
+// host that a recorded page's DOM might reference (I1). It counts connections
+// too, since a preconnect opens one without sending a request.
 function countingServer() {
-  const state = { count: 0 };
+  const state = { count: 0, connections: 0 };
   const server = http.createServer((req, res) => {
     state.count++;
     res.writeHead(200, { "Content-Type": "text/plain" });
     res.end("");
   });
+  server.on("connection", () => { state.connections++; });
   return { server, state };
 }
 
@@ -125,12 +129,13 @@ async function waitFor(page, expr, { timeout = 5000, interval = 50 } = {}) {
   }
 }
 
-// Repeats `actionExpr` (not just waits) until `predicateExpr` is true: options.js
-// is the last of three blocking <script src> tags on the page (after
-// audit/store.js and the vendored player), so its own top-level code —
-// including the addEventListener calls below — may not have run yet by the
-// time a dispatch lands right after navigate() resolves. Re-dispatching is
-// harmless (setting .checked to the same value twice is a no-op).
+// Repeats `actionExpr` (not just waits) until `predicateExpr` is true.
+// navigate() resolves on Page.loadEventFired, which comes after all three
+// blocking <script src> tags, so options.js has attached its listeners by
+// then. But navigate() also resolves after 5s when no load event arrives, and
+// a change is saved asynchronously (the handler reads storage before it
+// writes), so one dispatch and one check can still miss. Dispatching the same
+// value again is harmless.
 async function retryUntil(page, actionExpr, predicateExpr, { timeout = 5000, interval = 100 } = {}) {
   const deadline = Date.now() + timeout;
   for (;;) {
@@ -223,9 +228,7 @@ after(async () => {
 
 test("ticking the audit checkbox, and choosing a retention, write to chrome.storage.local", { skip: !chromeAvailable, timeout: 20000 }, async () => {
   await withOptionsPage(async (page) => {
-    // Both use retryUntil: a dispatch right after navigation can race ahead of
-    // options.js's own script load (see retryUntil's own comment) and be lost
-    // before these listeners even exist yet to catch it.
+    // Both use retryUntil, see its own comment.
     await retryUntil(
       page,
       `(() => {
@@ -259,7 +262,7 @@ test("a click on the audit switch during a slow storage read is written and kept
       cb.checked = true;
       cb.dispatchEvent(new Event("change"));
     })()`);
-    await waitFor(page, `window.__storageState.audit != null`);
+    await waitFor(page, `window.__storageState.audit.enabled === true`);
     assert.equal((await page.evaluate("window.__storageState.audit")).enabled, true);
 
     // Wait past the stub's artificial delay: the stale stored enabled:false
@@ -283,12 +286,59 @@ test("a click on the audit switch during a slow storage read does not clobber th
       cb.checked = true;
       cb.dispatchEvent(new Event("change"));
     })()`);
-    await waitFor(page, `window.__storageState.audit != null`);
+    await waitFor(page, `window.__storageState.audit.enabled === true`);
 
     await new Promise((r) => setTimeout(r, 600)); // past the stub's artificial delay
     assert.deepEqual(await page.evaluate("window.__storageState.audit"), { enabled: true, retentionDays: 30 });
     assert.equal(await page.evaluate(`document.getElementById("audit-retention").value`), "30");
   }, { initialStorage: { audit: { enabled: false, retentionDays: 30 } }, storageDelayMs: 400 });
+});
+
+// Before the first storage read resolves, the control the user did not touch
+// still shows its markup default (retention "1 day", the switch off). No write
+// may carry that default, not even for one round trip.
+test("a change during a slow storage read never writes the other control's markup default", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  await withOptionsPage(async (page) => {
+    await page.evaluate(`(() => {
+      const cb = document.getElementById("audit-enabled");
+      cb.checked = true;
+      cb.dispatchEvent(new Event("change"));
+    })()`);
+    await waitFor(page, `window.__storageState.audit.enabled === true`);
+    await new Promise((r) => setTimeout(r, 600));
+    const writes = await page.evaluate("window.__storageWrites");
+    assert.deepEqual(writes.map((w) => w.audit), writes.map(() => ({ enabled: true, retentionDays: 30 })));
+  }, { initialStorage: { audit: { enabled: false, retentionDays: 30 } }, storageDelayMs: 400 });
+
+  await withOptionsPage(async (page) => {
+    await page.evaluate(`(() => {
+      const sel = document.getElementById("audit-retention");
+      sel.value = "30";
+      sel.dispatchEvent(new Event("change"));
+    })()`);
+    await waitFor(page, `window.__storageState.audit.retentionDays === 30`);
+    await new Promise((r) => setTimeout(r, 600));
+    const writes = await page.evaluate("window.__storageWrites");
+    assert.deepEqual(writes.map((w) => w.audit), writes.map(() => ({ enabled: true, retentionDays: 30 })));
+  }, { initialStorage: { audit: { enabled: true, retentionDays: 7 } }, storageDelayMs: 400 });
+});
+
+// Each save reads storage before it writes, so two saves in flight at once
+// must not both read the old value and let the second undo the first.
+test("two quick changes to different controls are both kept", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  await withOptionsPage(async (page) => {
+    await page.evaluate(`(() => {
+      const cb = document.getElementById("audit-enabled");
+      cb.checked = true;
+      cb.dispatchEvent(new Event("change"));
+      const sel = document.getElementById("audit-retention");
+      sel.value = "30";
+      sel.dispatchEvent(new Event("change"));
+    })()`);
+    await waitFor(page, `window.__storageState.audit.enabled === true && window.__storageState.audit.retentionDays === 30`);
+    await new Promise((r) => setTimeout(r, 400));
+    assert.deepEqual(await page.evaluate("window.__storageState.audit"), { enabled: true, retentionDays: 30 });
+  }, { initialStorage: { audit: { enabled: false, retentionDays: 7 } }, storageDelayMs: 100 });
 });
 
 test("a stored retention value outside 1/7/30 falls back to 7 in the UI and in what is written (M7)", { skip: !chromeAvailable, timeout: 20000 }, async () => {
@@ -302,7 +352,7 @@ test("a stored retention value outside 1/7/30 falls back to 7 in the UI and in w
         cb.checked = true;
         cb.dispatchEvent(new Event("change"));
       })()`,
-      `window.__storageState.audit != null`,
+      `window.__storageState.audit.enabled === true`,
     );
     assert.deepEqual(await page.evaluate("window.__storageState.audit"), { enabled: true, retentionDays: 7 });
   }, { initialStorage: { audit: { enabled: false, retentionDays: 14 } } });
@@ -464,6 +514,27 @@ test("Export loads a fresh copy of the session at click time, not the stale copy
 
 // Item 3: a failed Delete must show a notice instead of throwing or silently
 // doing nothing.
+test("a failed Export shows a notice instead of an unhandled rejection", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  await withOptionsPage(async (page, origin) => {
+    await seedAndReload(page, origin);
+    await waitFor(page, `document.querySelectorAll("#sessions-body tr").length === 1`);
+    await page.evaluate(`document.querySelector("#sessions-body tr td button").click()`);
+    await waitFor(page, `document.getElementById("session-detail").hidden === false`);
+
+    await page.evaluate(`(() => {
+      window.__unhandledRejections = 0;
+      window.addEventListener("unhandledrejection", () => { window.__unhandledRejections++; });
+      AuditStore.getSession = () => Promise.reject(new Error("boom"));
+    })()`);
+    await page.evaluate(`document.getElementById("export-session").click()`);
+    await waitFor(page, `document.getElementById("sessions-notice").hidden === false`);
+
+    assert.match(await page.evaluate(`document.getElementById("sessions-notice").textContent`), /[Cc]ould not export/);
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(await page.evaluate("window.__unhandledRejections"), 0);
+  });
+});
+
 test("a failed Delete shows a notice instead of throwing (item 3)", { skip: !chromeAvailable, timeout: 20000 }, async () => {
   await withOptionsPage(async (page, origin) => {
     await seedAndReload(page, origin);
@@ -633,7 +704,7 @@ test("a replay never sends the recorded page's resource URLs to the network (I1)
 // it blocks a stylesheet/image/background fetch (proven by the I1 test
 // above). Covers a node in the initial snapshot and one added later by a
 // mutation; a same-batch, non-blocked stylesheet link must survive untouched.
-test("preconnect/dns-prefetch/prefetch/preload/prerender link nodes are stripped before the player is built (item 5)", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+test("preconnect/dns-prefetch/prefetch/preload/prerender link nodes are neutralized before the player is built (item 5)", { skip: !chromeAvailable, timeout: 20000 }, async () => {
   const { server: attackerServer, state } = countingServer();
   await new Promise((resolve) => attackerServer.listen(0, "127.0.0.1", resolve));
   const attackerOrigin = `http://127.0.0.1:${attackerServer.address().port}`;
@@ -683,6 +754,142 @@ test("preconnect/dns-prefetch/prefetch/preload/prerender link nodes are stripped
 
     await new Promise((resolve) => setTimeout(resolve, 300)); // settle window for anything still in flight
     assert.equal(state.count, 0, `expected 0 requests to the attacker-like server from blocked link nodes, got ${state.count}`);
+  } finally {
+    await new Promise((resolve) => attackerServer.close(resolve));
+  }
+});
+
+// A page that loads its CSS the loadCSS way records the link as rel=preload.
+// When the sheet arrives, rrweb sends that node's rel change and its _cssText
+// as mutations on the same id, which the player turns into a <style>. The node
+// must survive neutralization for that to work.
+const RECORD_JS = fs.readFileSync(path.join(EXT_DIR, "vendor", "rrweb-record.min.js"), "utf8");
+const RECORD_OPTIONS = `{
+  maskAllInputs: true, maskInputOptions: { password: true },
+  maskTextSelector: '[contenteditable]:not([contenteditable="false"]), textarea',
+  blockSelector: "input[type=hidden]", recordCanvas: false, collectFonts: false, inlineImages: false,
+  sampling: { mousemove: 100, scroll: 150, input: "last" },
+}`;
+const LOADCSS_PAGE = `<!doctype html><html><head><link rel="preload" as="style" href="/late.css" onload="this.onload=null;this.rel='stylesheet'"></head><body><p id="t">hello</p></body></html>`;
+
+async function recordLoadCssPage(siteOrigin) {
+  const page = await openPage(browser);
+  try {
+    // Recording starts at DOMContentLoaded, before the delayed sheet arrives,
+    // so the snapshot still has the link as rel=preload.
+    await page.send("Page.addScriptToEvaluateOnNewDocument", {
+      source: `${RECORD_JS}\n;window.__ev = []; document.addEventListener("DOMContentLoaded", () => rrwebRecord.record({ emit: (e) => window.__ev.push(e), ...${RECORD_OPTIONS} }));`,
+    });
+    await navigate(page, `${siteOrigin}/`);
+    await waitFor(page, `window.__ev.some((e) => e.type === 3 && e.data.source === 0 && e.data.attributes.some((a) => "_cssText" in a.attributes))`, { timeout: 8000 });
+    return JSON.parse(await page.evaluate("JSON.stringify(window.__ev)"));
+  } finally {
+    await browser.send("Target.closeTarget", { targetId: page.targetId });
+  }
+}
+
+test("a loadCSS-style preload link keeps its stylesheet in the replay, and the replay sends no request", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  const site = { requests: 0 };
+  const siteServer = http.createServer((req, res) => {
+    site.requests++;
+    if (req.url.startsWith("/late.css")) {
+      setTimeout(() => { res.writeHead(200, { "Content-Type": "text/css" }); res.end("#t{color:rgb(1, 2, 3)}"); }, 1000);
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "text/html" });
+    res.end(LOADCSS_PAGE);
+  });
+  await new Promise((resolve) => siteServer.listen(0, "127.0.0.1", resolve));
+  try {
+    const events = await recordLoadCssPage(`http://127.0.0.1:${siteServer.address().port}`);
+    const link = JSON.stringify(events.find((e) => e.type === 2).data.node).match(/"rel":"preload"/);
+    assert.ok(link, "the snapshot must hold the link as rel=preload, or this proves nothing");
+    const requestsBeforeReplay = site.requests;
+    const lastTs = Math.max(...events.map((e) => e.timestamp));
+
+    await withOptionsPage(async (page, origin) => {
+      const action = { sessionId: "s1", ts: lastTs + 50, tool: "computer", tabId: 11, summary: "screenshot", outcome: "ok", ms: 1 };
+      await seedAndReload(page, origin, { ts: lastTs, actions: [action], events: { 11: events } });
+      await waitFor(page, `document.querySelectorAll("#sessions-body tr").length === 1`);
+      await page.evaluate(`document.querySelector("#sessions-body tr td button").click()`);
+      await waitFor(page, `!!document.querySelector("#player-container iframe")`);
+
+      await page.evaluate(`document.querySelectorAll("#actions-body tr")[0].click()`); // seeks past the _cssText mutations
+      const colorExpr = `(() => {
+        const doc = document.querySelector("#player-container iframe").contentDocument;
+        const t = doc && doc.getElementById("t");
+        return t ? doc.defaultView.getComputedStyle(t).color : null;
+      })()`;
+      await waitFor(page, `${colorExpr} === "rgb(1, 2, 3)"`, { timeout: 3000 }).catch(() => {});
+      assert.equal(await page.evaluate(colorExpr), "rgb(1, 2, 3)", "the replay must keep the stylesheet the page loaded");
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal(site.requests, requestsBeforeReplay, "the replay must not fetch the recorded link's href");
+  } finally {
+    await new Promise((resolve) => siteServer.close(resolve));
+  }
+});
+
+// A blocked link stays in the replay, and what a later mutation sets on it
+// reaches the replay too: an href on a prerender link fetches it while the
+// replay plays. Links that were not blocked at first can also get a blocked
+// rel, or an imagesrcset, later.
+test("blocked links stay in the replay, and a later rel, href or imagesrcset cannot make one fetch", { skip: !chromeAvailable, timeout: 20000 }, async () => {
+  const { server: attackerServer, state } = countingServer();
+  await new Promise((resolve) => attackerServer.listen(0, "127.0.0.1", resolve));
+  const attackerOrigin = `http://127.0.0.1:${attackerServer.address().port}`;
+  try {
+    const link = (id, attributes) => ({ type: 2, tagName: "link", attributes, id, childNodes: [] });
+    const events = [
+      { type: 4, timestamp: 1000, data: { href: "https://example.test/fixture", width: 1024, height: 768 } },
+      {
+        type: 2, timestamp: 1000,
+        data: {
+          node: {
+            type: 0, id: 1, childNodes: [{
+              type: 2, tagName: "html", attributes: {}, id: 2, childNodes: [
+                { type: 2, tagName: "head", attributes: {}, id: 3, childNodes: [
+                  link(10, { rel: "prerender", href: `${attackerOrigin}/p10` }),
+                  link(11, { rel: "preload", as: "image", href: `${attackerOrigin}/p11.png` }),
+                  link(12, { rel: "stylesheet", href: `${attackerOrigin}/s12.css` }),
+                  link(13, { rel: "icon", href: `${attackerOrigin}/i13.png` }),
+                ] },
+                { type: 2, tagName: "body", attributes: {}, id: 4, childNodes: [{ type: 3, textContent: "hello", id: 5 }] },
+              ],
+            }],
+          },
+        },
+      },
+      {
+        type: 3, timestamp: 1300,
+        data: {
+          source: 0, texts: [], removes: [], adds: [],
+          attributes: [
+            { id: 10, attributes: { href: `${attackerOrigin}/p10-late` } },
+            { id: 11, attributes: { imagesrcset: `${attackerOrigin}/p11-set.png 1x`, rel: "preload" } },
+            { id: 12, attributes: { rel: "prerender" } },
+            { id: 13, attributes: { rel: "preconnect" } },
+          ],
+        },
+      },
+      { type: 3, timestamp: 1400, data: { source: 3, id: 4, x: 0, y: 10 } },
+    ];
+
+    await withOptionsPage(async (page, origin) => {
+      await seedAndReload(page, origin, { events: { 11: events } });
+      await waitFor(page, `document.querySelectorAll("#sessions-body tr").length === 1`);
+      await page.evaluate(`document.querySelector("#sessions-body tr td button").click()`);
+      await waitFor(page, `!!document.querySelector("#player-container iframe")`);
+      await page.evaluate(`currentPlayer.play()`); // applies the mutation in real time, as a viewer watching would
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      const linkCount = await page.evaluate(`document.querySelector("#player-container iframe").contentDocument.querySelectorAll("link").length`);
+      assert.equal(linkCount, 4, "every recorded link node must stay in the replay");
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal(state.count, 0, `expected 0 requests to the attacker-like server, got ${state.count}`);
+    assert.equal(state.connections, 0, `expected 0 connections to the attacker-like server, got ${state.connections}`);
   } finally {
     await new Promise((resolve) => attackerServer.close(resolve));
   }

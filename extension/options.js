@@ -67,46 +67,48 @@ function clearPlayerNotice() {
 // The listeners are attached before the storage read even starts (not just
 // before AuditStore is opened), and each control's loaded value is applied
 // only if the user hasn't already changed that same control — so a click
-// during the read is written immediately and is never reverted once the read
-// resolves.
+// during the read is saved and is never reverted once the read resolves.
 
-async function saveSettings() {
-  await chrome.storage.local.set({
-    audit: { enabled: enabledCheckbox.checked, retentionDays: Number(retentionSelect.value) },
+// The stored settings as the controls show them. A stored retention the select
+// doesn't offer falls back to the default, so a save writes what is shown,
+// not a value no control holds.
+function shownSettings(audit) {
+  const { enabled, retentionDays } = { ...DEFAULT_SETTINGS, ...audit };
+  return { enabled: !!enabled, retentionDays: VALID_RETENTIONS.includes(retentionDays) ? retentionDays : DEFAULT_SETTINGS.retentionDays };
+}
+
+// Saves one changed field over the value read from storage, never over the
+// other control, which shows its markup default until the first read
+// resolves. Saves run one at a time, so two quick changes cannot both read the
+// old value and let the second undo the first.
+let settingsSaved = Promise.resolve();
+function saveSetting(field, value) {
+  settingsSaved = settingsSaved.catch(() => {}).then(async () => {
+    const { audit } = await chrome.storage.local.get("audit");
+    await chrome.storage.local.set({ audit: { ...shownSettings(audit), [field]: value } });
   });
+  return settingsSaved;
 }
 
 async function initSettings() {
   let userChangedEnabled = false;
   let userChangedRetention = false;
-  enabledCheckbox.addEventListener("change", () => { userChangedEnabled = true; saveSettings(); });
-  retentionSelect.addEventListener("change", () => { userChangedRetention = true; saveSettings(); });
+  enabledCheckbox.addEventListener("change", () => { userChangedEnabled = true; saveSetting("enabled", enabledCheckbox.checked); });
+  retentionSelect.addEventListener("change", () => { userChangedRetention = true; saveSetting("retentionDays", Number(retentionSelect.value)); });
 
   const { audit } = await chrome.storage.local.get("audit");
-  const { enabled, retentionDays } = { ...DEFAULT_SETTINGS, ...audit };
+  const { enabled, retentionDays } = shownSettings(audit);
   if (!userChangedEnabled) enabledCheckbox.checked = enabled;
-  if (!userChangedRetention) {
-    // A stored value the select doesn't offer would otherwise leave the select
-    // on some other option, and the next save would silently write that instead
-    // of the value actually shown.
-    retentionSelect.value = String(VALID_RETENTIONS.includes(retentionDays) ? retentionDays : DEFAULT_SETTINGS.retentionDays);
-  }
-  // N6: a change to ONE control before this read resolved was saved together
-  // with the OTHER control's still-unset markup default (the switch off, or
-  // retention "1 day") — clobbering it in storage even though the DOM above
-  // now shows the right value for it. Now that both controls hold their real
-  // values (the user's own change, and the stored value just applied for the
-  // one they didn't touch), save once more so storage matches what is shown.
-  if (userChangedEnabled || userChangedRetention) await saveSettings();
+  if (!userChangedRetention) retentionSelect.value = String(retentionDays);
 }
 
 // --- Sessions table ---
 
 async function renderSessions() {
-  // Important 1: a per-row getSession() would load every session's full
-  // recording (tens of MB of rrweb events each) just to count actions and
-  // tabs — listSessionSummaries gets both without ever touching an event
-  // row's own events payload.
+  // A per-row getSession() would load every session's full recording (tens of
+  // MB of rrweb events each) just to count actions and tabs —
+  // listSessionSummaries gets both without ever touching an event row's own
+  // events payload.
   const rows = await AuditStore.listSessionSummaries(); // already newest first
 
   sessionsBody.textContent = "";
@@ -197,34 +199,71 @@ function destroyPlayer() {
   playerContainer.textContent = "";
 }
 
-// Item 5: these still open a real network connection to their recorded href
-// when the player rebuilds them into the replay DOM — unlike a stylesheet,
-// image or background fetch, the page CSP does not govern them.
-const BLOCKED_LINK_RELS = new Set(["preconnect", "dns-prefetch", "prefetch", "preload", "prerender"]);
+// preconnect, dns-prefetch, prefetch, preload and prerender links still open a
+// real network connection to their recorded href when the player rebuilds them
+// into the replay DOM — unlike a stylesheet, image or background fetch, the
+// page CSP does not govern them. A neutralized link gets NEUTRAL_LINK_REL,
+// which counts as blocked too, so building the player again for the same
+// events (a tab switched back to) still treats it as neutralized.
+const NEUTRAL_LINK_REL = "ocic-blocked";
+const BLOCKED_LINK_RELS = new Set(["preconnect", "dns-prefetch", "prefetch", "preload", "prerender", NEUTRAL_LINK_REL]);
 
-function isBlockedLinkNode(node) {
-  if (!node || node.type !== 2 || typeof node.tagName !== "string" || node.tagName.toLowerCase() !== "link") return false;
-  const rel = node.attributes && typeof node.attributes.rel === "string" ? node.attributes.rel : "";
-  return rel.toLowerCase().split(/\s+/).some((token) => BLOCKED_LINK_RELS.has(token));
+function hasBlockedRel(rel) {
+  return typeof rel === "string" && rel.toLowerCase().split(/\s+/).some((token) => BLOCKED_LINK_RELS.has(token));
 }
 
-// Removes blocked <link> nodes from a snapshot (or added) node tree in place.
-function stripBlockedLinks(node) {
-  if (!node || typeof node !== "object" || !Array.isArray(node.childNodes)) return;
-  node.childNodes = node.childNodes.filter((child) => !isBlockedLinkNode(child));
-  for (const child of node.childNodes) stripBlockedLinks(child);
+// Walks a snapshot (or added) node tree: records every <link> element's id in
+// `links` (true once neutralized), and neutralizes the blocked ones in place.
+// A blocked link keeps its node but loses what it could fetch: its href and
+// imagesrcset go, and its rel becomes one no browser acts on. The node has to
+// stay, because later mutations target its id: a page that loads its CSS the
+// loadCSS way (<link rel="preload" as="style" onload="this.rel='stylesheet'">)
+// gets its stylesheet text as a _cssText mutation on that node, which the
+// player turns into a <style>.
+function neutralizeLinksInTree(node, links) {
+  if (!node || typeof node !== "object") return;
+  if (node.type === 2 && typeof node.tagName === "string" && node.tagName.toLowerCase() === "link" && node.attributes) {
+    const blocked = hasBlockedRel(node.attributes.rel);
+    if (blocked) {
+      delete node.attributes.href;
+      delete node.attributes.imagesrcset;
+      node.attributes.rel = NEUTRAL_LINK_REL;
+    }
+    links.set(node.id, blocked);
+  }
+  if (Array.isArray(node.childNodes)) for (const child of node.childNodes) neutralizeLinksInTree(child, links);
 }
 
-// Strips blocked link nodes from every FullSnapshot and mutation-add in an
-// events array, in place — covers a recording stored before this fix too.
-function stripBlockedLinksFromEvents(events) {
-  for (const event of events || []) {
-    if (!event || typeof event !== "object") continue;
-    if (event.type === 2 && event.data && event.data.node) {
-      stripBlockedLinks(event.data.node);
-    } else if (event.type === 3 && event.data && event.data.source === 0) {
-      event.data.adds = (event.data.adds || []).filter((add) => !isBlockedLinkNode(add.node));
-      for (const add of event.data.adds) stripBlockedLinks(add.node);
+// Neutralizes blocked links in every FullSnapshot, mutation add and attribute
+// mutation of an events array, in place — covers a recording stored before
+// this fix too. An attribute mutation reaches the replay as well: on a
+// neutralized link it may not bring back an href, an imagesrcset or a rel, and
+// a blocked rel set on any other link neutralizes that link from then on. The
+// player applies events in timestamp order, whatever order they were stored
+// in, so they are walked in that order.
+function neutralizeBlockedLinks(events) {
+  const ordered = (events || []).filter((e) => e && typeof e === "object" && e.data).sort((a, b) => a.timestamp - b.timestamp);
+  let links = new Map(); // rrweb id of each <link> element -> true once neutralized
+  for (const event of ordered) {
+    if (event.type === 2) {
+      links = new Map(); // a FullSnapshot describes the whole document afresh
+      neutralizeLinksInTree(event.data.node, links);
+    } else if (event.type === 3 && event.data.source === 0) {
+      for (const add of event.data.adds || []) if (add) neutralizeLinksInTree(add.node, links);
+      for (const mutation of event.data.attributes || []) {
+        const attributes = mutation && mutation.attributes;
+        if (!attributes || !links.has(mutation.id)) continue;
+        if (links.get(mutation.id)) {
+          delete attributes.href;
+          delete attributes.imagesrcset;
+          if ("rel" in attributes) attributes.rel = NEUTRAL_LINK_REL;
+        } else if (hasBlockedRel(attributes.rel)) {
+          attributes.rel = NEUTRAL_LINK_REL;
+          attributes.href = null; // null removes the attribute the node already has
+          attributes.imagesrcset = null;
+          links.set(mutation.id, true);
+        }
+      }
     }
   }
   return events;
@@ -237,16 +276,16 @@ function renderPlayer(tabId) {
   const events = tabId != null ? currentSession.eventsByTab[tabId] : undefined;
   if (!events || events.length === 0) return;
 
-  // Item 5: age-based pruning (or a batch dropped before it was ever stored)
-  // can leave a tab's stream with no FullSnapshot of its own to replay from —
-  // covers a recording stored before store.js's own prune fix closed this for
-  // new ones, too.
+  // Age-based pruning (or a batch dropped before it was ever stored) can leave
+  // a tab's stream with no FullSnapshot of its own to replay from — covers a
+  // recording stored before store.js's own prune fix closed this for new ones,
+  // too.
   if (!events.some((e) => e && e.type === 2)) {
     showPlayerNotice("Replay unavailable: the start of this recording was deleted by retention.");
     return;
   }
 
-  stripBlockedLinksFromEvents(events);
+  neutralizeBlockedLinks(events);
 
   // rrweb-player also refuses fewer than 2 events (a lone Meta or FullSnapshot
   // can't be replayed), so skip constructing it below that.
@@ -283,9 +322,9 @@ function seekToAction(action) {
     tabSelect.value = String(action.tabId);
     renderPlayer(action.tabId);
   }
-  // Item 4: retried batches can arrive (and be stored) out of order, so the
-  // first element isn't reliably the earliest event — seek from the true
-  // minimum timestamp instead of assuming array order. A loop, not
+  // Retried batches can arrive (and be stored) out of order, so the first
+  // element isn't reliably the earliest event — seek from the true minimum
+  // timestamp instead of assuming array order. A loop, not
   // Math.min(...tabEvents...), since a large recording's events array can
   // exceed the engine's argument-spread limit.
   let firstEventTs = tabEvents[0].timestamp;
@@ -298,25 +337,31 @@ function seekToAction(action) {
 // live export link. Each call uses its own local url/anchor, so concurrent
 // clicks can't race each other's revoke.
 async function exportSession(id) {
-  // Item 3: load a fresh copy at click time — currentSession is the copy
-  // loaded when the detail was opened, and the session can keep recording
-  // (and adding to that copy in storage) while its detail stays open.
-  const data = await AuditStore.getSession(id);
-  if (!data.session || data.session.id !== id) return;
-  const blob = new Blob([JSON.stringify(data)], { type: "application/json" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `audit-session-${id}.json`;
-  a.click();
-  setTimeout(() => URL.revokeObjectURL(url), 0);
+  try {
+    // A fresh copy at click time — currentSession is the copy loaded when the
+    // detail was opened, and the session can keep recording (and adding to
+    // that copy in storage) while its detail stays open.
+    const data = await AuditStore.getSession(id);
+    if (!data.session || data.session.id !== id) return;
+    const blob = new Blob([JSON.stringify(data)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `audit-session-${id}.json`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+  } catch (err) {
+    // A failed load (or a recording too large to serialize) must not throw
+    // uncaught or silently do nothing.
+    showNotice("Could not export this session.");
+  }
 }
 
 async function deleteCurrentSession(id) {
   try {
     await AuditStore.deleteSession(id);
   } catch (err) {
-    // Item 3: a failed delete must not throw uncaught or silently do nothing.
+    // A failed delete must not throw uncaught or silently do nothing.
     showNotice("Could not delete this session.");
     return;
   }
