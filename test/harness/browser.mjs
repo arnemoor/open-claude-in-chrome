@@ -17,8 +17,12 @@ export async function launchChrome({ args = [] } = {}) {
   let ws;
   try {
     const portFile = `${profile}/DevToolsActivePort`;
-    for (let i = 0; i < 150 && !fs.existsSync(portFile); i++) await sleep(100);
-    const [port, wsPath] = fs.readFileSync(portFile, "utf8").trim().split("\n");
+    // Chrome creates the file before writing it, so wait for both lines, not just the file.
+    let port, wsPath;
+    for (let i = 0; i < 150 && !wsPath; i++) {
+      try { [port, wsPath] = fs.readFileSync(portFile, "utf8").trim().split("\n"); } catch {}
+      if (!wsPath) await sleep(100);
+    }
     ws = new WebSocket(`ws://127.0.0.1:${port}${wsPath}`);
     await new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
   } catch (err) {
